@@ -14,9 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Validate scripts and plists
-        run: |
-          bash -n install.sh uninstall.sh scripts/build-app.sh
-          plutil -lint swift/Info.plist entitlements.plist
+        run: ./scripts/check.sh
       - name: Swift self-tests
         run: swift run -c debug --package-path swift Parakey --self-test all
       - name: Build app bundle
@@ -25,3 +23,17 @@ jobs:
         run: |
           test -x "$RUNNER_TEMP/SuperDictate.app/Contents/MacOS/SuperDictate"
           codesign --verify --deep --strict "$RUNNER_TEMP/SuperDictate.app"
+      - name: Exercise installer and uninstaller
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/SuperDictate.app" "$RUNNER_TEMP/release/SuperDictate.zip"
+          checksum="$(shasum -a 256 "$RUNNER_TEMP/release/SuperDictate.zip" | awk '{print $1}')"
+          SUPERDICTATE_RELEASE_URL="file://$RUNNER_TEMP/release/SuperDictate.zip" \
+          SUPERDICTATE_RELEASE_SHA256="$checksum" \
+          SUPERDICTATE_NO_OPEN=1 \
+            ./install.sh
+          test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
+          codesign --verify --deep --strict /Applications/SuperDictate.app
+          ./uninstall.sh
+          test ! -e /Applications/SuperDictate.app

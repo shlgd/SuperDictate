@@ -1,0 +1,28 @@
+name: release smoke
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: macos-15
+    steps:
+      - name: Install from the public command
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | \
+            SUPERDICTATE_NO_OPEN=1 bash
+      - name: Verify installed release
+        run: |
+          test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
+          test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "com.local.superdictate"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "0.2.21"
+          file /Applications/SuperDictate.app/Contents/MacOS/SuperDictate | grep -q arm64
+          codesign --verify --deep --strict /Applications/SuperDictate.app
+          codesign -d --entitlements :- /Applications/SuperDictate.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$RUNNER_TEMP/entitlements.plist")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.microphone' "$RUNNER_TEMP/entitlements.plist")" = "true"

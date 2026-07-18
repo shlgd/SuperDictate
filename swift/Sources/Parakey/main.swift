@@ -6054,13 +6054,9 @@ func systemAudioUnmuteRequestDecision(phase: SystemAudioMutePhase) -> SystemAudi
     }
 }
 
-private func parakeyApplicationSupportDirectory() -> URL {
-    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Parakey", isDirectory: true)
-}
-
 private func systemAudioMuteMarkerURL() -> URL {
-    parakeyApplicationSupportDirectory()
+    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent(APP_SUPPORT_DIR_NAME, isDirectory: true)
         .appendingPathComponent("system-audio-muted", isDirectory: false)
 }
 

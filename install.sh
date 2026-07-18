@@ -3,8 +3,10 @@
 set -euo pipefail
 
 REPOSITORY="shlgd/SuperDictate"
-RELEASE_VERSION="${SUPERDICTATE_VERSION:-0.2.20}"
-RELEASE_SHA256="33a1bb5a1f38a1d97b409da6a77ee1d44969e457d4593ac66c9545b1926f3361"
+RELEASE_VERSION="0.2.21"
+RELEASE_SHA256="a29f6b5157b4b42299b0c516eec9f8249d8158c47765831bb6abc8a45527480e"
+RELEASE_URL="${SUPERDICTATE_RELEASE_URL:-https://github.com/$REPOSITORY/releases/download/v$RELEASE_VERSION/SuperDictate.zip}"
+EXPECTED_SHA256="${SUPERDICTATE_RELEASE_SHA256:-$RELEASE_SHA256}"
 REF="${SUPERDICTATE_REF:-main}"
 APP_PATH="${SUPERDICTATE_APP_PATH:-/Applications/SuperDictate.app}"
 BUILD_FROM_SOURCE="${SUPERDICTATE_BUILD_FROM_SOURCE:-0}"
@@ -37,28 +39,36 @@ run_as_admin() {
 verify_app() {
     local app="$1"
     local executable="$app/Contents/MacOS/SuperDictate"
-    local bundle_id
+    local bundle_id version minimum_system entitlements_file audio_input microphone
 
     [[ -x "$executable" ]] || fail "В архиве нет исполняемого файла SuperDictate."
     bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")"
     [[ "$bundle_id" == "com.local.superdictate" ]] || fail "Неверный идентификатор приложения: $bundle_id"
+    version="$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")"
+    [[ "$version" == "$RELEASE_VERSION" ]] || fail "Ожидалась версия $RELEASE_VERSION, получена $version."
+    minimum_system="$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")"
+    [[ "$minimum_system" == "14.0" ]] || fail "Неожиданная минимальная версия macOS: $minimum_system"
     file "$executable" | grep -q 'arm64' || fail "Сборка не предназначена для Apple Silicon."
     codesign --verify --deep --strict "$app" || fail "Проверка подписи приложения не прошла."
+    entitlements_file="$WORK_DIR/verified-entitlements.plist"
+    codesign -d --entitlements :- "$app" > "$entitlements_file" 2>/dev/null
+    audio_input="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$entitlements_file")"
+    microphone="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.microphone' "$entitlements_file")"
+    [[ "$audio_input" == "true" && "$microphone" == "true" ]] || fail "В сборке отсутствуют разрешения микрофона."
 }
 
 download_release() {
     local work_dir="$1"
     local archive="$work_dir/SuperDictate.zip"
-    local expected actual
+    local actual
 
     say "Скачиваю готовую сборку $RELEASE_VERSION..."
-    curl --fail --location --silent --show-error \
-        "https://github.com/$REPOSITORY/releases/download/v$RELEASE_VERSION/SuperDictate.zip" \
+    curl --fail --location --silent --show-error --retry 3 --retry-delay 1 --retry-all-errors \
+        "$RELEASE_URL" \
         -o "$archive"
 
-    expected="$RELEASE_SHA256"
     actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
-    [[ "$actual" == "$expected" ]] || fail "Контрольная сумма загрузки не совпала."
+    [[ "$actual" == "$EXPECTED_SHA256" ]] || fail "Контрольная сумма загрузки не совпала."
 
     ditto -x -k "$archive" "$work_dir/release"
     [[ -d "$work_dir/release/SuperDictate.app" ]] || fail "В релизе нет SuperDictate.app."
@@ -77,7 +87,7 @@ build_from_source() {
     }
 
     say "Скачиваю открытый исходный код..."
-    curl --fail --location --silent --show-error \
+    curl --fail --location --silent --show-error --retry 3 --retry-delay 1 --retry-all-errors \
         "https://github.com/$REPOSITORY/archive/$REF.zip" \
         -o "$work_dir/source.zip"
     ditto -x -k "$work_dir/source.zip" "$work_dir/source"
@@ -112,19 +122,31 @@ if [[ "$APP_PATH" == "/Applications/SuperDictate.app" ]]; then
 fi
 
 INCOMING="$(dirname "$APP_PATH")/.SuperDictate.install.$$"
+BACKUP="$(dirname "$APP_PATH")/.SuperDictate.previous.$$"
 run_as_admin rm -rf "$INCOMING"
+run_as_admin rm -rf "$BACKUP"
 run_as_admin ditto "$WORK_DIR/SuperDictate.app" "$INCOMING"
 verify_app "$INCOMING"
-run_as_admin rm -rf "$APP_PATH"
-run_as_admin mv "$INCOMING" "$APP_PATH"
+
+if [[ -e "$APP_PATH" ]]; then
+    run_as_admin mv "$APP_PATH" "$BACKUP"
+fi
+if ! run_as_admin mv "$INCOMING" "$APP_PATH"; then
+    if [[ -e "$BACKUP" ]]; then
+        run_as_admin mv "$BACKUP" "$APP_PATH"
+    fi
+    fail "Не удалось заменить приложение; предыдущая версия восстановлена."
+fi
 
 verify_app "$APP_PATH"
+run_as_admin rm -rf "$BACKUP"
 
 if [[ "$NO_OPEN" == "1" ]]; then
     say "Готово. Проверенная сборка установлена."
 else
     say "Готово. Открываю SuperDictate..."
     open "$APP_PATH"
-    printf '\nВыдайте приложению три разрешения в открывшейся панели.\n'
-    printf 'Первый запуск также скачает локальную модель распознавания.\n\n'
+    printf '\n1. Нажмите Grant для Microphone, Accessibility и Input Monitoring.\n'
+    printf '2. Дождитесь загрузки локальной модели и статуса Ready.\n'
+    printf '3. Нажмите правый Command и начинайте говорить.\n\n'
 fi
