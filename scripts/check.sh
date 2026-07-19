@@ -18,5 +18,12 @@ installer_version="$(sed -n 's/^RELEASE_VERSION="\([^"]*\)"$/\1/p' install.sh)"
 grep -q 'com.apple.security.device.audio-input' entitlements.plist
 grep -q 'com.apple.security.device.microphone' entitlements.plist
 
+! grep -q 'raw.githubusercontent.com/shlgd/SuperDictate/main/' README.md
+grep -q 'raw.githubusercontent.com/shlgd/SuperDictate/v'"$app_version"'/' README.md
+grep -q '^REF="${SUPERDICTATE_REF:-v\$RELEASE_VERSION}"$' install.sh
+grep -q '^EXPECTED_SOURCE_COMMIT="${SUPERDICTATE_SOURCE_COMMIT:-\$SOURCE_COMMIT}"$' install.sh
+grep -q 'verify_source_ref' install.sh
+grep -q 'validate_output_app_path "$OUTPUT_APP"' scripts/build-app.sh
+
 git diff --check
 printf 'SuperDictate checks passed (v%s).\n' "$app_version"

@@ -15,8 +15,26 @@ fail() {
     exit 1
 }
 
+validate_output_app_path() {
+    local output="$1"
+    local parent base
+
+    [[ -n "$output" ]] || fail "Output app path is empty."
+    [[ "$output" == *.app ]] || fail "Output app path must end with .app."
+
+    parent="$(dirname "$output")"
+    base="$(basename "$output")"
+
+    [[ "$base" != "." && "$base" != ".." ]] || fail "Output app path is not specific enough."
+    [[ "$output" != "/" && "$parent" != "/" ]] || fail "Refusing to write directly under /."
+    [[ "$output" != "$HOME" && "$parent" != "$HOME" ]] || fail "Refusing to replace the home directory."
+    [[ "$output" != "/Applications" && "$parent" != "/Applications" ]] || fail "Refusing to write directly under /Applications."
+    [[ "$output" != "$ROOT_DIR" && "$parent" != "$ROOT_DIR" ]] || fail "Refusing to replace the repository root."
+}
+
 [[ "$(uname -s)" == "Darwin" ]] || fail "macOS is required."
 [[ "$(uname -m)" == "arm64" ]] || fail "An Apple Silicon Mac (M1 or newer) is required."
+validate_output_app_path "$OUTPUT_APP"
 command -v swift >/dev/null 2>&1 || fail "Swift is missing. Run: xcode-select --install"
 command -v codesign >/dev/null 2>&1 || fail "codesign is missing. Run: xcode-select --install"
 
@@ -57,4 +75,3 @@ trap - EXIT
 rm -rf "$STAGE_DIR"
 
 say "Built $OUTPUT_APP"
-
