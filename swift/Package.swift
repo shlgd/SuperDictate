@@ -1,6 +1,6 @@
 // swift-tools-version: 6.0
 //
-// SuperDictate — a single-file Swift push-to-talk dictation app
+// SuperDictate — a Swift push-to-talk dictation app
 // for macOS Apple Silicon. Native AppKit / AVFoundation, FluidAudio
 // driving Parakeet TDT v3 on the Apple Neural Engine. macOS 14
 // (Sonoma) minimum. The Hardened Runtime microphone entitlement
