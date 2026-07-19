@@ -46,6 +46,7 @@ let PENDING_DICTATION_HEADER_SIZE = 16
 let PENDING_DICTATION_MAX_SECONDS: TimeInterval = 30 * 60
 let PENDING_DICTATION_MAX_BYTES = Int(PENDING_DICTATION_MAX_SECONDS * SAMPLE_RATE * 4) + PENDING_DICTATION_HEADER_SIZE
 let DEFAULT_HOTKEY_KEYCODE: CGKeyCode = 54  // Right Command
+let LEFT_COMMAND_KEYCODE: CGKeyCode = 55
 let RIGHT_COMMAND_KEYCODE: CGKeyCode = 54
 let RIGHT_OPTION_KEYCODE: CGKeyCode = 61
 let RIGHT_SHIFT_KEYCODE: CGKeyCode = 60
@@ -137,6 +138,7 @@ struct HotkeyChoice: Equatable {
 }
 
 let RIGHT_MODIFIER_HOTKEY_CHOICES: [HotkeyChoice] = [
+    HotkeyChoice(name: "Left Command", keycode: LEFT_COMMAND_KEYCODE, isModifier: true, modifierFlag: .maskCommand),
     HotkeyChoice(name: "Right Control", keycode: 62, isModifier: true, modifierFlag: .maskControl),
     HotkeyChoice(name: "Right Option", keycode: 61, isModifier: true, modifierFlag: .maskAlternate),
     HotkeyChoice(name: "Right Command", keycode: 54, isModifier: true, modifierFlag: .maskCommand),
@@ -169,6 +171,7 @@ let HOTKEY_CHOICES: [HotkeyChoice] = [
     RIGHT_MODIFIER_HOTKEY_CHOICES[0],
     RIGHT_MODIFIER_HOTKEY_CHOICES[1],
     RIGHT_MODIFIER_HOTKEY_CHOICES[2],
+    RIGHT_MODIFIER_HOTKEY_CHOICES[3],
     HotkeyChoice(name: "F5",            keycode: 96,  isModifier: false, modifierFlag: nil),
     HotkeyChoice(name: "F6",            keycode: 97,  isModifier: false, modifierFlag: nil),
     HotkeyChoice(name: "F13",           keycode: 105, isModifier: false, modifierFlag: nil),
@@ -3382,7 +3385,7 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
     guard event.typeRawValue == CGEventType.keyDown.rawValue else { return .ignore }
     guard let choice = recordableHotkeyChoice(forKeycode: event.keycode),
           !choice.isModifier else {
-        return .reject("Choose a right-side modifier key or an F-key. Typing keys are not safe because Parakey suppresses its dictation key globally.")
+        return .reject("Choose a supported modifier key or an F-key. Typing keys are not safe because Parakey suppresses its dictation key globally.")
     }
     return .accept(choice)
 }
@@ -13632,7 +13635,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let alert = NSAlert()
         alert.messageText = "Record Hotkey"
-        alert.informativeText = "Press a right-side modifier key or an F-key."
+        alert.informativeText = "Press a supported modifier key or an F-key."
         alert.addButton(withTitle: "Use Selected")
         alert.addButton(withTitle: "Cancel")
         let useButton = alert.buttons[0]
@@ -14914,14 +14917,24 @@ private enum ParakeySelfTest {
             equals: CGKeyCode(98),
             "stored hotkey normalization should accept recorded F-key keycodes"
         )
-        try expect(
-            hotkeyChoice(forKeycode: CGKeyCode(98)),
-            equals: HotkeyChoice(name: "F7", keycode: 98, isModifier: false, modifierFlag: nil),
-            "recorded F-key choices should get a stable display name"
-        )
-        try expect(
-            normalizedHotkeyKeycode(storedValue: NSNumber(value: 999)),
-            equals: nil,
+ try expect(
+ hotkeyChoice(forKeycode: CGKeyCode(98)),
+ equals: HotkeyChoice(name: "F7", keycode: 98, isModifier: false, modifierFlag: nil),
+ "recorded F-key choices should get a stable display name"
+ )
+ try expect(
+ normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(LEFT_COMMAND_KEYCODE))),
+ equals: LEFT_COMMAND_KEYCODE,
+ "stored hotkey normalization should accept Left Command"
+ )
+ try expect(
+ hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE),
+ equals: HotkeyChoice(name: "Left Command", keycode: LEFT_COMMAND_KEYCODE, isModifier: true, modifierFlag: .maskCommand),
+ "Left Command should get a stable display name"
+ )
+ try expect(
+ normalizedHotkeyKeycode(storedValue: NSNumber(value: 999)),
+ equals: nil,
             "stored hotkey normalization should reject unsupported keycodes"
         )
         try expect(
@@ -14942,7 +14955,7 @@ private enum ParakeySelfTest {
         )
         try expect(
             hotkeyRecordingDecision(for: event(.keyDown, keycode: 0)),
-            equals: .reject("Choose a right-side modifier key or an F-key. Typing keys are not safe because Parakey suppresses its dictation key globally."),
+            equals: .reject("Choose a supported modifier key or an F-key. Typing keys are not safe because Parakey suppresses its dictation key globally."),
             "hotkey recorder should reject typing keys"
         )
         try expect(
@@ -14954,13 +14967,23 @@ private enum ParakeySelfTest {
             hotkeyRecordingDecision(for: event(.flagsChanged,
                                                keycode: 61,
                                                flags: CGEventFlags.maskAlternate.rawValue)),
-            equals: .accept(HotkeyChoice(name: "Right Option",
-                                         keycode: 61,
-                                         isModifier: true,
-                                         modifierFlag: .maskAlternate)),
-            "hotkey recorder should accept right-side modifier presses"
-        )
-    }
+ equals: .accept(HotkeyChoice(name: "Right Option",
+ keycode: 61,
+ isModifier: true,
+ modifierFlag: .maskAlternate)),
+ "hotkey recorder should accept modifier presses"
+ )
+ try expect(
+ hotkeyRecordingDecision(for: event(.flagsChanged,
+ keycode: LEFT_COMMAND_KEYCODE,
+ flags: CGEventFlags.maskCommand.rawValue)),
+ equals: .accept(HotkeyChoice(name: "Left Command",
+ keycode: LEFT_COMMAND_KEYCODE,
+ isModifier: true,
+ modifierFlag: .maskCommand)),
+ "hotkey recorder should accept Left Command"
+ )
+ }
 
     private static func testHotkeyPreferenceUpdateResults() throws {
         let f5 = hotkeyChoice(forKeycode: 96)
