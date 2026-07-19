@@ -18316,8 +18316,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         root.addArrangedSubview(separator())
         root.addArrangedSubview(sectionLabel("Settings"))
-        root.addArrangedSubview(infoRow(title: "Dictation key",
-                                        detail: "\(hotkeyChoice(forKeycode: settings.hotkeyKeycode).name), \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue.lowercased())"))
+        root.addArrangedSubview(popupRow(title: "Dictation key",
+                                         detail: "\(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue.lowercased()). Changing this restarts the service.",
+                                         selectedValue: String(settings.hotkeyKeycode),
+                                         options: HOTKEY_CHOICES.map { ($0.name, String($0.keycode)) },
+                                         action: #selector(selectDictationKey(_:))))
         root.addArrangedSubview(checkboxRow(title: "Option + Command sends Enter",
                                             detail: "Off: plain Right Command sends Enter, and Option + Command finishes without Enter.",
                                             isOn: settings.optionCommandEnterAfterDictation,
@@ -18620,6 +18623,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func toggleOptionCommandEnterClicked(_ sender: NSButton) {
         settings.optionCommandEnterAfterDictation = sender.state == .on
+        refresh()
+    }
+
+    @objc private func selectDictationKey(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let value = UInt16(raw),
+              let choice = recordableHotkeyChoice(forKeycode: CGKeyCode(value)) else {
+            return
+        }
+        settings.hotkeyKeycode = choice.keycode
+        if settings.agentEnabled || SuperDictateAgentService.isAgentRunning() {
+            do {
+                try SuperDictateAgentService.restart()
+            } catch {
+                showError(title: "Couldn't Restart Dictation Service", detail: error.localizedDescription)
+            }
+        }
         refresh()
     }
 
