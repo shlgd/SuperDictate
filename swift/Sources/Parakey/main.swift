@@ -2546,6 +2546,7 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
 
@@ -2650,6 +2651,21 @@ final class Settings: @unchecked Sendable {
             return defaults.bool(forKey: Self.keyAlternateCompletionEnabled)
         }
         set { defaults.set(newValue, forKey: Self.keyAlternateCompletionEnabled) }
+    }
+
+    /// Delay between pasting the transcribed text and posting the
+    /// Return key when the completion behavior includes "+ Enter".
+    /// Some apps (Electron, VMs) need a beat to process the paste
+    /// before they can handle a keystroke. Stored in milliseconds;
+    /// the default (120) matches the original hardcoded constant.
+    var enterDelayMilliseconds: Int {
+        get {
+            guard defaults.object(forKey: Self.keyEnterDelayMilliseconds) != nil else {
+                return 120
+            }
+            return max(0, min(500, defaults.integer(forKey: Self.keyEnterDelayMilliseconds)))
+        }
+        set { defaults.set(max(0, min(500, newValue)), forKey: Self.keyEnterDelayMilliseconds) }
     }
 
     var historyHotkeyKeycode: CGKeyCode {
@@ -11483,7 +11499,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         if inserted {
                             if shouldPressEnterAfterInsertion {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
-                                try? await Task.sleep(nanoseconds: ENTER_AFTER_INSERT_DELAY_NANOSECONDS)
+                                let enterDelayNanoseconds = UInt64(settings.enterDelayMilliseconds) * 1_000_000
+                                if enterDelayNanoseconds > 0 {
+                                    try? await Task.sleep(nanoseconds: enterDelayNanoseconds)
+                                }
                                 if KeyboardShortcutPoster.postReturn() {
                                     log("return posted after dictation")
                                 } else {
@@ -19970,6 +19989,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var historyHotkey: HotkeyChoice
     var primaryCompletionBehavior: DictationCompletionBehavior
     var alternateCompletionEnabled: Bool
+    var enterDelayMilliseconds: Int
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -19981,6 +20001,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         historyHotkey = settings.configuredHistoryHotkey
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
+        enterDelayMilliseconds = settings.enterDelayMilliseconds
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -20247,6 +20268,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
         root.addArrangedSubview(alternateCompletionRow(draft))
+        root.addArrangedSubview(enterDelayRow(draft))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
             shortcut: draft.historyHotkey,
@@ -21024,6 +21046,28 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private static let enterDelayOptions: [(title: String, value: String)] = [
+        ("0 ms", "0"),
+        ("50 ms", "50"),
+        ("80 ms", "80"),
+        ("120 ms", "120"),
+        ("200 ms", "200"),
+        ("300 ms", "300"),
+    ]
+
+    private func enterDelayRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Задержка Enter", "Enter delay"),
+            detail: t("Пауза между вставкой текста и нажатием Enter.",
+                      "Pause between inserting text and pressing Enter."),
+            selectedValue: String(draft.enterDelayMilliseconds),
+            options: Self.enterDelayOptions,
+            action: #selector(selectEnterDelay(_:)),
+            toolTip: t("Некоторым приложениям (Electron, VM) нужна пауза после вставки. Уменьшите для быстрых приложений.",
+                       "Some apps (Electron, VMs) need a pause after paste. Lower for fast native apps.")
+        )
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -21584,6 +21628,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectEnterDelay(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let ms = Int(raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.enterDelayMilliseconds = ms
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDSize(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let size = RecordingHUDSize(rawValue: raw) else { return }
@@ -21606,6 +21659,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
+        settings.enterDelayMilliseconds = draft.enterDelayMilliseconds
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
