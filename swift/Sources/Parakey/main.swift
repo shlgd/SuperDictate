@@ -59,6 +59,8 @@ let UPDATE_REMIND_LATER_SECONDS: TimeInterval = 24 * 3600  // 24h
 let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/shlgd/SuperDictate/releases/latest")!
 let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/shlgd/SuperDictate")!
 let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/shlgd/SuperDictate/releases/latest")!
+let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/shlgd/SuperDictate/main/update.json")!
+let UPDATE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
 let HOMEBREW_CASK_TAP = "shlgd/superdictate"
 let HOMEBREW_CASK_TOKEN = "shlgd/superdictate/superdictate"
 let HOMEBREW_CASK_INSTALLED_TOKEN = "parakey"
@@ -6946,6 +6948,235 @@ enum UpdateCheck {
     }
 }
 
+struct SuperDictateUpdateManifest: Decodable, Equatable, Sendable {
+    let version: String
+    let sha256: String
+}
+
+struct PreparedSuperDictateUpdate: Sendable {
+    let version: String
+    let workDirectory: URL
+    let stagedAppURL: URL
+}
+
+enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
+    case network
+    case httpStatus(Int)
+    case invalidManifest
+    case manifestVersionMismatch(expected: String, actual: String)
+    case archiveTooLarge
+    case checksumMismatch
+    case extractionFailed(String)
+    case invalidBundle(String)
+    case appNotWritable
+
+    var errorDescription: String? { message(language: .russian) }
+
+    func message(language: InterfaceLanguage) -> String {
+        if language == .english {
+            switch self {
+            case .network:
+                return "The update could not be downloaded. Check your internet connection."
+            case .httpStatus(let code):
+                return "The update server returned HTTP \(code)."
+            case .invalidManifest:
+                return "The update manifest is damaged or has an unknown format."
+            case .manifestVersionMismatch(let expected, let actual):
+                return "GitHub reports version \(expected), but the manifest reports \(actual). The update was stopped."
+            case .archiveTooLarge:
+                return "The update archive exceeds the allowed size."
+            case .checksumMismatch:
+                return "The archive checksum did not match. The application was not replaced."
+            case .extractionFailed(let detail):
+                return "The update could not be extracted: \(detail)"
+            case .invalidBundle(let detail):
+                return "The new application failed verification: \(detail)"
+            case .appNotWritable:
+                return "SuperDictate cannot replace the application in Applications. Run the regular installer once."
+            }
+        }
+        switch self {
+        case .network:
+            return "Не удалось скачать обновление. Проверьте подключение к интернету."
+        case .httpStatus(let code):
+            return "Сервер обновлений вернул ошибку HTTP \(code)."
+        case .invalidManifest:
+            return "Манифест обновления повреждён или имеет неизвестный формат."
+        case .manifestVersionMismatch(let expected, let actual):
+            return "GitHub сообщает о версии \(expected), а манифест — о версии \(actual). Обновление остановлено."
+        case .archiveTooLarge:
+            return "Архив обновления превышает допустимый размер."
+        case .checksumMismatch:
+            return "Контрольная сумма архива не совпала. Приложение не будет заменено."
+        case .extractionFailed(let detail):
+            return "Не удалось распаковать обновление: \(detail)"
+        case .invalidBundle(let detail):
+            return "Проверка нового приложения не пройдена: \(detail)"
+        case .appNotWritable:
+            return "SuperDictate не может заменить приложение в папке Applications. Запустите обычный установщик один раз."
+        }
+    }
+}
+
+enum SuperDictateUpdateInstaller {
+    private static let manifestMaxBytes = 16 * 1024
+
+    static func fetchManifest(expectedVersion: String) async throws -> SuperDictateUpdateManifest {
+        var request = URLRequest(url: GITHUB_UPDATE_MANIFEST_URL)
+        request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.timeoutInterval = 15
+        let (data, response) = try await fetch(request: request, maxBytes: manifestMaxBytes)
+        guard (200..<300).contains(response.statusCode) else {
+            throw SuperDictateUpdateInstallerError.httpStatus(response.statusCode)
+        }
+        return try parseManifest(data, expectedVersion: expectedVersion)
+    }
+
+    static func parseManifest(_ data: Data,
+                              expectedVersion: String) throws -> SuperDictateUpdateManifest {
+        guard let manifest = try? JSONDecoder().decode(SuperDictateUpdateManifest.self, from: data),
+              UpdateCheck.normalizedReleaseVersion(from: manifest.version) == manifest.version,
+              manifest.sha256.count == 64,
+              manifest.sha256.allSatisfy({ $0.isHexDigit }) else {
+            throw SuperDictateUpdateInstallerError.invalidManifest
+        }
+        guard manifest.version == expectedVersion else {
+            throw SuperDictateUpdateInstallerError.manifestVersionMismatch(
+                expected: expectedVersion,
+                actual: manifest.version
+            )
+        }
+        return manifest
+    }
+
+    static func prepare(manifest: SuperDictateUpdateManifest) async throws -> PreparedSuperDictateUpdate {
+        guard appCanBeReplaced(at: Bundle.main.bundleURL) else {
+            throw SuperDictateUpdateInstallerError.appNotWritable
+        }
+
+        let archiveURL = URL(string: "https://github.com/shlgd/SuperDictate/releases/download/v\(manifest.version)/SuperDictate.zip")!
+        var request = URLRequest(url: archiveURL)
+        request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 60
+        let (archiveData, response) = try await fetch(request: request,
+                                                      maxBytes: UPDATE_ARCHIVE_MAX_BYTES)
+        guard (200..<300).contains(response.statusCode) else {
+            throw SuperDictateUpdateInstallerError.httpStatus(response.statusCode)
+        }
+
+        var hasher = SHA256()
+        hasher.update(data: archiveData)
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest.caseInsensitiveCompare(manifest.sha256) == .orderedSame else {
+            throw SuperDictateUpdateInstallerError.checksumMismatch
+        }
+
+        let workDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("SuperDictate-update-\(UUID().uuidString)", isDirectory: true)
+        let archiveFile = workDirectory.appendingPathComponent("SuperDictate.zip")
+        let extractedDirectory = workDirectory.appendingPathComponent("release", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: extractedDirectory,
+                                                    withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try archiveData.write(to: archiveFile, options: [.atomic])
+        } catch {
+            try? FileManager.default.removeItem(at: workDirectory)
+            throw SuperDictateUpdateInstallerError.extractionFailed(error.localizedDescription)
+        }
+
+        let extraction = await Task.detached(priority: .userInitiated) {
+            SuperDictateAgentService.run("/usr/bin/ditto",
+                                         ["-x", "-k", archiveFile.path, extractedDirectory.path])
+        }.value
+        guard extraction.status == 0 else {
+            try? FileManager.default.removeItem(at: workDirectory)
+            throw SuperDictateUpdateInstallerError.extractionFailed(extraction.output)
+        }
+
+        let stagedAppURL = extractedDirectory.appendingPathComponent("SuperDictate.app",
+                                                                      isDirectory: true)
+        do {
+            try validateApp(at: stagedAppURL, expectedVersion: manifest.version)
+        } catch let error as SuperDictateUpdateInstallerError {
+            try? FileManager.default.removeItem(at: workDirectory)
+            throw error
+        } catch {
+            try? FileManager.default.removeItem(at: workDirectory)
+            throw SuperDictateUpdateInstallerError.invalidBundle(error.localizedDescription)
+        }
+        return PreparedSuperDictateUpdate(version: manifest.version,
+                                          workDirectory: workDirectory,
+                                          stagedAppURL: stagedAppURL)
+    }
+
+    static func appCanBeReplaced(at appURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        guard appURL.pathExtension == "app",
+              fileManager.fileExists(atPath: appURL.path) else { return false }
+        return fileManager.isWritableFile(atPath: appURL.path)
+            && fileManager.isWritableFile(atPath: appURL.deletingLastPathComponent().path)
+    }
+
+    static func validateApp(at appURL: URL, expectedVersion: String) throws {
+        let fileManager = FileManager.default
+        let infoURL = appURL.appendingPathComponent("Contents/Info.plist")
+        let executableURL = appURL.appendingPathComponent("Contents/MacOS/SuperDictate")
+        guard appURL.lastPathComponent == "SuperDictate.app",
+              fileManager.fileExists(atPath: infoURL.path),
+              fileManager.isExecutableFile(atPath: executableURL.path),
+              let infoData = try? Data(contentsOf: infoURL),
+              let info = try? PropertyListSerialization.propertyList(from: infoData,
+                                                                     format: nil) as? [String: Any],
+              info["CFBundleIdentifier"] as? String == "com.local.superdictate",
+              info["CFBundleShortVersionString"] as? String == expectedVersion else {
+            throw SuperDictateUpdateInstallerError.invalidBundle("неверный идентификатор или версия")
+        }
+
+        if let enumerator = fileManager.enumerator(at: appURL,
+                                                   includingPropertiesForKeys: [.isSymbolicLinkKey],
+                                                   options: []) {
+            for case let itemURL as URL in enumerator {
+                if (try? itemURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                    throw SuperDictateUpdateInstallerError.invalidBundle("архив содержит символическую ссылку")
+                }
+            }
+        }
+
+        let signature = SuperDictateAgentService.run("/usr/bin/codesign",
+                                                      ["--verify", "--deep", "--strict", appURL.path])
+        guard signature.status == 0 else {
+            throw SuperDictateUpdateInstallerError.invalidBundle("codesign: \(signature.output)")
+        }
+    }
+
+    private static func fetch(request: URLRequest,
+                              maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = request.timeoutInterval
+        configuration.timeoutIntervalForResource = request.timeoutInterval
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw SuperDictateUpdateInstallerError.network
+            }
+            guard data.count <= maxBytes else {
+                throw SuperDictateUpdateInstallerError.archiveTooLarge
+            }
+            return (data, http)
+        } catch let error as SuperDictateUpdateInstallerError {
+            throw error
+        } catch {
+            throw SuperDictateUpdateInstallerError.network
+        }
+    }
+}
+
 func shellSingleQuoted(_ value: String) -> String {
     "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
 }
@@ -7161,6 +7392,138 @@ func updateHelperScript(pid: pid_t,
     sleep 2
     /usr/bin/open "$APP_PATH"
     state "complete" "Parakey v$TARGET_VERSION is installed."
+    """#
+}
+
+func superDictateDirectUpdateHelperScript(pid: pid_t,
+                                           targetVersion: String,
+                                           statePath: String,
+                                           stagedAppPath: String,
+                                           workDirectory: String,
+                                           backupAppPath: String,
+                                           appPath: String,
+                                           language: InterfaceLanguage,
+                                           relaunch: Bool = true) -> String {
+    let preparing = localizedText("Подготавливаю замену приложения…",
+                                  "Preparing to replace the application…",
+                                  language: language)
+    let installing = localizedText("Устанавливаю SuperDictate v\(targetVersion)…",
+                                    "Installing SuperDictate v\(targetVersion)…",
+                                    language: language)
+    let verifying = localizedText("Проверяю установленную версию…",
+                                   "Verifying the installed version…",
+                                   language: language)
+    let relaunching = localizedText("Обновление готово. Запускаю SuperDictate…",
+                                    "Update complete. Reopening SuperDictate…",
+                                    language: language)
+    let complete = localizedText("SuperDictate v\(targetVersion) установлена.",
+                                  "SuperDictate v\(targetVersion) is installed.",
+                                  language: language)
+    let failed = localizedText("Обновление не установлено. Предыдущая версия восстановлена.",
+                                "The update was not installed. The previous version was restored.",
+                                language: language)
+
+    return #"""
+    #!/bin/bash
+    set -u
+    umask 077
+
+    SCRIPT_PATH="$0"
+    PANEL_PID=\#(pid)
+    TARGET_VERSION=\#(shellSingleQuoted(targetVersion))
+    STATE_PATH=\#(shellSingleQuoted(statePath))
+    STAGED_APP=\#(shellSingleQuoted(stagedAppPath))
+    WORK_DIR=\#(shellSingleQuoted(workDirectory))
+    BACKUP_APP=\#(shellSingleQuoted(backupAppPath))
+    APP_PATH=\#(shellSingleQuoted(appPath))
+    SHOULD_RELAUNCH=\#(relaunch ? "1" : "0")
+    APP_PARENT="$(/usr/bin/dirname "$APP_PATH")"
+    INFO_PLIST="$APP_PATH/Contents/Info.plist"
+    SERVICE="gui/$(/usr/bin/id -u)/\#(AGENT_LABEL)"
+
+    timestamp() {
+        /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
+    }
+
+    log() {
+        printf '[%s] %s\n' "$(timestamp)" "$*"
+    }
+
+    state() {
+        local phase="$1"
+        local message="$2"
+        local tmp="${STATE_PATH}.$$"
+        log "$message"
+        if printf '%s\t%s\n' "$phase" "$message" >"$tmp"; then
+            /bin/chmod 600 "$tmp" 2>/dev/null || true
+            /bin/mv -f "$tmp" "$STATE_PATH" 2>/dev/null || true
+        else
+            /bin/rm -f "$tmp" 2>/dev/null || true
+        fi
+    }
+
+    cleanup() {
+        /bin/rm -rf "$WORK_DIR" 2>/dev/null || true
+        /bin/rm -f "$SCRIPT_PATH" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    wait_for_panel_exit() {
+        for _ in {1..40}; do
+            if ! /bin/kill -0 "$PANEL_PID" 2>/dev/null; then
+                return 0
+            fi
+            /bin/sleep 0.25
+        done
+        /bin/kill -TERM "$PANEL_PID" 2>/dev/null || true
+        /bin/sleep 1
+        ! /bin/kill -0 "$PANEL_PID" 2>/dev/null
+    }
+
+    verify_app() {
+        [ -x "$APP_PATH/Contents/MacOS/SuperDictate" ] || return 1
+        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null)" = "com.local.superdictate" ] || return 1
+        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null)" = "$TARGET_VERSION" ] || return 1
+        /usr/bin/codesign --verify --deep --strict "$APP_PATH"
+    }
+
+    rollback() {
+        log "Rolling back the application bundle."
+        if [ -d "$BACKUP_APP" ]; then
+            /bin/rm -rf "$APP_PATH" 2>/dev/null || true
+            /bin/mv "$BACKUP_APP" "$APP_PATH" 2>/dev/null || true
+        fi
+        state "failed" \#(shellSingleQuoted(failed))
+        if [ "$SHOULD_RELAUNCH" = "1" ] && [ -d "$APP_PATH" ]; then
+            /usr/bin/open "$APP_PATH" 2>/dev/null || true
+        fi
+        exit 1
+    }
+
+    state "preparing" \#(shellSingleQuoted(preparing))
+    [ -d "$STAGED_APP" ] || rollback
+    [ -d "$APP_PATH" ] || rollback
+    [ ! -e "$BACKUP_APP" ] || rollback
+    [ -w "$APP_PATH" ] && [ -w "$APP_PARENT" ] || rollback
+    wait_for_panel_exit || rollback
+
+    /bin/launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
+    /usr/bin/pkill -f "$APP_PATH/Contents/MacOS/SuperDictate --agent" >/dev/null 2>&1 || true
+
+    state "installing" \#(shellSingleQuoted(installing))
+    /bin/mv "$APP_PATH" "$BACKUP_APP" || rollback
+    /usr/bin/ditto "$STAGED_APP" "$APP_PATH" || rollback
+
+    state "verifying" \#(shellSingleQuoted(verifying))
+    verify_app || rollback
+
+    /bin/rm -rf "$BACKUP_APP" || true
+    state "relaunching" \#(shellSingleQuoted(relaunching))
+    if [ "$SHOULD_RELAUNCH" = "1" ]; then
+        /usr/bin/open "$APP_PATH" || rollback
+    fi
+    /bin/sleep 2
+    state "complete" \#(shellSingleQuoted(complete))
     """#
 }
 
@@ -7822,6 +8185,12 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
         self.launch = launch
     }
 
+    private var language: InterfaceLanguage { Settings.shared.interfaceLanguage }
+
+    private func t(_ russian: String, _ english: String) -> String {
+        localizedText(russian, english, language: language)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildWindow()
@@ -7851,7 +8220,7 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
-        window.title = "Updating Parakey"
+        window.title = t("Обновление SuperDictate", "Updating SuperDictate")
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -7863,11 +8232,13 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
         root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = updateProgressLabel("Updating Parakey to v\(launch.targetVersion)",
+        let title = updateProgressLabel(t("Обновление SuperDictate до v\(launch.targetVersion)",
+                                          "Updating SuperDictate to v\(launch.targetVersion)"),
                                         font: .systemFont(ofSize: 18, weight: .semibold))
-        messageLabel = updateProgressLabel("Starting update...",
+        messageLabel = updateProgressLabel(t("Запускаю обновление…", "Starting update…"),
                                            font: .systemFont(ofSize: 13, weight: .medium))
-        detailLabel = updateProgressLabel("Parakey will reopen automatically when the update finishes.",
+        detailLabel = updateProgressLabel(t("SuperDictate автоматически откроется после установки.",
+                                             "SuperDictate will reopen automatically when the update finishes."),
                                           font: .systemFont(ofSize: 12),
                                           color: .secondaryLabelColor)
         detailLabel.preferredMaxLayoutWidth = 390
@@ -7885,18 +8256,18 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
         buttonRow.spacing = 8
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
 
-        let openLog = NSButton(title: "Open Log",
+        let openLog = NSButton(title: t("Открыть журнал", "Open Log"),
                                target: self,
                                action: #selector(openUpdateLogClicked(_:)))
         openLog.bezelStyle = .rounded
 
-        openReleaseButton = NSButton(title: "Open Release Page",
+        openReleaseButton = NSButton(title: t("Открыть страницу релиза", "Open Release Page"),
                                      target: self,
                                      action: #selector(openReleasePageClicked(_:)))
         openReleaseButton.bezelStyle = .rounded
         openReleaseButton.isHidden = true
 
-        closeButton = NSButton(title: "Close",
+        closeButton = NSButton(title: t("Закрыть", "Close"),
                                target: self,
                                action: #selector(closeUpdateProgressClicked(_:)))
         closeButton.bezelStyle = .rounded
@@ -7952,7 +8323,8 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
 
     private func pollState() {
         let state = UpdateProgressState.read(from: launch.statePath)
-            ?? UpdateProgressState(phase: "starting", message: "Starting update...")
+            ?? UpdateProgressState(phase: "starting",
+                                   message: t("Запускаю обновление…", "Starting update…"))
         guard state.phase != lastPhase || state.message != lastMessage else { return }
 
         lastPhase = state.phase
@@ -7963,23 +8335,28 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
         case "failed":
             progress.stopAnimation(nil)
             progress.isHidden = true
-            detailLabel.stringValue = "The existing app was left in place. Open the log for details."
+            detailLabel.stringValue = t("Предыдущая версия сохранена. Подробности доступны в журнале.",
+                                        "The previous version was preserved. Open the log for details.")
             openReleaseButton.isHidden = false
             closeButton.isHidden = false
             NSApp.activate(ignoringOtherApps: true)
         case "complete":
             progress.stopAnimation(nil)
             progress.isHidden = true
-            detailLabel.stringValue = "The updated app is opening. This window will close shortly."
+            detailLabel.stringValue = t("Обновлённое приложение открывается. Это окно скоро закроется.",
+                                        "The updated app is opening. This window will close shortly.")
             closeButton.isHidden = false
             scheduleClose(after: 4)
         case "installing":
-            detailLabel.stringValue = "Parakey has quit so Homebrew can replace the app bundle. It will reopen automatically."
+            detailLabel.stringValue = t("Старая версия закрыта, новая устанавливается. Приложение откроется автоматически.",
+                                        "The old version has closed while the new one is installed. It will reopen automatically.")
         case "relaunching":
-            detailLabel.stringValue = "Closing the updater so macOS opens the newly installed app."
+            detailLabel.stringValue = t("Запускаю новую версию SuperDictate.",
+                                        "Opening the new version of SuperDictate.")
             scheduleClose(after: 0.5)
         default:
-            detailLabel.stringValue = "Parakey will reopen automatically when the update finishes."
+            detailLabel.stringValue = t("SuperDictate автоматически откроется после установки.",
+                                        "SuperDictate will reopen automatically when the update finishes.")
         }
     }
 
@@ -17149,8 +17526,41 @@ private enum ParakeySelfTest {
     private static func testUpdate() throws {
         try testUpdateCheckParsing()
         try testUpdateCheckState()
+        try testDirectUpdateManifest()
         try testUpdateHelperScript()
+        try testDirectUpdateReplacement()
         try testUpdateProgressState()
+    }
+
+    private static func testDirectUpdateManifest() throws {
+        let checksum = String(repeating: "a", count: 64)
+        let validData = Data("{\"version\":\"9.8.7\",\"sha256\":\"\(checksum)\"}".utf8)
+        try expect(
+            try SuperDictateUpdateInstaller.parseManifest(validData,
+                                                           expectedVersion: "9.8.7"),
+            equals: SuperDictateUpdateManifest(version: "9.8.7", sha256: checksum),
+            "direct update manifest should parse a canonical version and SHA-256"
+        )
+
+        do {
+            _ = try SuperDictateUpdateInstaller.parseManifest(validData,
+                                                               expectedVersion: "9.8.8")
+            throw SelfTestFailure.failed("direct update manifest should reject version disagreement")
+        } catch let error as SuperDictateUpdateInstallerError {
+            try expect(error,
+                       equals: .manifestVersionMismatch(expected: "9.8.8", actual: "9.8.7"),
+                       "direct update manifest should describe version disagreement")
+        }
+
+        let invalidChecksum = Data(#"{"version":"9.8.7","sha256":"not-a-checksum"}"#.utf8)
+        do {
+            _ = try SuperDictateUpdateInstaller.parseManifest(invalidChecksum,
+                                                               expectedVersion: "9.8.7")
+            throw SelfTestFailure.failed("direct update manifest should reject malformed checksums")
+        } catch let error as SuperDictateUpdateInstallerError {
+            try expect(error, equals: .invalidManifest,
+                       "direct update manifest should reject malformed checksums")
+        }
     }
 
     private static func testUpdateCheckParsing() throws {
@@ -17564,6 +17974,48 @@ private enum ParakeySelfTest {
             }
         }
 
+        let directScript = superDictateDirectUpdateHelperScript(
+            pid: 123,
+            targetVersion: "9.8.7",
+            statePath: "/tmp/superdictate-update.state",
+            stagedAppPath: "/tmp/work/release/SuperDictate.app",
+            workDirectory: "/tmp/work",
+            backupAppPath: "/Applications/.SuperDictate-update-backup-test.app",
+            appPath: "/Applications/SuperDictate.app",
+            language: .english
+        )
+        for fragment in [
+            "PANEL_PID=123",
+            "TARGET_VERSION='9.8.7'",
+            "STAGED_APP='/tmp/work/release/SuperDictate.app'",
+            "BACKUP_APP='/Applications/.SuperDictate-update-backup-test.app'",
+            "wait_for_panel_exit || rollback",
+            "launchctl bootout \"$SERVICE\"",
+            "/bin/mv \"$APP_PATH\" \"$BACKUP_APP\" || rollback",
+            "/usr/bin/ditto \"$STAGED_APP\" \"$APP_PATH\" || rollback",
+            "/usr/bin/codesign --verify --deep --strict \"$APP_PATH\"",
+            "if [ -d \"$BACKUP_APP\" ]; then",
+            "state \"complete\" 'SuperDictate v9.8.7 is installed.'",
+        ] {
+            guard directScript.contains(fragment) else {
+                throw SelfTestFailure.failed("direct update helper missing fragment: \(fragment)")
+            }
+        }
+        let directTmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("superdictate-direct-update-self-test-\(UUID().uuidString).sh")
+        try directScript.write(to: directTmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: directTmp) }
+        let directProc = Process()
+        directProc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        directProc.arguments = ["-n", directTmp.path]
+        directProc.standardOutput = Pipe()
+        directProc.standardError = Pipe()
+        try directProc.run()
+        directProc.waitUntilExit()
+        guard directProc.terminationStatus == 0 else {
+            throw SelfTestFailure.failed("direct update helper script should pass bash -n")
+        }
+
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("parakey-update-self-test-\(UUID().uuidString).sh")
         try script.write(to: tmp, atomically: true, encoding: .utf8)
@@ -17705,6 +18157,95 @@ private enum ParakeySelfTest {
             equals: "hard target\n",
             "update helper log fallback should leave hard-linked targets untouched"
         )
+    }
+
+    private static func testDirectUpdateReplacement() throws {
+        let fileManager = FileManager.default
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("superdictate-update-replacement-test-\(UUID().uuidString)",
+                                    isDirectory: true)
+        let applications = root.appendingPathComponent("Applications", isDirectory: true)
+        let currentApp = applications.appendingPathComponent("SuperDictate.app", isDirectory: true)
+        let workDirectory = root.appendingPathComponent("work", isDirectory: true)
+        let stagedApp = workDirectory
+            .appendingPathComponent("release", isDirectory: true)
+            .appendingPathComponent("SuperDictate.app", isDirectory: true)
+        let backupApp = applications.appendingPathComponent(".SuperDictate-update-backup.app",
+                                                             isDirectory: true)
+        let statePath = root.appendingPathComponent("state.txt")
+        let helperPath = root.appendingPathComponent("helper.sh")
+        try fileManager.createDirectory(at: applications, withIntermediateDirectories: true)
+        try makeSyntheticSignedUpdateApp(at: currentApp, version: "1.0.0")
+        try makeSyntheticSignedUpdateApp(at: stagedApp, version: "9.8.7")
+        try Data("starting\tStarting update…\n".utf8).write(to: statePath)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let script = superDictateDirectUpdateHelperScript(
+            pid: Int32.max,
+            targetVersion: "9.8.7",
+            statePath: statePath.path,
+            stagedAppPath: stagedApp.path,
+            workDirectory: workDirectory.path,
+            backupAppPath: backupApp.path,
+            appPath: currentApp.path,
+            language: .english,
+            relaunch: false
+        )
+        try script.write(to: helperPath, atomically: true, encoding: .utf8)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [helperPath.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let processOutput = String(data: output.fileHandleForReading.readDataToEndOfFile(),
+                                   encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else {
+            throw SelfTestFailure.failed("direct update replacement failed: \(processOutput)")
+        }
+
+        try SuperDictateUpdateInstaller.validateApp(at: currentApp,
+                                                     expectedVersion: "9.8.7")
+        try expect(fileManager.fileExists(atPath: backupApp.path), equals: false,
+                   "successful direct update should remove its backup")
+        try expect(fileManager.fileExists(atPath: workDirectory.path), equals: false,
+                   "successful direct update should remove staged files")
+        try expect(UpdateProgressState.read(from: statePath.path)?.phase,
+                   equals: Optional("complete"),
+                   "successful direct update should report completion")
+    }
+
+    private static func makeSyntheticSignedUpdateApp(at appURL: URL,
+                                                     version: String) throws {
+        guard let sourceExecutable = Bundle.main.executableURL else {
+            throw SelfTestFailure.failed("self-test executable URL is unavailable")
+        }
+        let fileManager = FileManager.default
+        let executableDirectory = appURL.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try fileManager.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
+        let executableURL = executableDirectory.appendingPathComponent("SuperDictate")
+        try fileManager.copyItem(at: sourceExecutable, to: executableURL)
+        try fileManager.setAttributes([.posixPermissions: 0o755],
+                                      ofItemAtPath: executableURL.path)
+        let info: [String: Any] = [
+            "CFBundleExecutable": "SuperDictate",
+            "CFBundleIdentifier": "com.local.superdictate",
+            "CFBundleName": "SuperDictate",
+            "CFBundlePackageType": "APPL",
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": "1",
+        ]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: info,
+                                                          format: .xml,
+                                                          options: 0)
+        try infoData.write(to: appURL.appendingPathComponent("Contents/Info.plist"))
+        let signing = SuperDictateAgentService.run("/usr/bin/codesign",
+                                                   ["--force", "--deep", "--sign", "-", appURL.path])
+        guard signing.status == 0 else {
+            throw SelfTestFailure.failed("could not sign synthetic update app: \(signing.output)")
+        }
     }
 
     private static func testUpdateProgressState() throws {
@@ -18653,11 +19194,21 @@ private enum ControlPanelServiceOperation: String, Sendable {
     case applyingShortcut
 }
 
+private enum ControlPanelUpdateState: Equatable, Sendable {
+    case checking
+    case upToDate(String)
+    case available(GitHubRelease)
+    case preparing(version: String, phase: String)
+    case failed(String)
+}
+
 @MainActor
 private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
+    private var updateTask: Task<Void, Never>?
+    private var updateState: ControlPanelUpdateState = .checking
     private var lastRenderFingerprint = ""
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
@@ -18673,6 +19224,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         SuperDictateControlPanelRegistry.claimCurrentPanel()
         showWindow()
         startRefreshTimer()
+        checkForUpdates()
         if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
             beginServiceOperation(.starting)
         }
@@ -18688,6 +19240,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        updateTask?.cancel()
+        updateTask = nil
         SuperDictateControlPanelRegistry.clearCurrentPanel()
     }
 
@@ -18759,6 +19313,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
         return [language.rawValue,
                 serviceOperation?.rawValue ?? "idle",
+                updateStateFingerprint(),
                 SuperDictateAgentService.isAgentRunning() ? "running" : "stopped",
                 stateToken,
                 permissions,
@@ -18769,6 +19324,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.recordingHUDTranscribingColor.rawValue,
                 settings.recordingHUDBackgroundStyle.rawValue,
                 permissionClickCount.description].joined(separator: "::")
+    }
+
+    private func updateStateFingerprint() -> String {
+        switch updateState {
+        case .checking:
+            return "checking"
+        case .upToDate(let version):
+            return "current:\(version)"
+        case .available(let release):
+            return "available:\(release.version)"
+        case .preparing(let version, let phase):
+            return "preparing:\(version):\(phase)"
+        case .failed(let message):
+            return "failed:\(message)"
+        }
     }
 
     private func makeContentView() -> NSView {
@@ -18791,6 +19361,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(sectionLabel(t("Фоновая служба", "Background Service")))
         root.addArrangedSubview(serviceStatusView())
         root.addArrangedSubview(serviceButtonsView())
+        root.addArrangedSubview(separator())
+
+        root.addArrangedSubview(sectionLabel(t("Обновления", "Updates")))
+        root.addArrangedSubview(updateStatusView())
         root.addArrangedSubview(separator())
 
         root.addArrangedSubview(sectionLabel(t("Разрешения macOS", "macOS Permissions")))
@@ -19130,6 +19704,240 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func updateStatusView() -> NSView {
+        let currentVersion = currentBundleVersion()
+        switch updateState {
+        case .checking:
+            return statusRow(
+                title: t("Версия SuperDictate", "SuperDictate version"),
+                detail: t("Проверяю GitHub Releases в фоне. Диктовка продолжает работать.",
+                          "Checking GitHub Releases in the background. Dictation keeps working."),
+                status: t("Проверка…", "Checking…"),
+                statusColor: .systemBlue
+            )
+        case .upToDate:
+            return statusRow(
+                title: t("Версия SuperDictate", "SuperDictate version"),
+                detail: t("Установлена v\(currentVersion). Это последняя доступная версия.",
+                          "Version \(currentVersion) is installed. This is the latest release."),
+                status: t("Актуально", "Up to date"),
+                statusColor: .systemGreen,
+                buttonTitle: t("Проверить", "Check"),
+                action: #selector(updateButtonClicked(_:))
+            )
+        case .available(let release):
+            return statusRow(
+                title: t("Доступна SuperDictate v\(release.version)",
+                         "SuperDictate v\(release.version) is available"),
+                detail: t("Сейчас установлена v\(currentVersion). Обновление скачивается, проверяется и устанавливается автоматически.",
+                          "Version \(currentVersion) is installed. The update is downloaded, verified, and installed automatically."),
+                status: t("Есть обновление", "Update available"),
+                statusColor: .systemBlue,
+                buttonTitle: t("Обновить до v\(release.version)", "Update to v\(release.version)"),
+                action: #selector(updateButtonClicked(_:)),
+                buttonEnabled: serviceOperation == nil
+            )
+        case .preparing(let version, let phase):
+            return statusRow(
+                title: t("Обновление до v\(version)", "Updating to v\(version)"),
+                detail: phase,
+                status: t("В процессе", "In progress"),
+                statusColor: .systemBlue
+            )
+        case .failed(let message):
+            return statusRow(
+                title: t("Не удалось проверить или установить обновление",
+                         "Update check or installation failed"),
+                detail: message,
+                status: t("Ошибка", "Failed"),
+                statusColor: .systemRed,
+                buttonTitle: t("Повторить", "Try Again"),
+                action: #selector(updateButtonClicked(_:))
+            )
+        }
+    }
+
+    private func checkForUpdates() {
+        updateTask?.cancel()
+        updateState = .checking
+        refresh(force: true)
+        updateTask = Task { [weak self] in
+            let outcome = await UpdateCheck.fetchLatest()
+            guard !Task.isCancelled, let self else { return }
+            self.updateTask = nil
+            switch outcome {
+            case .success(let release):
+                self.settings.lastUpdateCheckAt = Date()
+                self.settings.lastUpdateCheckSource = .manual
+                self.settings.lastUpdateCheckVersion = release.version
+                if isNewer(release.version, than: currentBundleVersion()) {
+                    self.settings.lastUpdateCheckResult = .available
+                    self.updateState = .available(release)
+                } else {
+                    self.settings.lastUpdateCheckResult = .upToDate
+                    self.updateState = .upToDate(currentBundleVersion())
+                }
+            case .failure(let failure):
+                self.settings.lastUpdateCheckAt = Date()
+                self.settings.lastUpdateCheckSource = .manual
+                self.settings.lastUpdateCheckResult = .failed
+                self.updateState = .failed(self.localizedUpdateFailure(failure))
+            }
+            self.lastRenderFingerprint = ""
+            self.refresh(force: true)
+        }
+    }
+
+    private func localizedUpdateFailure(_ failure: UpdateCheckFailure) -> String {
+        guard language == .russian else { return manualUpdateCheckFailureText(failure) }
+        switch failure {
+        case .network:
+            return "Не удалось связаться с GitHub. Проверьте интернет и повторите попытку."
+        case .httpStatus(403):
+            return "GitHub временно ограничил проверку обновлений. Повторите через несколько минут."
+        case .httpStatus(let code):
+            return "GitHub вернул ошибку HTTP \(code). Повторите попытку позже."
+        case .unexpectedResponse:
+            return "GitHub вернул ответ, который SuperDictate не смог проверить."
+        }
+    }
+
+    private func beginInAppUpdate(for release: GitHubRelease) {
+        guard updateTask == nil else { return }
+        let version = release.version
+        updateState = .preparing(
+            version: version,
+            phase: t("Получаю защищённый манифест обновления…",
+                     "Fetching the verified update manifest…")
+        )
+        refresh(force: true)
+        updateTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let manifest = try await SuperDictateUpdateInstaller.fetchManifest(
+                    expectedVersion: version
+                )
+                guard !Task.isCancelled else { return }
+                self.updateState = .preparing(
+                    version: version,
+                    phase: self.t("Скачиваю архив и проверяю SHA-256…",
+                                  "Downloading the archive and verifying SHA-256…")
+                )
+                self.refresh(force: true)
+                let prepared = try await SuperDictateUpdateInstaller.prepare(manifest: manifest)
+                guard !Task.isCancelled else {
+                    try? FileManager.default.removeItem(at: prepared.workDirectory)
+                    return
+                }
+                self.updateState = .preparing(
+                    version: version,
+                    phase: self.t("Архив проверен. Запускаю установку…",
+                                  "The archive is verified. Starting installation…")
+                )
+                self.refresh(force: true)
+                try self.launchPreparedUpdate(prepared)
+            } catch {
+                self.updateTask = nil
+                let message = (error as? SuperDictateUpdateInstallerError)?
+                    .message(language: self.language) ?? error.localizedDescription
+                self.updateState = .failed(message)
+                self.lastRenderFingerprint = ""
+                self.refresh(force: true)
+            }
+        }
+    }
+
+    private func launchPreparedUpdate(_ prepared: PreparedSuperDictateUpdate) throws {
+        let statePath = try createPrivateUpdateProgressStateFile()
+        let helperLog = try openPrivateUpdateHelperLog()
+        let appURL = Bundle.main.bundleURL
+        let backupURL = appURL.deletingLastPathComponent()
+            .appendingPathComponent(".SuperDictate-update-backup-\(UUID().uuidString).app",
+                                    isDirectory: true)
+        let script = superDictateDirectUpdateHelperScript(
+            pid: getpid(),
+            targetVersion: prepared.version,
+            statePath: statePath,
+            stagedAppPath: prepared.stagedAppURL.path,
+            workDirectory: prepared.workDirectory.path,
+            backupAppPath: backupURL.path,
+            appPath: appURL.path,
+            language: language
+        )
+        let helperPath = try writePrivateUpdateHelperScript(script)
+
+        let progressAppPath: String
+        do {
+            progressAppPath = try launchUpdateProgressApp(
+                statePath: statePath,
+                logPath: helperLog.path,
+                targetVersion: prepared.version
+            )
+        } catch {
+            try? FileManager.default.removeItem(atPath: helperPath)
+            try? FileManager.default.removeItem(atPath: statePath)
+            try? FileManager.default.removeItem(at: prepared.workDirectory)
+            helperLog.handle.closeFile()
+            throw error
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [helperPath]
+        process.environment = systemToolProcessEnvironment()
+        process.standardOutput = helperLog.handle
+        process.standardError = helperLog.handle
+        do {
+            try process.run()
+        } catch {
+            try? FileManager.default.removeItem(atPath: helperPath)
+            try? FileManager.default.removeItem(atPath: statePath)
+            try? FileManager.default.removeItem(at: prepared.workDirectory)
+            try? FileManager.default.removeItem(atPath: progressAppPath)
+            helperLog.handle.closeFile()
+            throw error
+        }
+
+        updateTask = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func launchUpdateProgressApp(statePath: String,
+                                         logPath: String,
+                                         targetVersion: String) throws -> String {
+        let sourceAppURL = Bundle.main.bundleURL
+        guard sourceAppURL.pathExtension == "app",
+              let executableName = Bundle.main.executableURL?.lastPathComponent else {
+            throw posixError(EINVAL)
+        }
+        let progressAppURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("\(UPDATE_PROGRESS_APP_PREFIX)\(UUID().uuidString).app",
+                                    isDirectory: true)
+        try FileManager.default.copyItem(at: sourceAppURL, to: progressAppURL)
+        let executableURL = progressAppURL
+            .appendingPathComponent("Contents/MacOS", isDirectory: true)
+            .appendingPathComponent(executableName)
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = [
+            UPDATE_PROGRESS_ARGUMENT,
+            statePath,
+            logPath,
+            targetVersion,
+            progressAppURL.path,
+        ]
+        process.environment = systemToolProcessEnvironment()
+        do {
+            try process.run()
+            return progressAppURL.path
+        } catch {
+            try? FileManager.default.removeItem(at: progressAppURL)
+            throw error
+        }
+    }
+
     private func permissionRow(_ permission: Permission) -> NSView {
         let granted = Permissions.isGranted(permission)
         let buttonTitle = granted ? nil : ((permissionClickCount[permission] ?? 0) >= 1
@@ -19436,6 +20244,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 return
             }
             try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+    }
+
+    @objc private func updateButtonClicked(_ sender: NSButton) {
+        switch updateState {
+        case .available(let release):
+            beginInAppUpdate(for: release)
+        case .checking, .preparing:
+            return
+        case .upToDate, .failed:
+            checkForUpdates()
         }
     }
 
