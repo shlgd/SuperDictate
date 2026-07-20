@@ -278,6 +278,55 @@ let TRIGGER_DISPLAY: [TriggerMode: String] = [
     .toggle: "Press to toggle",
 ]
 
+enum InterfaceLanguage: String, CaseIterable {
+    case russian = "ru"
+    case english = "en"
+}
+
+func localizedText(_ russian: String,
+                   _ english: String,
+                   language: InterfaceLanguage) -> String {
+    language == .russian ? russian : english
+}
+
+func localizedHotkeyName(_ choice: HotkeyChoice,
+                         language: InterfaceLanguage) -> String {
+    guard language == .russian else { return choice.name }
+    if choice.isModifier {
+        switch choice.keycode {
+        case 59: return "Левый Control"
+        case 62: return "Правый Control"
+        case 58: return "Левый Option"
+        case 61: return "Правый Option"
+        case 56: return "Левый Shift"
+        case 60: return "Правый Shift"
+        case 55: return "Левый Command"
+        case 54: return "Правый Command"
+        default: return choice.name
+        }
+    }
+
+    let keyName: String
+    switch choice.keycode {
+    case 36: keyName = "Return"
+    case 48: keyName = "Tab"
+    case 49: keyName = "Пробел"
+    case 51: keyName = "Delete"
+    case 76: keyName = "Enter"
+    case 115: keyName = "Home"
+    case 116: keyName = "Page Up"
+    case 117: keyName = "Forward Delete"
+    case 119: keyName = "End"
+    case 121: keyName = "Page Down"
+    case 123: keyName = "Стрелка влево"
+    case 124: keyName = "Стрелка вправо"
+    case 125: keyName = "Стрелка вниз"
+    case 126: keyName = "Стрелка вверх"
+    default: keyName = hotkeyKeyName(for: choice.keycode)
+    }
+    return hotkeyModifierSymbols(choice.requiredModifiers) + keyName
+}
+
 enum PasteSuffix: String { case appendSpace = "space", none, appendNewline = "newline" }
 let PASTE_SUFFIX_DISPLAY: [PasteSuffix: String] = [
     .appendSpace: "Append space",
@@ -2375,6 +2424,7 @@ extension ISO8601DateFormatter {
 final class Settings: @unchecked Sendable {
     private static let keyHotkeyKeycode = "hotkey_keycode"
     private static let keyHotkeyModifiers = "hotkey_modifiers"
+    private static let keyInterfaceLanguage = "interface_language"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
     private static let keyRecentTranscripts = "recent_transcripts"
@@ -2454,6 +2504,17 @@ final class Settings: @unchecked Sendable {
     func setConfiguredHotkey(_ choice: HotkeyChoice) {
         hotkeyKeycode = choice.keycode
         hotkeyModifiers = choice.requiredModifiers
+    }
+
+    var interfaceLanguage: InterfaceLanguage {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyInterfaceLanguage),
+                  let language = InterfaceLanguage(rawValue: raw) else {
+                return .russian
+            }
+            return language
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyInterfaceLanguage) }
     }
 
     var triggerMode: TriggerMode {
@@ -3516,13 +3577,21 @@ private struct HotkeyRecorderCaptureState {
 }
 
 @MainActor
-private func presentHotkeyRecorder() -> HotkeyChoice? {
+private func presentHotkeyRecorder(language: InterfaceLanguage) -> HotkeyChoice? {
     let alert = NSAlert()
-    alert.messageText = "Record Dictation Shortcut"
-    alert.informativeText = "Press one keyboard key or a shortcut. It saves immediately; press Escape to cancel."
-    alert.addButton(withTitle: "Cancel")
+    alert.messageText = localizedText("Новое сочетание для диктовки",
+                                      "Record Dictation Shortcut",
+                                      language: language)
+    alert.informativeText = localizedText(
+        "Нажмите одну клавишу или сочетание. Оно сохранится сразу; Escape отменяет запись.",
+        "Press one keyboard key or a shortcut. It saves immediately; press Escape to cancel.",
+        language: language
+    )
+    alert.addButton(withTitle: localizedText("Отмена", "Cancel", language: language))
 
-    let status = NSTextField(labelWithString: "Waiting for a key or shortcut…")
+    let status = NSTextField(labelWithString: localizedText("Жду клавишу или сочетание…",
+                                                            "Waiting for a key or shortcut…",
+                                                            language: language))
     status.font = .systemFont(ofSize: 13, weight: .medium)
     status.textColor = .secondaryLabelColor
     status.lineBreakMode = .byWordWrapping
@@ -3543,7 +3612,12 @@ private func presentHotkeyRecorder() -> HotkeyChoice? {
         )
         switch captureState.consume(snapshot) {
         case .waitingForChord(let choice):
-            status.stringValue = "Release to use \(choice.name), or press another key to record a shortcut."
+            let name = localizedHotkeyName(choice, language: language)
+            status.stringValue = localizedText(
+                "Отпустите, чтобы выбрать «\(name)», или нажмите ещё одну клавишу.",
+                "Release to use \(name), or press another key to record a shortcut.",
+                language: language
+            )
             return nil
         case .complete(let choice):
             selected = choice
@@ -13836,7 +13910,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.stop()
         }
 
-        let selected = presentHotkeyRecorder()
+        let selected = presentHotkeyRecorder(language: settings.interfaceLanguage)
         defer {
             let restartSucceeded: Bool
             if shouldRestoreHotkeyTap && !isTerminating {
@@ -15075,6 +15149,18 @@ private enum ParakeySelfTest {
             hotkeyChoice(forKeycode: CGKeyCode(98)),
             equals: HotkeyChoice(name: "F7", keycode: 98, isModifier: false, modifierFlag: nil),
             "recorded F-key choices should get a stable display name"
+        )
+        try expect(
+            localizedHotkeyName(hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE),
+                                language: .russian),
+            equals: "Правый Command",
+            "Russian UI should localize a modifier-only shortcut"
+        )
+        try expect(
+            localizedHotkeyName(hotkeyChoice(forKeycode: 49, modifiers: .maskAlternate),
+                                language: .russian),
+            equals: "⌥Пробел",
+            "Russian UI should localize a chord key name"
         )
         try expect(
             normalizedHotkeyKeycode(storedValue: NSNumber(value: 999)),
@@ -18446,12 +18532,23 @@ if let status = ParakeySelfTest.run(arguments: Array(CommandLine.arguments.dropF
 }
 #endif
 
+private enum ControlPanelServiceOperation: String, Sendable {
+    case starting
+    case restarting
+    case stopping
+    case applyingShortcut
+}
+
 @MainActor
 private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var refreshTimer: Timer?
+    private var serviceOperation: ControlPanelServiceOperation?
+    private var lastRenderFingerprint = ""
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
+
+    private var language: InterfaceLanguage { settings.interfaceLanguage }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -18460,15 +18557,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         SuperDictateControlPanelRegistry.claimCurrentPanel()
-        if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
-            do {
-                try SuperDictateAgentService.installAndStart()
-            } catch {
-                showError(title: "Couldn't Start Dictation Service", detail: error.localizedDescription)
-            }
-        }
         showWindow()
         startRefreshTimer()
+        if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
+            beginServiceOperation(.starting)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -18476,9 +18569,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return true
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
-    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
@@ -18490,23 +18581,28 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         NSApp.terminate(nil)
     }
 
+    private func t(_ russian: String, _ english: String) -> String {
+        localizedText(russian, english, language: language)
+    }
+
     private func showWindow() {
         if let window {
-            refresh()
+            refresh(force: true)
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
-                              styleMask: [.titled, .closable, .miniaturizable],
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 760),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered,
                               defer: false)
         window.title = "SuperDictate"
+        window.minSize = NSSize(width: 660, height: 620)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
-        refresh()
+        refresh(force: true)
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -18514,86 +18610,144 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func startRefreshTimer() {
         refreshTimer?.invalidate()
-        refreshTimer = Timer.scheduledTimer(timeInterval: 1.0,
+        refreshTimer = Timer.scheduledTimer(timeInterval: 0.75,
                                             target: self,
                                             selector: #selector(refreshTimerFired(_:)),
                                             userInfo: nil,
                                             repeats: true)
-        refreshTimer?.tolerance = 0.25
+        refreshTimer?.tolerance = 0.15
     }
 
     @objc private func refreshTimerFired(_ timer: Timer) {
         refresh()
     }
 
-    private func refresh() {
-        window?.contentView = makeContentView()
+    private func refresh(force: Bool = false) {
+        guard let window else { return }
+        let fingerprint = renderFingerprint()
+        guard force || fingerprint != lastRenderFingerprint else { return }
+        lastRenderFingerprint = fingerprint
+        window.title = t("SuperDictate — панель управления", "SuperDictate — Control Panel")
+        window.contentView = makeContentView()
+    }
+
+    private func renderFingerprint() -> String {
+        let state = AgentRuntimeStateStore.read()
+        let permissions = Permission.allCases.map { Permissions.isGranted($0) ? "1" : "0" }.joined()
+        let stateToken: String
+        if serviceOperation != nil {
+            stateToken = "operation"
+        } else {
+            stateToken = [state?.status ?? "none",
+                          state?.detail ?? "",
+                          String(state?.pid ?? 0),
+                          state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
+        }
+        return [language.rawValue,
+                serviceOperation?.rawValue ?? "idle",
+                SuperDictateAgentService.isAgentRunning() ? "running" : "stopped",
+                stateToken,
+                permissions,
+                settings.configuredHotkey.name,
+                settings.triggerMode.rawValue,
+                settings.optionCommandEnterAfterDictation ? "1" : "0",
+                settings.recordingHUDRecordingColor.rawValue,
+                settings.recordingHUDTranscribingColor.rawValue,
+                settings.recordingHUDBackgroundStyle.rawValue,
+                permissionClickCount.description].joined(separator: "::")
     }
 
     private func makeContentView() -> NSView {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 16
-        root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 20, right: 24)
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 24, left: 26, bottom: 24, right: 26)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = panelLabel("SuperDictate", size: 24, weight: .semibold)
-        let subtitle = panelLabel("Control panel. Closing this window does not stop dictation.",
-                                  size: 13,
-                                  color: .secondaryLabelColor)
-        root.addArrangedSubview(title)
-        root.addArrangedSubview(subtitle)
+        root.addArrangedSubview(headerView())
+        if let serviceOperation {
+            root.addArrangedSubview(operationBanner(serviceOperation))
+        }
+
+        root.addArrangedSubview(sectionLabel(t("Состояние", "Overview")))
+        root.addArrangedSubview(overviewCardsView())
         root.addArrangedSubview(separator())
 
-        root.addArrangedSubview(sectionLabel("Service"))
+        root.addArrangedSubview(sectionLabel(t("Фоновая служба", "Background Service")))
         root.addArrangedSubview(serviceStatusView())
         root.addArrangedSubview(serviceButtonsView())
-
         root.addArrangedSubview(separator())
-        root.addArrangedSubview(sectionLabel("Permissions"))
+
+        root.addArrangedSubview(sectionLabel(t("Разрешения macOS", "macOS Permissions")))
         for permission in Permission.allCases {
             root.addArrangedSubview(permissionRow(permission))
         }
-
         root.addArrangedSubview(separator())
-        root.addArrangedSubview(sectionLabel("Settings"))
+
+        root.addArrangedSubview(sectionLabel(t("Настройки", "Settings")))
         root.addArrangedSubview(statusRow(
-            title: "Dictation shortcut",
-            detail: "\(settings.configuredHotkey.name), \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue.lowercased())",
+            title: t("Сочетание для диктовки", "Dictation shortcut"),
+            detail: "\(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(triggerModeText())",
             status: "",
             statusColor: .secondaryLabelColor,
-            buttonTitle: "Change…",
-            action: #selector(recordDictationShortcutClicked(_:))
+            buttonTitle: t("Изменить…", "Change…"),
+            action: #selector(recordDictationShortcutClicked(_:)),
+            buttonEnabled: serviceOperation == nil
         ))
-        root.addArrangedSubview(checkboxRow(title: "Option + Command sends Enter",
-                                            detail: "Off: the dictation shortcut sends Enter, and Right Option + Right Command finishes without Enter.",
-                                            isOn: settings.optionCommandEnterAfterDictation,
-                                            action: #selector(toggleOptionCommandEnterClicked(_:))))
-        root.addArrangedSubview(popupRow(title: "Recording color",
-                                         detail: "Color used while the microphone is listening.",
-                                         selectedValue: settings.recordingHUDRecordingColor.rawValue,
-                                         options: RecordingHUDAccentColor.allCases.map { ($0.displayName, $0.rawValue) },
-                                         action: #selector(selectRecordingHUDRecordingColor(_:))))
-        root.addArrangedSubview(popupRow(title: "Transcribing color",
-                                         detail: "Color used while speech is being converted to text.",
-                                         selectedValue: settings.recordingHUDTranscribingColor.rawValue,
-                                         options: RecordingHUDAccentColor.allCases.map { ($0.displayName, $0.rawValue) },
-                                         action: #selector(selectRecordingHUDTranscribingColor(_:))))
-        root.addArrangedSubview(popupRow(title: "HUD background",
-                                         detail: "Capsule background follows the system appearance or stays fixed.",
-                                         selectedValue: settings.recordingHUDBackgroundStyle.rawValue,
-                                         options: RecordingHUDBackgroundStyle.allCases.map { ($0.displayName, $0.rawValue) },
-                                         action: #selector(selectRecordingHUDBackgroundStyle(_:))))
+        root.addArrangedSubview(checkboxRow(
+            title: t("Правый Option + правый Command отправляет Enter",
+                     "Right Option + Right Command sends Enter"),
+            detail: t("Если выключено, Enter отправляет обычное сочетание диктовки.",
+                      "When off, the regular dictation shortcut sends Enter."),
+            isOn: settings.optionCommandEnterAfterDictation,
+            action: #selector(toggleOptionCommandEnterClicked(_:))
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Цвет записи", "Recording color"),
+            detail: t("Цвет аудиоволн, пока микрофон слушает.",
+                      "Color used while the microphone is listening."),
+            selectedValue: settings.recordingHUDRecordingColor.rawValue,
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDRecordingColor(_:))
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Цвет транскрибации", "Transcribing color"),
+            detail: t("Цвет анимации во время распознавания речи.",
+                      "Color used while speech is being converted to text."),
+            selectedValue: settings.recordingHUDTranscribingColor.rawValue,
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDTranscribingColor(_:))
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Фон капсулы", "HUD background"),
+            detail: t("Системная тема или постоянный светлый/тёмный фон.",
+                      "Follow the system appearance or use a fixed background."),
+            selectedValue: settings.recordingHUDBackgroundStyle.rawValue,
+            options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDBackgroundStyle(_:))
+        ))
+        root.addArrangedSubview(privacyInfoView())
 
-        let container = NSView()
-        container.addSubview(root)
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(root)
+
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = document
+
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            root.topAnchor.constraint(equalTo: container.topAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
-            root.widthAnchor.constraint(equalToConstant: 620),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            root.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            root.topAnchor.constraint(equalTo: document.topAnchor),
+            root.bottomAnchor.constraint(equalTo: document.bottomAnchor),
         ])
 
         let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
@@ -18601,57 +18755,274 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             view.widthAnchor.constraint(equalTo: root.widthAnchor,
                                         constant: innerWidthInset).isActive = true
         }
-        return container
+        return scroll
+    }
+
+    private func headerView() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel("SuperDictate", size: 25, weight: .semibold))
+        text.addArrangedSubview(panelLabel(
+            t("Панель можно закрыть — диктовка продолжит работать в фоне.",
+              "You can close this panel; dictation keeps running in the background."),
+            size: 13,
+            color: .secondaryLabelColor
+        ))
+
+        let version = panelLabel("v\(currentBundleVersion())", size: 12, color: .tertiaryLabelColor)
+        version.setContentHuggingPriority(.required, for: .horizontal)
+
+        let languageControl = NSSegmentedControl(labels: ["RU", "EN"],
+                                                 trackingMode: .selectOne,
+                                                 target: self,
+                                                 action: #selector(selectInterfaceLanguage(_:)))
+        languageControl.selectedSegment = language == .russian ? 0 : 1
+        languageControl.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(version)
+        row.addArrangedSubview(languageControl)
+        return row
+    }
+
+    private func overviewCardsView() -> NSView {
+        let state = AgentRuntimeStateStore.read()
+        let running = SuperDictateAgentService.isAgentRunning()
+        let permissionCount = Permission.allCases.filter(Permissions.isGranted).count
+        let service = servicePresentation(running: running, state: state)
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.distribution = .fillEqually
+        row.spacing = 10
+        let modelReady = running && state?.speechModelReady == true
+        let cards = [
+            infoCard(symbol: "bolt.horizontal.circle.fill",
+                     title: t("Служба", "Service"),
+                     value: service.status,
+                     detail: running ? t("Фоновый процесс активен", "Background process active")
+                                     : t("Фоновый процесс выключен", "Background process is off"),
+                     color: service.color),
+            infoCard(symbol: "waveform.badge.mic",
+                     title: t("Модель", "Model"),
+                     value: modelReady ? t("Готова", "Ready") : t("Загрузка", "Loading"),
+                     detail: "Parakeet TDT v3 · \(t("локально", "local"))",
+                     color: modelReady ? .systemGreen : .systemOrange),
+            infoCard(symbol: "keyboard",
+                     title: t("Хоткей", "Shortcut"),
+                     value: localizedHotkeyName(settings.configuredHotkey, language: language),
+                     detail: triggerModeText(),
+                     color: settings.recordingHUDRecordingColor.nsColor),
+            infoCard(symbol: permissionCount == Permission.allCases.count
+                        ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
+                     title: t("Доступы", "Permissions"),
+                     value: t("\(permissionCount) из \(Permission.allCases.count)",
+                              "\(permissionCount) of \(Permission.allCases.count)"),
+                     detail: permissionCount == Permission.allCases.count
+                        ? t("Все разрешения выданы", "All permissions granted")
+                        : t("Нужна настройка", "Setup required"),
+                     color: permissionCount == Permission.allCases.count ? .systemGreen : .systemOrange),
+        ]
+        for card in cards { row.addArrangedSubview(card) }
+        for card in cards.dropFirst() {
+            card.widthAnchor.constraint(equalTo: cards[0].widthAnchor).isActive = true
+        }
+        return row
+    }
+
+    private func infoCard(symbol: String,
+                          title: String,
+                          value: String,
+                          detail: String,
+                          color: NSColor) -> NSView {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 8
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.72).cgColor
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
+        card.layer?.borderWidth = 1
+
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 5
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        let top = NSStackView()
+        top.orientation = .horizontal
+        top.alignment = .centerY
+        top.spacing = 6
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol,
+                                              accessibilityDescription: title) ?? NSImage())
+        icon.contentTintColor = color
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        top.addArrangedSubview(icon)
+        top.addArrangedSubview(panelLabel(title, size: 11, weight: .medium, color: .secondaryLabelColor))
+
+        let valueLabel = panelLabel(value, size: 15, weight: .semibold)
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.maximumNumberOfLines = 1
+        let detailLabel = panelLabel(detail, size: 10.5, color: .secondaryLabelColor)
+        detailLabel.maximumNumberOfLines = 2
+
+        content.addArrangedSubview(top)
+        content.addArrangedSubview(valueLabel)
+        content.addArrangedSubview(detailLabel)
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 108),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            content.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -10),
+        ])
+        return card
+    }
+
+    private func operationBanner(_ operation: ControlPanelServiceOperation) -> NSView {
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 8
+        box.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.10).cgColor
+        box.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.28).cgColor
+        box.layer?.borderWidth = 1
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.startAnimation(nil)
+        spinner.setContentHuggingPriority(.required, for: .horizontal)
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        text.addArrangedSubview(panelLabel(operationTitle(operation), size: 13, weight: .semibold))
+        text.addArrangedSubview(panelLabel(operationDetail(operation), size: 12, color: .secondaryLabelColor))
+
+        let row = NSStackView(views: [spinner, text])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        row.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+            row.topAnchor.constraint(equalTo: box.topAnchor, constant: 11),
+            row.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -11),
+        ])
+        return box
+    }
+
+    private func operationTitle(_ operation: ControlPanelServiceOperation) -> String {
+        switch operation {
+        case .starting: return t("Запускаю службу диктовки", "Starting dictation service")
+        case .restarting: return t("Перезапускаю фоновую службу", "Restarting background service")
+        case .stopping: return t("Останавливаю фоновую службу", "Stopping background service")
+        case .applyingShortcut: return t("Сохраняю сочетание и перезапускаю службу",
+                                         "Saving shortcut and restarting service")
+        }
+    }
+
+    private func operationDetail(_ operation: ControlPanelServiceOperation) -> String {
+        switch operation {
+        case .starting:
+            return t("Подключаю глобальный хоткей и локальную модель. Обычно 1–3 секунды; при первой загрузке дольше.",
+                     "Enabling the global shortcut and local model. Usually 1–3 seconds; the first download takes longer.")
+        case .restarting, .applyingShortcut:
+            return t("Диктовка временно недоступна. Панель не зависла — новый воркер уже запускается.",
+                     "Dictation is temporarily unavailable. The panel is responsive while the new worker starts.")
+        case .stopping:
+            return t("Хоткей перестанет работать, но настройки и история сохранятся.",
+                     "The shortcut will stop; settings and history remain saved.")
+        }
+    }
+
+    private func servicePresentation(running: Bool,
+                                     state: AgentRuntimeState?) -> (status: String, detail: String, color: NSColor) {
+        if let operation = serviceOperation {
+            return (operationTitle(operation), operationDetail(operation), .systemBlue)
+        }
+        if running, let state {
+            return (displayStatus(state.status), localizedServiceDetail(state), colorForStatus(state.status))
+        }
+        if running {
+            return (t("Запускается", "Starting"),
+                    t("Фоновый процесс запущен и готовит модель.", "The background process is preparing the model."),
+                    .systemOrange)
+        }
+        return (settings.agentEnabled ? t("Остановлена", "Stopped") : t("Выключена", "Off"),
+                t("Хоткей не работает, пока служба не запущена.",
+                  "The shortcut is unavailable until the service starts."),
+                settings.agentEnabled ? .systemRed : .secondaryLabelColor)
     }
 
     private func serviceStatusView() -> NSView {
         let running = SuperDictateAgentService.isAgentRunning()
         let state = AgentRuntimeStateStore.read()
-        let statusText: String
-        let detailText: String
-        let color: NSColor
+        let presentation = servicePresentation(running: running, state: state)
+        let metadata = serviceMetadata(running: running, state: state)
+        return statusRow(title: t("Служба диктовки", "Dictation service"),
+                         detail: "\(presentation.detail)\n\(metadata)",
+                         status: presentation.status,
+                         statusColor: presentation.color)
+    }
 
-        if running, let state {
-            statusText = displayStatus(state.status)
-            detailText = state.detail
-            color = colorForStatus(state.status)
-        } else if running {
-            statusText = "Starting"
-            detailText = "Dictation service is launching."
-            color = .systemOrange
-        } else {
-            statusText = settings.agentEnabled ? "Stopped" : "Off"
-            detailText = settings.agentEnabled
-                ? "The \(settings.configuredHotkey.name) dictation shortcut is off until the service is started."
-                : "Dictation service is off. Press Start to turn it back on."
-            color = settings.agentEnabled ? .systemRed : .secondaryLabelColor
+    private func serviceMetadata(running: Bool, state: AgentRuntimeState?) -> String {
+        var parts = ["SuperDictate v\(currentBundleVersion())"]
+        if running, let state, state.pid > 0 { parts.append("PID \(state.pid)") }
+        if let state, state.updatedAt > 0 {
+            let formatter = DateFormatter()
+            formatter.timeStyle = .medium
+            formatter.dateStyle = .none
+            parts.append("\(t("обновлено", "updated")) \(formatter.string(from: Date(timeIntervalSince1970: state.updatedAt)))")
         }
-
-        return statusRow(title: "Dictation service",
-                         detail: detailText,
-                         status: statusText,
-                         statusColor: color)
+        return parts.joined(separator: "  ·  ")
     }
 
     private func serviceButtonsView() -> NSView {
+        let running = SuperDictateAgentService.isAgentRunning()
+        let enabled = serviceOperation == nil
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
-        row.addArrangedSubview(panelButton("Start", action: #selector(startAgentClicked(_:))))
-        row.addArrangedSubview(panelButton("Restart", action: #selector(restartAgentClicked(_:))))
-        row.addArrangedSubview(panelButton("Stop", action: #selector(stopAgentClicked(_:))))
+        row.addArrangedSubview(panelButton(t("Запустить", "Start"),
+                                           symbol: "play.fill",
+                                           action: #selector(startAgentClicked(_:)),
+                                           enabled: enabled && !running))
+        row.addArrangedSubview(panelButton(t("Перезапустить", "Restart"),
+                                           symbol: "arrow.clockwise",
+                                           action: #selector(restartAgentClicked(_:)),
+                                           enabled: enabled && running))
+        row.addArrangedSubview(panelButton(t("Остановить", "Stop"),
+                                           symbol: "stop.fill",
+                                           action: #selector(stopAgentClicked(_:)),
+                                           enabled: enabled && running))
         row.addArrangedSubview(NSView())
-        row.addArrangedSubview(panelButton("Close Panel", action: #selector(closePanelClicked(_:))))
+        row.addArrangedSubview(panelButton(t("Закрыть панель", "Close Panel"),
+                                           symbol: "xmark",
+                                           action: #selector(closePanelClicked(_:))))
         return row
     }
 
     private func permissionRow(_ permission: Permission) -> NSView {
         let granted = Permissions.isGranted(permission)
-        let buttonTitle = granted ? nil : ((permissionClickCount[permission] ?? 0) >= 1 ? "Try Again" : "Grant")
-        return statusRow(title: permission.rawValue,
+        let buttonTitle = granted ? nil : ((permissionClickCount[permission] ?? 0) >= 1
+            ? t("Повторить", "Try Again") : t("Разрешить", "Grant"))
+        return statusRow(title: permissionTitle(permission),
                          detail: permissionDetail(permission),
-                         status: granted ? "Granted" : "Missing",
+                         status: granted ? t("Разрешено", "Granted") : t("Нет доступа", "Missing"),
                          statusColor: granted ? .systemGreen : .systemOrange,
                          buttonTitle: buttonTitle,
                          action: granted ? nil : #selector(grantPermissionClicked(_:)),
@@ -18664,7 +19035,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                            statusColor: NSColor,
                            buttonTitle: String? = nil,
                            action: Selector? = nil,
-                           tag: Int = 0) -> NSView {
+                           tag: Int = 0,
+                           buttonEnabled: Bool = true) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -18673,10 +19045,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 2
+        text.spacing = 3
         text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
         let detailLabel = panelLabel(detail, size: 12, color: .secondaryLabelColor)
-        detailLabel.preferredMaxLayoutWidth = 350
+        detailLabel.preferredMaxLayoutWidth = 440
         text.addArrangedSubview(detailLabel)
 
         let statusLabel = panelLabel(status, size: 12, weight: .medium, color: statusColor)
@@ -18686,9 +19058,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(statusLabel)
-
         if let buttonTitle, let action {
-            let button = panelButton(buttonTitle, action: action)
+            let button = panelButton(buttonTitle, action: action, enabled: buttonEnabled)
             button.tag = tag
             row.addArrangedSubview(button)
         }
@@ -18711,13 +19082,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 2
+        text.spacing = 3
         text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
         text.addArrangedSubview(panelLabel(detail, size: 12, color: .secondaryLabelColor))
-
         row.addArrangedSubview(checkbox)
         row.addArrangedSubview(text)
-        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return row
     }
 
@@ -18734,14 +19103,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 2
+        text.spacing = 3
         text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
         text.addArrangedSubview(panelLabel(detail, size: 12, color: .secondaryLabelColor))
 
         let popup = NSPopUpButton()
         popup.target = self
         popup.action = action
-        popup.controlSize = .regular
         for option in options {
             popup.addItem(withTitle: option.title)
             popup.lastItem?.representedObject = option.value
@@ -18750,11 +19118,27 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             popup.select(item)
         }
         popup.setContentHuggingPriority(.required, for: .horizontal)
-
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(popup)
-        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return row
+    }
+
+    private func privacyInfoView() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        let icon = NSImageView(image: NSImage(systemSymbolName: "lock.shield.fill",
+                                              accessibilityDescription: nil) ?? NSImage())
+        icon.contentTintColor = .secondaryLabelColor
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(panelLabel(
+            t("Аудио и распознавание остаются на Mac. Интернет нужен только для первой загрузки модели и обновлений.",
+              "Audio and transcription stay on this Mac. Internet is only used for the first model download and updates."),
+            size: 11.5,
+            color: .secondaryLabelColor
+        ))
         return row
     }
 
@@ -18774,10 +19158,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return label
     }
 
-    private func panelButton(_ title: String, action: Selector) -> NSButton {
+    private func panelButton(_ title: String,
+                             symbol: String? = nil,
+                             action: Selector,
+                             enabled: Bool = true) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
         button.controlSize = .regular
+        button.isEnabled = enabled
+        if let symbol, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) {
+            button.image = image
+            button.imagePosition = .imageLeading
+        }
         button.setContentHuggingPriority(.required, for: .horizontal)
         return button
     }
@@ -18788,17 +19180,39 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return box
     }
 
+    private func triggerModeText() -> String {
+        switch settings.triggerMode {
+        case .hold: return t("Удерживать", "Press and hold")
+        case .toggle: return t("Нажать для старта и ещё раз для остановки", "Press to start, press again to stop")
+        }
+    }
+
     private func displayStatus(_ raw: String) -> String {
         switch raw {
-        case "ready": return "Running"
-        case "recording": return "Recording"
-        case "transcribing": return "Transcribing"
-        case "starting": return "Starting"
-        case "needs_permissions": return "Needs Access"
-        case "error": return "Error"
-        case "stopping": return "Stopping"
-        case "stopped": return "Stopped"
+        case "ready": return t("Работает", "Running")
+        case "recording": return t("Запись", "Recording")
+        case "transcribing": return t("Распознавание", "Transcribing")
+        case "starting": return t("Запускается", "Starting")
+        case "needs_permissions": return t("Нужен доступ", "Needs Access")
+        case "error": return t("Ошибка", "Error")
+        case "stopping": return t("Останавливается", "Stopping")
+        case "stopped": return t("Остановлена", "Stopped")
         default: return raw.capitalized
+        }
+    }
+
+    private func localizedServiceDetail(_ state: AgentRuntimeState) -> String {
+        switch state.status {
+        case "ready":
+            return t("Готово. Хоткей: \(localizedHotkeyName(settings.configuredHotkey, language: language)).",
+                     "Ready. Shortcut: \(settings.configuredHotkey.name).")
+        case "recording": return t("Микрофон записывает текущую диктовку.", "The microphone is recording dictation.")
+        case "transcribing": return t("Локальная модель преобразует речь в текст.", "The local model is converting speech to text.")
+        case "starting": return t("Загружаю модель и подключаю глобальный хоткей.", "Loading the model and enabling the global shortcut.")
+        case "needs_permissions": return t("Выдайте недостающие разрешения ниже.", "Grant the missing permissions below.")
+        case "stopped": return t("Фоновая служба остановлена.", "The background service is stopped.")
+        case "error": return t("Служба сообщила об ошибке: \(state.detail)", "Service error: \(state.detail)")
+        default: return state.detail
         }
     }
 
@@ -18811,48 +19225,130 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func permissionTitle(_ permission: Permission) -> String {
+        switch permission {
+        case .microphone: return t("Микрофон", "Microphone")
+        case .accessibility: return t("Универсальный доступ", "Accessibility")
+        case .inputMonitoring: return t("Мониторинг ввода", "Input Monitoring")
+        }
+    }
+
     private func permissionDetail(_ permission: Permission) -> String {
         switch permission {
         case .microphone:
-            return "Lets the service hear your voice while dictation is active."
+            return t("Запись голоса только во время активной диктовки.",
+                     "Lets the service hear your voice while dictation is active.")
         case .accessibility:
-            return "Lets the service paste the transcript at your cursor."
+            return t("Поиск активного поля и вставка готового текста.",
+                     "Lets the service find the active field and insert text.")
         case .inputMonitoring:
-            return "Lets the service hear your dictation shortcut globally."
+            return t("Глобальное распознавание выбранного сочетания клавиш.",
+                     "Lets the service detect your shortcut globally.")
+        }
+    }
+
+    private func localizedColorName(_ color: RecordingHUDAccentColor) -> String {
+        guard language == .russian else { return color.displayName }
+        switch color {
+        case .red: return "Красный"
+        case .orange: return "Оранжевый"
+        case .pink: return "Розовый"
+        case .purple: return "Фиолетовый"
+        case .blue: return "Синий"
+        case .cyan: return "Голубой"
+        case .green: return "Зелёный"
+        case .white: return "Белый"
+        }
+    }
+
+    private func localizedBackgroundName(_ style: RecordingHUDBackgroundStyle) -> String {
+        guard language == .russian else { return style.displayName }
+        switch style {
+        case .system: return "Как в системе"
+        case .dark: return "Тёмный"
+        case .light: return "Светлый"
+        }
+    }
+
+    private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
+        guard serviceOperation == nil else { return }
+        serviceOperation = operation
+        lastRenderFingerprint = ""
+        refresh(force: true)
+        let operationStartedAt = Date().timeIntervalSince1970
+
+        Task { [weak self] in
+            let failure = await Task.detached(priority: .userInitiated) { () -> String? in
+                do {
+                    switch operation {
+                    case .starting:
+                        try SuperDictateAgentService.installAndStart()
+                    case .restarting, .applyingShortcut:
+                        try SuperDictateAgentService.restart()
+                    case .stopping:
+                        SuperDictateAgentService.stop()
+                    }
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+
+            guard let self else { return }
+            if failure == nil {
+                await self.waitForServiceResult(operation: operation, startedAt: operationStartedAt)
+            }
+            self.serviceOperation = nil
+            self.lastRenderFingerprint = ""
+            self.refresh(force: true)
+            if let failure {
+                self.showError(
+                    title: self.t("Не удалось изменить состояние службы", "Service operation failed"),
+                    detail: failure
+                )
+            }
+        }
+    }
+
+    private func waitForServiceResult(operation: ControlPanelServiceOperation,
+                                      startedAt: TimeInterval) async {
+        for _ in 0..<80 {
+            let state = AgentRuntimeStateStore.read()
+            if operation == .stopping {
+                if state?.status == "stopped" { return }
+            } else if let state,
+                      state.updatedAt >= startedAt,
+                      ["ready", "error", "needs_permissions"].contains(state.status) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 
     @objc private func startAgentClicked(_ sender: NSButton) {
         settings.agentEnabled = true
-        do {
-            try SuperDictateAgentService.installAndStart()
-        } catch {
-            showError(title: "Couldn't Start Dictation Service", detail: error.localizedDescription)
-        }
-        refresh()
+        _ = settings.refreshFromDisk()
+        beginServiceOperation(.starting)
     }
 
     @objc private func restartAgentClicked(_ sender: NSButton) {
         settings.agentEnabled = true
-        do {
-            try SuperDictateAgentService.restart()
-        } catch {
-            showError(title: "Couldn't Restart Dictation Service", detail: error.localizedDescription)
-        }
-        refresh()
+        _ = settings.refreshFromDisk()
+        beginServiceOperation(.restarting)
     }
 
     @objc private func stopAgentClicked(_ sender: NSButton) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Stop Dictation Service?"
-        alert.informativeText = "The \(settings.configuredHotkey.name) dictation shortcut will stop until you start the service again."
-        alert.addButton(withTitle: "Keep Running")
-        alert.addButton(withTitle: "Stop Service")
+        alert.messageText = t("Остановить службу диктовки?", "Stop Dictation Service?")
+        alert.informativeText = t("Хоткей перестанет работать, но история, модель и настройки сохранятся.",
+                                  "The shortcut will stop, but history, model, and settings remain saved.")
+        alert.addButton(withTitle: t("Оставить включённой", "Keep Running"))
+        alert.addButton(withTitle: t("Остановить", "Stop Service"))
         guard alert.runModal() == .alertSecondButtonReturn else { return }
         settings.agentEnabled = false
-        SuperDictateAgentService.stop()
-        refresh()
+        _ = settings.refreshFromDisk()
+        beginServiceOperation(.stopping)
     }
 
     @objc private func closePanelClicked(_ sender: NSButton) {
@@ -18860,43 +19356,44 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
-        guard let selected = presentHotkeyRecorder() else { return }
+        guard let selected = presentHotkeyRecorder(language: language) else { return }
         settings.setConfiguredHotkey(selected)
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
-        do {
-            try SuperDictateAgentService.restart()
-        } catch {
-            showError(title: "Shortcut Saved, but Service Restart Failed",
-                      detail: "Open SuperDictate and press Restart. \(error.localizedDescription)")
-        }
-        refresh()
+        beginServiceOperation(.applyingShortcut)
+    }
+
+    @objc private func selectInterfaceLanguage(_ sender: NSSegmentedControl) {
+        settings.interfaceLanguage = sender.selectedSegment == 1 ? .english : .russian
+        _ = settings.refreshFromDisk()
+        lastRenderFingerprint = ""
+        refresh(force: true)
     }
 
     @objc private func toggleOptionCommandEnterClicked(_ sender: NSButton) {
         settings.optionCommandEnterAfterDictation = sender.state == .on
-        refresh()
+        refresh(force: true)
     }
 
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
         settings.recordingHUDRecordingColor = color
-        refresh()
+        refresh(force: true)
     }
 
     @objc private func selectRecordingHUDTranscribingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
         settings.recordingHUDTranscribingColor = color
-        refresh()
+        refresh(force: true)
     }
 
     @objc private func selectRecordingHUDBackgroundStyle(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let style = RecordingHUDBackgroundStyle(rawValue: raw) else { return }
         settings.recordingHUDBackgroundStyle = style
-        refresh()
+        refresh(force: true)
     }
 
     @objc private func grantPermissionClicked(_ sender: NSButton) {
@@ -18904,7 +19401,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let permission = Permission.allCases[sender.tag]
         if Permissions.isGranted(permission) {
             permissionClickCount[permission] = nil
-            refresh()
+            refresh(force: true)
             return
         }
 
@@ -18914,12 +19411,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             TCC.reset(permission, bundleID: Bundle.main.bundleIdentifier ?? SETTINGS_SUITE) { [weak self] in
                 guard let self else { return }
                 Permissions.request(permission)
-                self.refresh()
+                self.refresh(force: true)
             }
         } else {
             Permissions.request(permission)
         }
-        refresh()
+        refresh(force: true)
     }
 
     private func showError(title: String, detail: String) {
@@ -18927,7 +19424,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         alert.alertStyle = .warning
         alert.messageText = title
         alert.informativeText = detail
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: t("ОК", "OK"))
         alert.runModal()
     }
 }
