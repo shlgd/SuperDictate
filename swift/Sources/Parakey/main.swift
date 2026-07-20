@@ -5364,7 +5364,7 @@ enum SpeechModelTextRepair {
         if !replaceWithYo {
             result = result
                 .replacingOccurrences(of: #"\s+([.,!?;:])"#, with: "$1", options: .regularExpression)
-                .replacingOccurrences(of: "  ", with: " ")
+                .replacingOccurrences(of: #"[ \t]+"#, with: " ", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return result
@@ -9681,7 +9681,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
         hotkey.onShowHistory = { [weak self] in self?.toggleHistoryOverlay() }
         hotkey.onRejectedBusyPress = { [weak self] in
-            guard let self, self.settings.playFeedbackSounds else { return }
+            guard let self, self.isBusy, self.settings.playFeedbackSounds else { return }
             Sounds.playError()
         }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
@@ -19118,6 +19118,16 @@ private enum ParakeySelfTest {
             removedUnkPunctuation,
             equals: "Hello, world.",
             "removing <unk> should not leave a space before punctuation"
+        )
+
+        let removedUnkMultiSpace = SpeechModelTextRepair.apply(
+            to: "Hello <unk>   world",
+            language: .english
+        )
+        try expect(
+            removedUnkMultiSpace,
+            equals: "Hello world",
+            "removing <unk> should collapse multi-space runs left behind"
         )
 
         let removedUnkFrench = SpeechModelTextRepair.apply(
