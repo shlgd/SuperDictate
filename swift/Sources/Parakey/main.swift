@@ -128,6 +128,10 @@ enum MenuBarState {
 enum RecordingHUDMode {
     case recording
     case transcribing
+    /// Brief flash shown when a dictation fails (transcription error,
+    /// paste failure). Renders a static yellow capsule so the user
+    /// gets visual feedback even when the menu-bar icon is hidden.
+    case error
 }
 
 /// A global dictation shortcut: either one modifier key or a regular
@@ -1890,12 +1894,16 @@ func visibleRecordingLevel(rawLevel: Float) -> Float {
 }
 
 func recordingHUDPhaseSpeed(mode: RecordingHUDMode, level: Float) -> CGFloat {
-    guard mode == .recording else {
+    switch mode {
+    case .recording:
+        let voiceLevel = CGFloat(visibleRecordingLevel(rawLevel: level))
+        return RECORDING_HUD_RECORDING_BASE_PHASE_SPEED
+            + (voiceLevel * RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED)
+    case .transcribing:
         return RECORDING_HUD_TRANSCRIBING_PHASE_SPEED
+    case .error:
+        return 0
     }
-    let voiceLevel = CGFloat(visibleRecordingLevel(rawLevel: level))
-    return RECORDING_HUD_RECORDING_BASE_PHASE_SPEED
-        + (voiceLevel * RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED)
 }
 
 struct TranscriptCorrectionSyncMergeResult: Equatable {
@@ -5290,8 +5298,22 @@ actor TranscriptionWorker {
 // used exactly as the user typed it.
 
 enum SpeechModelTextRepair {
-    static func apply(to text: String) -> String {
+    /// Parakeet TDT v3 emits `<unk>` for Cyrillic "ё" in Russian text.
+    /// For Russian and auto-detect (the app's default audience) the
+    /// token is replaced with "ё"/"Ё". For every other language the
+    /// token is genuinely unknown and is removed entirely so a stray
+    /// Cyrillic character doesn't appear in English/French/etc. text.
+    static func apply(to text: String,
+                      language: DictationLanguage = .auto) -> String {
         guard text.localizedCaseInsensitiveContains("<unk>") else { return text }
+
+        let replaceWithYo: Bool
+        switch language {
+        case .auto, .russian:
+            replaceWithYo = true
+        default:
+            replaceWithYo = false
+        }
 
         var result = ""
         result.reserveCapacity(text.count)
@@ -5299,12 +5321,20 @@ enum SpeechModelTextRepair {
 
         while index < text.endIndex {
             if matchesUnknownToken(in: text, at: index) {
-                result.append(shouldCapitalizeYo(before: result) ? "Ё" : "ё")
+                if replaceWithYo {
+                    result.append(shouldCapitalizeYo(before: result) ? "Ё" : "ё")
+                }
                 index = text.index(index, offsetBy: 5)
             } else {
                 result.append(text[index])
                 index = text.index(after: index)
             }
+        }
+
+        if !replaceWithYo {
+            result = result
+                .replacingOccurrences(of: "  ", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return result
     }
@@ -5571,9 +5601,10 @@ private struct DictationTextProcessingResult: Equatable {
 
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
-                                    removeFillerWords: Bool) -> DictationTextProcessingResult {
+                                    removeFillerWords: Bool,
+                                    language: DictationLanguage = .auto) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-    let repaired = SpeechModelTextRepair.apply(to: trimmed)
+    let repaired = SpeechModelTextRepair.apply(to: trimmed, language: language)
     let corrected = TranscriptCorrector.apply(to: repaired, corrections: corrections)
 
     guard removeFillerWords else {
@@ -8104,9 +8135,12 @@ private final class RecordingHUDView: NSView {
         let palette = backgroundPalette(alpha: capsuleAlpha)
         palette.fill.setFill()
         capsule.fill()
-        let accent = mode == .transcribing
-            ? transcribingColor
-            : recordingColor
+        let accent: NSColor
+        switch mode {
+        case .transcribing: accent = transcribingColor
+        case .error:        accent = .systemYellow
+        case .recording:    accent = recordingColor
+        }
         let vividAccent = accent
         if showsCapsuleStroke {
             palette.stroke.setStroke()
@@ -8127,6 +8161,11 @@ private final class RecordingHUDView: NSView {
 
         if mode == .transcribing {
             drawTranscribingWave(in: capsuleRect, alpha: 1)
+            return
+        }
+
+        if mode == .error {
+            drawErrorIndicator(in: capsuleRect)
             return
         }
 
@@ -8239,6 +8278,33 @@ private final class RecordingHUDView: NSView {
             fillColor.withAlphaComponent((0.58 + (0.26 * front) + (0.20 * reversePulse) + (0.14 * conversion)) * alpha).setFill()
             path.fill()
         }
+    }
+
+    /// Static exclamation mark drawn inside the yellow error capsule.
+    private func drawErrorIndicator(in capsuleRect: NSRect) {
+        let visualScale = self.visualScale
+        let accent = NSColor.systemYellow
+        let stemWidth: CGFloat = 2.4 * visualScale
+        let stemHeight: CGFloat = min(capsuleRect.height * 0.38, 9 * visualScale)
+        let dotDiameter: CGFloat = 2.4 * visualScale
+        let gap: CGFloat = 2.0 * visualScale
+        let totalHeight = stemHeight + gap + dotDiameter
+        let topY = capsuleRect.midY + (totalHeight / 2)
+
+        let stemRect = NSRect(x: capsuleRect.midX - (stemWidth / 2),
+                              y: topY - stemHeight,
+                              width: stemWidth,
+                              height: stemHeight)
+        accent.withAlphaComponent(0.88).setFill()
+        NSBezierPath(roundedRect: stemRect,
+                     xRadius: stemWidth / 2,
+                     yRadius: stemWidth / 2).fill()
+
+        let dotRect = NSRect(x: capsuleRect.midX - (dotDiameter / 2),
+                             y: topY - totalHeight,
+                             width: dotDiameter,
+                             height: dotDiameter)
+        NSBezierPath(ovalIn: dotRect).fill()
     }
 
     private func smoothstep(_ edge0: CGFloat, _ edge1: CGFloat, _ value: CGFloat) -> CGFloat {
@@ -9984,7 +10050,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let timing = transcription.timing(totalSeconds: completedAt - requestedAt)
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
-                                                       removeFillerWords: settings.removeFillerWords)
+                                                       removeFillerWords: settings.removeFillerWords,
+                                                       language: settings.dictationLanguage)
                 if !processed.text.isEmpty {
                     addToHistory(
                         processed.text,
@@ -11192,19 +11259,28 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Visible + audible cue that a press produced no pasted text — the
     // transcription threw, or the paste itself failed. Without it the menu
     // bar just slips back to idle and the user can't tell their speech was
-    // dropped from "pasted somewhere I wasn't looking." The sound honours
-    // the feedback-sounds toggle; the icon flash always fires since it's the
-    // only signal for users who run silent.
+    // dropped from "pasted somewhere I wasn't looking."
+    //
+    // The error sound plays unconditionally (not gated by
+    // playFeedbackSounds): start/done sounds are optional polish, but
+    // a dropped dictation is a failure the user must notice. The HUD
+    // flash provides a visual channel for users who run silent or
+    // have the menu-bar icon hidden.
     private func signalDictationFailure() {
-        if settings.playFeedbackSounds {
-            Sounds.playError()
-        }
-        flashErrorMenuBarIcon()
+        Sounds.playError()
+        flashErrorFeedback()
     }
 
-    private func flashErrorMenuBarIcon() {
+    /// Flashes both the menu-bar icon (error tint) and the recording
+    /// HUD (static yellow capsule with exclamation mark) for
+    /// DICTATION_ERROR_FLASH_SECONDS. A single work item owns both
+    /// channels so they always expire together.
+    private func flashErrorFeedback() {
         errorFlashWorkItem?.cancel()
         setMenuBarState(.error)
+        if settings.showRecordingWaveform {
+            showRecordingHUD(mode: .error, level: 0)
+        }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.errorFlashWorkItem = nil
@@ -11213,6 +11289,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // error state, or termination all own it and must not be stomped.
             guard self.isReady, !self.isRecording, !self.isBusy, !self.isTerminating else { return }
             self.setMenuBarState(.idle)
+            self.hideRecordingHUD()
             self.rebuildMenu()
         }
         errorFlashWorkItem = work
@@ -11222,7 +11299,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Recording loop
 
     private func handlePress() {
-        guard isReady, !isRecording, !isBusy, !isTerminating else { return }
+        guard isReady, !isRecording, !isBusy, !isTerminating else {
+            // Audible cue when the previous transcription is still in
+            // flight — without it the press vanishes silently and the
+            // user thinks the hotkey broke. Only fires for the busy
+            // case; model-loading and termination have their own UI.
+            if isBusy, settings.playFeedbackSounds {
+                Sounds.playError()
+            }
+            return
+        }
         let missing = missingPermissions()
         guard missing.isEmpty else {
             enterPermissionBlockedState(missing: missing, reason: "hotkey press")
@@ -11350,7 +11436,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let postprocessingStartedAt = ProcessInfo.processInfo.systemUptime
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
-                                                           removeFillerWords: settings.removeFillerWords)
+                                                           removeFillerWords: settings.removeFillerWords,
+                                                           language: settings.dictationLanguage)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
                         log("transcript corrections applied: \(processed.appliedCorrectionCount)")
@@ -11506,7 +11593,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if !isTerminating {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
-                                                           removeFillerWords: settings.removeFillerWords)
+                                                           removeFillerWords: settings.removeFillerWords,
+                                                           language: settings.dictationLanguage)
                     if !processed.text.isEmpty {
                         addToHistory(
                             processed.text,
@@ -16877,6 +16965,11 @@ private enum ParakeySelfTest {
             equals: RECORDING_HUD_TRANSCRIBING_PHASE_SPEED,
             "transcribing animation speed should not depend on stale microphone level"
         )
+        try expect(
+            recordingHUDPhaseSpeed(mode: .error, level: 0),
+            equals: 0,
+            "error HUD should be static (zero phase speed)"
+        )
     }
 
     private static func testAudioConversion() throws {
@@ -18941,6 +19034,50 @@ private enum ParakeySelfTest {
             repairedYo.text,
             equals: "Ёлка, моё и её. Потом ёжик.",
             "dictation text processing should repair Parakeet unknown tokens used for Cyrillic yo"
+        )
+
+        let repairedYoRussian = processedDictationText(
+            rawTranscript: "  <unk>лка.  ",
+            corrections: [],
+            removeFillerWords: false,
+            language: .russian
+        )
+        try expect(
+            repairedYoRussian.text,
+            equals: "Ёлка.",
+            "explicit Russian language should repair <unk> to ё"
+        )
+
+        let removedUnkEnglish = processedDictationText(
+            rawTranscript: "  Hello <unk> world.  ",
+            corrections: [],
+            removeFillerWords: false,
+            language: .english
+        )
+        try expect(
+            removedUnkEnglish.text,
+            equals: "Hello world.",
+            "non-Russian language should remove <unk> tokens, not replace with Cyrillic ё"
+        )
+
+        let removedUnkFrench = SpeechModelTextRepair.apply(
+            to: "Bonjour <unk> le monde.",
+            language: .french
+        )
+        try expect(
+            removedUnkFrench,
+            equals: "Bonjour le monde.",
+            "SpeechModelTextRepair should strip <unk> for French"
+        )
+
+        let autoYo = SpeechModelTextRepair.apply(
+            to: "<unk>лка",
+            language: .auto
+        )
+        try expect(
+            autoYo,
+            equals: "Ёлка",
+            "auto-detect language should preserve the ё repair for the default audience"
         )
 
         let markerText = systemAudioMuteMarkerText(pid: 12345,
