@@ -3678,7 +3678,9 @@ private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
     private let saveButton: NSButton
     private var captureState = HotkeyRecorderCaptureState()
     private var selected: HotkeyChoice?
-    private var monitor: Any?
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var fallbackMonitor: Any?
     private var completion: ((HotkeyChoice?) -> Void)?
     private var isFinished = false
 
@@ -3780,14 +3782,30 @@ private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
 
     func present(relativeTo parent: NSWindow? = nil) {
         guard !isFinished else { return }
-        if monitor != nil {
+        if eventTap != nil || fallbackMonitor != nil {
             panel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
-            self?.consume(event)
-            return nil
+        if !startEventTap() {
+            log("Hotkey recorder: CGEventTap unavailable; using AppKit fallback")
+            fallbackMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.keyDown, .keyUp, .flagsChanged]
+            ) { [weak self] event in
+                let typeRawValue: UInt32
+                switch event.type {
+                case .flagsChanged: typeRawValue = CGEventType.flagsChanged.rawValue
+                case .keyUp: typeRawValue = CGEventType.keyUp.rawValue
+                default: typeRawValue = CGEventType.keyDown.rawValue
+                }
+                self?.consume(HotkeyEventSnapshot(
+                    typeRawValue: typeRawValue,
+                    keycode: CGKeyCode(event.keyCode),
+                    flagsRawValue: hotkeyFlags(from: event.modifierFlags).rawValue,
+                    isAutoRepeat: event.isARepeat
+                ))
+                return nil
+            }
         }
 
         if let parent, let screen = parent.screen {
@@ -3824,20 +3842,66 @@ private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
         return false
     }
 
-    private func consume(_ event: NSEvent) {
+    private func startEventTap() -> Bool {
+        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)
+            | (1 << CGEventType.flagsChanged.rawValue)
+        let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+        guard let eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                let recorder = Unmanaged<HotkeyRecorderController>
+                    .fromOpaque(userInfo)
+                    .takeUnretainedValue()
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    MainActor.assumeIsolated {
+                        if let eventTap = recorder.eventTap {
+                            CGEvent.tapEnable(tap: eventTap, enable: true)
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                let snapshot = HotkeyEventSnapshot(
+                    typeRawValue: type.rawValue,
+                    keycode: CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
+                    flagsRawValue: event.flags.rawValue,
+                    isAutoRepeat: type == .keyDown
+                        && event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+                )
+                MainActor.assumeIsolated {
+                    recorder.consume(snapshot)
+                }
+                return nil
+            },
+            userInfo: opaqueSelf
+        ) else {
+            return false
+        }
+
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0) else {
+            CFMachPortInvalidate(eventTap)
+            return false
+        }
+        self.eventTap = eventTap
+        runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        log("Hotkey recorder: dedicated CGEventTap active")
+        return true
+    }
+
+    private func consume(_ snapshot: HotkeyEventSnapshot) {
         guard !isFinished else { return }
-        let snapshot = HotkeyEventSnapshot(
-            typeRawValue: event.type == .flagsChanged
-                ? CGEventType.flagsChanged.rawValue
-                : CGEventType.keyDown.rawValue,
-            keycode: CGKeyCode(event.keyCode),
-            flagsRawValue: hotkeyFlags(from: event.modifierFlags).rawValue,
-            isAutoRepeat: event.isARepeat
-        )
+        log("Hotkey recorder: event type=\(snapshot.typeRawValue) keycode=\(snapshot.keycode) flags=0x\(String(snapshot.flagsRawValue, radix: 16))")
         switch captureState.consume(snapshot) {
         case .candidate(let choice):
             selected = choice
             saveButton.isEnabled = true
+            log("Hotkey recorder: selected \(choice.name)")
             status.stringValue = localizedText(
                 "Выбрано: \(localizedHotkeyName(choice, language: language))",
                 "Selected: \(localizedHotkeyName(choice, language: language))",
@@ -3862,10 +3926,19 @@ private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
     private func finish(with choice: HotkeyChoice?) {
         guard !isFinished else { return }
         isFinished = true
-        if let monitor {
-            NSEvent.removeMonitor(monitor)
-            self.monitor = nil
+        if let fallbackMonitor {
+            NSEvent.removeMonitor(fallbackMonitor)
+            self.fallbackMonitor = nil
         }
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+        }
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
+        eventTap = nil
+        runLoopSource = nil
         panel.delegate = nil
         panel.orderOut(nil)
         panel.close()
