@@ -3689,128 +3689,167 @@ private struct HotkeyRecorderCaptureState {
 }
 
 @MainActor
-private final class HotkeyRecorderWindowDelegate: NSObject, NSWindowDelegate {
-    private(set) var didSave = false
+private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
+    private let language: InterfaceLanguage
+    private let panel: NSPanel
+    private let status: NSTextField
+    private let saveButton: NSButton
+    private var captureState = HotkeyRecorderCaptureState()
+    private var selected: HotkeyChoice?
+    private var monitor: Any?
+    private var completion: ((HotkeyChoice?) -> Void)?
+    private var isFinished = false
 
-    @objc func save(_ sender: NSButton) {
-        didSave = true
-        NSApp.abortModal()
+    init(language: InterfaceLanguage,
+         titleOverride: String? = nil,
+         completion: @escaping (HotkeyChoice?) -> Void) {
+        self.language = language
+        self.completion = completion
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        status = NSTextField(labelWithString: localizedText(
+            "Ничего не выбрано",
+            "Nothing selected",
+            language: language
+        ))
+        saveButton = NSButton(title: localizedText("Сохранить", "Save", language: language),
+                              target: nil,
+                              action: nil)
+        super.init()
+
+        panel.title = "SuperDictate"
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.delegate = self
+
+        let title = NSTextField(labelWithString: titleOverride ?? localizedText(
+            "Новое сочетание для диктовки",
+            "Record Dictation Shortcut",
+            language: language
+        ))
+        title.font = .systemFont(ofSize: 19, weight: .semibold)
+
+        let instruction = NSTextField(wrappingLabelWithString: localizedText(
+            "Нажмите одну клавишу или любое сочетание. Изменение применится только после «Сохранить». Escape закроет окно без изменений.",
+            "Press one key or any shortcut. It changes only after you click Save. Escape closes without changes.",
+            language: language
+        ))
+        instruction.font = .systemFont(ofSize: 13)
+        instruction.textColor = .secondaryLabelColor
+
+        status.font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
+        status.textColor = .labelColor
+        status.lineBreakMode = .byTruncatingMiddle
+
+        let statusContainer = NSBox()
+        statusContainer.boxType = .custom
+        statusContainer.cornerRadius = 7
+        statusContainer.borderWidth = 1
+        statusContainer.borderColor = .separatorColor
+        statusContainer.fillColor = .controlBackgroundColor
+        statusContainer.contentViewMargins = NSSize(width: 14, height: 10)
+        statusContainer.contentView = status
+        statusContainer.heightAnchor.constraint(equalToConstant: 42).isActive = true
+
+        saveButton.target = self
+        saveButton.action = #selector(save(_:))
+        saveButton.bezelStyle = .rounded
+        saveButton.isEnabled = false
+        saveButton.keyEquivalent = ""
+
+        let cancelButton = NSButton(
+            title: localizedText("Отмена", "Cancel", language: language),
+            target: self,
+            action: #selector(cancelClicked(_:))
+        )
+        cancelButton.bezelStyle = .rounded
+        cancelButton.keyEquivalent = ""
+
+        let buttonSpacer = NSView()
+        buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let buttonRow = NSStackView(views: [buttonSpacer, cancelButton, saveButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 10
+
+        let stack = NSStackView(views: [title, instruction, statusContainer, buttonRow])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        instruction.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        statusContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let contentView = NSView()
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 22),
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -18),
+        ])
+        panel.contentView = contentView
     }
 
-    @objc func cancel(_ sender: Any?) {
-        didSave = false
-        NSApp.abortModal()
+    func present(relativeTo parent: NSWindow? = nil) {
+        guard !isFinished else { return }
+        if monitor != nil {
+            panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            self?.consume(event)
+            return nil
+        }
+
+        if let parent, let screen = parent.screen {
+            let frame = panel.frame
+            let parentFrame = parent.frame
+            let visibleFrame = screen.visibleFrame
+            let x = min(max(visibleFrame.minX, parentFrame.midX - frame.width / 2),
+                        visibleFrame.maxX - frame.width)
+            let y = min(max(visibleFrame.minY, parentFrame.midY - frame.height / 2),
+                        visibleFrame.maxY - frame.height)
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+        } else {
+            panel.center()
+        }
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func cancel() {
+        finish(with: nil)
+    }
+
+    @objc private func save(_ sender: NSButton) {
+        guard let selected else { return }
+        finish(with: selected)
+    }
+
+    @objc private func cancelClicked(_ sender: NSButton) {
+        cancel()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        cancel(nil)
+        cancel()
         return false
     }
-}
 
-@MainActor
-private func presentHotkeyRecorder(language: InterfaceLanguage,
-                                   titleOverride: String? = nil) -> HotkeyChoice? {
-    let panel = NSPanel(
-        contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    panel.title = "SuperDictate"
-    panel.isReleasedWhenClosed = false
-    panel.level = .floating
-    panel.center()
-
-    let actionTarget = HotkeyRecorderWindowDelegate()
-    panel.delegate = actionTarget
-
-    let title = NSTextField(labelWithString: titleOverride ?? localizedText(
-        "Новое сочетание для диктовки",
-        "Record Dictation Shortcut",
-        language: language
-    ))
-    title.font = .systemFont(ofSize: 19, weight: .semibold)
-
-    let instruction = NSTextField(wrappingLabelWithString: localizedText(
-        "Глобальная диктовка на паузе. Нажмите клавишу или сочетание; ничего не применится, пока вы не нажмёте «Сохранить».",
-        "Global dictation is paused. Press a key or shortcut; nothing changes until you click Save.",
-        language: language
-    ))
-    instruction.font = .systemFont(ofSize: 13)
-    instruction.textColor = .secondaryLabelColor
-
-    let status = NSTextField(labelWithString: localizedText(
-        "Ничего не выбрано",
-        "Nothing selected",
-        language: language
-    ))
-    status.font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
-    status.textColor = .labelColor
-    status.lineBreakMode = .byTruncatingMiddle
-
-    let statusContainer = NSBox()
-    statusContainer.boxType = .custom
-    statusContainer.cornerRadius = 7
-    statusContainer.borderWidth = 1
-    statusContainer.borderColor = .separatorColor
-    statusContainer.fillColor = .controlBackgroundColor
-    statusContainer.contentViewMargins = NSSize(width: 14, height: 10)
-    statusContainer.contentView = status
-    statusContainer.heightAnchor.constraint(equalToConstant: 42).isActive = true
-
-    let saveButton = NSButton(
-        title: localizedText("Сохранить", "Save", language: language),
-        target: actionTarget,
-        action: #selector(HotkeyRecorderWindowDelegate.save(_:))
-    )
-    saveButton.bezelStyle = .rounded
-    saveButton.isEnabled = false
-    saveButton.keyEquivalent = ""
-
-    let cancelButton = NSButton(
-        title: localizedText("Отмена", "Cancel", language: language),
-        target: actionTarget,
-        action: #selector(HotkeyRecorderWindowDelegate.cancel(_:))
-    )
-    cancelButton.bezelStyle = .rounded
-    cancelButton.keyEquivalent = ""
-
-    let buttonSpacer = NSView()
-    buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    let buttonRow = NSStackView(views: [buttonSpacer, cancelButton, saveButton])
-    buttonRow.orientation = .horizontal
-    buttonRow.alignment = .centerY
-    buttonRow.spacing = 10
-
-    let stack = NSStackView(views: [title, instruction, statusContainer, buttonRow])
-    stack.orientation = .vertical
-    stack.alignment = .leading
-    stack.spacing = 14
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    instruction.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-    statusContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-    buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-
-    let contentView = NSView()
-    contentView.addSubview(stack)
-    NSLayoutConstraint.activate([
-        stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 22),
-        stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
-        stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
-        stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -18)
-    ])
-    panel.contentView = contentView
-
-    var selected: HotkeyChoice?
-    var captureState = HotkeyRecorderCaptureState()
-    let monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
+    private func consume(_ event: NSEvent) {
+        guard !isFinished else { return }
         let snapshot = HotkeyEventSnapshot(
             typeRawValue: event.type == .flagsChanged
                 ? CGEventType.flagsChanged.rawValue
                 : CGEventType.keyDown.rawValue,
             keycode: CGKeyCode(event.keyCode),
-            flagsRawValue: event.cgEvent?.flags.rawValue ?? 0,
+            flagsRawValue: hotkeyFlags(from: event.modifierFlags).rawValue,
             isAutoRepeat: event.isARepeat
         )
         switch captureState.consume(snapshot) {
@@ -3819,21 +3858,18 @@ private func presentHotkeyRecorder(language: InterfaceLanguage,
             saveButton.isEnabled = false
             let name = localizedHotkeyName(choice, language: language)
             status.stringValue = localizedText(
-                "Удерживайте \(name) и нажмите ещё одну клавишу или отпустите для выбора одной кнопки",
-                "Hold \(name) and press another key, or release it to select that key alone",
+                "Удерживайте \(name) и нажмите другую клавишу — или отпустите, чтобы выбрать только \(name)",
+                "Hold \(name) and press another key, or release it to choose \(name) alone",
                 language: language
             )
-            return nil
         case .candidate(let choice):
             selected = choice
             saveButton.isEnabled = true
-            let name = localizedHotkeyName(choice, language: language)
             status.stringValue = localizedText(
-                "Выбрано: \(name)",
-                "Selected: \(name)",
+                "Выбрано: \(localizedHotkeyName(choice, language: language))",
+                "Selected: \(localizedHotkeyName(choice, language: language))",
                 language: language
             )
-            return nil
         case .reject(let message):
             selected = nil
             saveButton.isEnabled = false
@@ -3843,25 +3879,37 @@ private func presentHotkeyRecorder(language: InterfaceLanguage,
                 language: language
             )
             NSSound.beep()
-            return nil
         case .cancel:
-            actionTarget.cancel(nil)
-            return nil
+            cancel()
         case .ignore:
-            return nil
+            break
         }
-    }
-    defer {
-        if let monitor {
-            NSEvent.removeMonitor(monitor)
-        }
-        panel.orderOut(nil)
     }
 
-    panel.makeKeyAndOrderFront(nil)
-    NSApp.activate(ignoringOtherApps: true)
-    _ = NSApp.runModal(for: panel)
-    return actionTarget.didSave ? selected : nil
+    private func finish(with choice: HotkeyChoice?) {
+        guard !isFinished else { return }
+        isFinished = true
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+        panel.delegate = nil
+        panel.orderOut(nil)
+        panel.close()
+        let completion = self.completion
+        self.completion = nil
+        completion?(choice)
+    }
+}
+
+private func hotkeyFlags(from modifiers: NSEvent.ModifierFlags) -> CGEventFlags {
+    var result: CGEventFlags = []
+    if modifiers.contains(.control) { result.insert(.maskControl) }
+    if modifiers.contains(.option) { result.insert(.maskAlternate) }
+    if modifiers.contains(.shift) { result.insert(.maskShift) }
+    if modifiers.contains(.command) { result.insert(.maskCommand) }
+    if modifiers.contains(.function) { result.insert(.maskSecondaryFn) }
+    return result
 }
 
 private enum HotkeyTransitionAction: Equatable, Sendable {
@@ -9297,6 +9345,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var workspacePowerObservers: [NSObjectProtocol] = []
     private var hotkeyPausedForExternalCapture = false
     private var hotkeyCaptureFailsafeTimer: Timer?
+    private var hotkeyRecorder: HotkeyRecorderController?
     private var shouldResumeRuntimeAfterWake = false
     private var didLogDeferredWakeRecovery = false
     private var didOfferSetupChecklistThisLaunch = false
@@ -9558,6 +9607,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         isTerminating = true
+        hotkeyRecorder?.cancel()
+        hotkeyRecorder = nil
         publishAgentState(status: "stopping", detail: "Dictation service is stopping.")
         settings.hasActiveRunMarker = false
         startupTask?.cancel()
@@ -14600,6 +14651,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func showHotkeyRecorder() {
         guard !isRecording, !isBusy, !isTerminating else { return }
+        if let hotkeyRecorder {
+            hotkeyRecorder.present()
+            return
+        }
         showAppForModal()
 
         let shouldRestoreHotkeyTap = isReady
@@ -14607,23 +14662,24 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.stop()
         }
 
-        let selected = presentHotkeyRecorder(language: settings.interfaceLanguage)
-        defer {
+        let recorder = HotkeyRecorderController(language: settings.interfaceLanguage) { [weak self] selected in
+            guard let self else { return }
+            self.hotkeyRecorder = nil
             let restartSucceeded: Bool
-            if shouldRestoreHotkeyTap && !isTerminating {
-                restartSucceeded = hotkey.start()
+            if shouldRestoreHotkeyTap && !self.isTerminating {
+                restartSucceeded = self.hotkey.start()
             } else {
                 restartSucceeded = false
             }
             switch hotkeyRecorderRestartAction(
                 shouldRestoreHotkeyTap: shouldRestoreHotkeyTap,
-                isTerminating: isTerminating,
+                isTerminating: self.isTerminating,
                 restartSucceeded: restartSucceeded
             ) {
             case .none, .restoredListener:
                 break
             case .recordFailure:
-                recordStartupFailure(
+                self.recordStartupFailure(
                     stage: .hotkeyListener,
                     error: NSError(
                         domain: "Parakey",
@@ -14635,12 +14691,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     reason: "hotkey recorder"
                 )
             }
+            guard let selected else { return }
+            if self.applyHotkeyChoice(selected) {
+                log("HotkeyListener: recorded hotkey → \(selected.name)")
+            }
         }
-
-        guard let selected else { return }
-        if applyHotkeyChoice(selected) {
-            log("HotkeyListener: recorded hotkey → \(selected.name)")
-        }
+        hotkeyRecorder = recorder
+        recorder.present()
     }
 
     private func showHotkeyRecordError(_ message: String) {
@@ -15958,6 +16015,28 @@ private enum ParakeySelfTest {
     }
 
     private static func testHotkeyRecorderCaptureFlow() throws {
+        try expect(
+            hotkeyFlags(from: [.command, .option]),
+            equals: [.maskCommand, .maskAlternate],
+            "recorder should translate AppKit modifier flags without relying on an optional CGEvent"
+        )
+
+        var singleCommand = HotkeyRecorderCaptureState()
+        let commandDown = event(.flagsChanged,
+                                keycode: RIGHT_COMMAND_KEYCODE,
+                                flags: CGEventFlags.maskCommand.rawValue)
+        let rightCommand = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        try expect(
+            singleCommand.consume(commandDown),
+            equals: .waitingForChord(rightCommand),
+            "recorder should begin capturing a lone Right Command press"
+        )
+        try expect(
+            singleCommand.consume(event(.flagsChanged, keycode: RIGHT_COMMAND_KEYCODE)),
+            equals: .candidate(rightCommand),
+            "releasing Right Command should select it as a one-key shortcut"
+        )
+
         var singleModifier = HotkeyRecorderCaptureState()
         let optionDown = event(.flagsChanged,
                                keycode: 58,
@@ -19561,6 +19640,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
+    private var hotkeyRecorder: HotkeyRecorderController?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -19587,6 +19667,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        hotkeyRecorder?.cancel()
+        hotkeyRecorder = nil
         refreshTimer?.invalidate()
         refreshTimer = nil
         updateTask?.cancel()
@@ -19597,6 +19679,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     func windowWillClose(_ notification: Notification) {
         guard let closingWindow = notification.object as? NSWindow else { return }
         if closingWindow === settingsWindow {
+            hotkeyRecorder?.cancel()
+            hotkeyRecorder = nil
             settingsWindow = nil
             settingsDraft = nil
             return
@@ -20872,6 +20956,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
         guard serviceOperation == nil,
               let kind = ControlPanelShortcutKind(rawValue: sender.tag) else { return }
+        if let hotkeyRecorder {
+            hotkeyRecorder.present(relativeTo: settingsWindow)
+            return
+        }
         let state = AgentRuntimeStateStore.read()
         if state?.isRecording == true || state?.isTranscribing == true {
             showError(
@@ -20896,7 +20984,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             userInfo: nil,
             deliverImmediately: true
         )
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.12))
         let recorderTitle: String
         switch kind {
         case .withoutEnter:
@@ -20904,22 +20991,30 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .withEnter:
             recorderTitle = t("Новое сочетание с Enter", "Shortcut With Enter")
         }
-        let selected = presentHotkeyRecorder(language: language,
-                                             titleOverride: recorderTitle)
-        DistributedNotificationCenter.default().postNotificationName(
-            HOTKEY_CAPTURE_END_NOTIFICATION,
-            object: nil,
-            userInfo: nil,
-            deliverImmediately: true
-        )
-        guard let selected else { return }
-        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        switch kind {
-        case .withoutEnter: draft.hotkeyWithoutEnter = selected
-        case .withEnter: draft.hotkeyWithEnter = selected
+        let recorder = HotkeyRecorderController(language: language,
+                                                titleOverride: recorderTitle) { [weak self] selected in
+            DistributedNotificationCenter.default().postNotificationName(
+                HOTKEY_CAPTURE_END_NOTIFICATION,
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+            guard let self else { return }
+            self.hotkeyRecorder = nil
+            guard let selected else { return }
+            var draft = self.settingsDraft ?? ControlPanelSettingsDraft(settings: self.settings)
+            switch kind {
+            case .withoutEnter: draft.hotkeyWithoutEnter = selected
+            case .withEnter: draft.hotkeyWithEnter = selected
+            }
+            self.settingsDraft = draft
+            self.refreshSettingsWindow()
         }
-        settingsDraft = draft
-        refreshSettingsWindow()
+        hotkeyRecorder = recorder
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self, weak recorder] in
+            guard self?.hotkeyRecorder === recorder else { return }
+            recorder?.present(relativeTo: self?.settingsWindow)
+        }
     }
 
     @objc private func selectInterfaceLanguage(_ sender: NSSegmentedControl) {
