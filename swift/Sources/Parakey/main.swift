@@ -19954,11 +19954,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                        "Start recording or insert the transcribed text.")
         ))
         root.addArrangedSubview(hotkeyRow(
-            title: t("Диктовка + Enter", "Dictation + Enter"),
+            title: t("Завершить + Enter", "Finish + Enter"),
             shortcut: draft.hotkeyWithEnter,
             kind: .withEnter,
-            toolTip: t("Вставить распознанный текст и нажать Enter.",
-                       "Insert the transcribed text and press Enter.")
+            toolTip: t("Только завершить текущую запись, вставить текст и нажать Enter.",
+                       "Only finish the current recording, insert its text, and press Enter.")
         ))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
@@ -20122,7 +20122,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.addArrangedSubview(panelLabel(presentation.status, size: 14, weight: .semibold))
         let primaryShortcut = "\(t("Диктовка", "Dictation")): \(localizedHotkeyName(settings.configuredHotkey, language: language))"
         let historyShortcut = "\(t("История", "History")): \(localizedHotkeyName(settings.configuredHistoryHotkey, language: language))"
-        let enterShortcut = "\(t("С Enter", "With Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
+        let enterShortcut = "\(t("Завершить + Enter", "Finish + Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
         let detail = panelLabel(
             "\(presentation.detail)\n\(primaryShortcut) · \(historyShortcut)",
             size: 11.5,
@@ -21112,7 +21112,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .withoutEnter:
             recorderTitle = t("Новое сочетание для диктовки", "New Dictation Shortcut")
         case .withEnter:
-            recorderTitle = t("Новое сочетание с Enter", "New Enter Shortcut")
+            recorderTitle = t("Сочетание «Завершить + Enter»", "Finish + Enter Shortcut")
         case .history:
             recorderTitle = t("Новое сочетание для истории", "New History Shortcut")
         }
