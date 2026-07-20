@@ -3646,7 +3646,6 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
 }
 
 private enum HotkeyRecorderCaptureResult: Equatable {
-    case waitingForChord(HotkeyChoice)
     case candidate(HotkeyChoice)
     case reject(String)
     case cancel
@@ -3654,31 +3653,14 @@ private enum HotkeyRecorderCaptureResult: Equatable {
 }
 
 private struct HotkeyRecorderCaptureState {
-    private var pendingModifier: HotkeyChoice?
-
     mutating func consume(_ event: HotkeyEventSnapshot) -> HotkeyRecorderCaptureResult {
         if event.typeRawValue == CGEventType.keyDown.rawValue,
            event.keycode == ESCAPE_KEYCODE {
-            pendingModifier = nil
             return .cancel
         }
 
-        if event.typeRawValue == CGEventType.flagsChanged.rawValue,
-           let pendingModifier,
-           pendingModifier.keycode == event.keycode {
-            self.pendingModifier = nil
-            return .candidate(pendingModifier)
-        }
-
         switch hotkeyRecordingDecision(for: event) {
-        case .accept(let choice) where choice.isModifier && !choice.requiredModifiers.isEmpty:
-            pendingModifier = nil
-            return .candidate(choice)
-        case .accept(let choice) where choice.isModifier:
-            pendingModifier = choice
-            return .waitingForChord(choice)
         case .accept(let choice):
-            pendingModifier = nil
             return .candidate(choice)
         case .reject(let message):
             return .reject(message)
@@ -3853,15 +3835,6 @@ private final class HotkeyRecorderController: NSObject, NSWindowDelegate {
             isAutoRepeat: event.isARepeat
         )
         switch captureState.consume(snapshot) {
-        case .waitingForChord(let choice):
-            selected = nil
-            saveButton.isEnabled = false
-            let name = localizedHotkeyName(choice, language: language)
-            status.stringValue = localizedText(
-                "Удерживайте \(name) и нажмите другую клавишу — или отпустите, чтобы выбрать только \(name)",
-                "Hold \(name) and press another key, or release it to choose \(name) alone",
-                language: language
-            )
         case .candidate(let choice):
             selected = choice
             saveButton.isEnabled = true
@@ -16028,13 +16001,13 @@ private enum ParakeySelfTest {
         let rightCommand = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
         try expect(
             singleCommand.consume(commandDown),
-            equals: .waitingForChord(rightCommand),
-            "recorder should begin capturing a lone Right Command press"
+            equals: .candidate(rightCommand),
+            "pressing Right Command should select it immediately as a one-key shortcut"
         )
         try expect(
             singleCommand.consume(event(.flagsChanged, keycode: RIGHT_COMMAND_KEYCODE)),
-            equals: .candidate(rightCommand),
-            "releasing Right Command should select it as a one-key shortcut"
+            equals: .ignore,
+            "releasing Right Command should not be required to preserve its selection"
         )
 
         var singleModifier = HotkeyRecorderCaptureState()
@@ -16044,14 +16017,29 @@ private enum ParakeySelfTest {
         let leftOption = hotkeyChoice(forKeycode: 58)
         try expect(
             singleModifier.consume(optionDown),
-            equals: .waitingForChord(leftOption),
-            "recorder should wait for a possible chord after a modifier press"
+            equals: .candidate(leftOption),
+            "pressing Option should select it immediately as a one-key shortcut"
         )
         try expect(
             singleModifier.consume(event(.flagsChanged, keycode: 58)),
-            equals: .candidate(leftOption),
-            "releasing a lone modifier should select it for confirmation"
+            equals: .ignore,
+            "releasing Option should not change the selected shortcut"
         )
+
+        for (keycode, flags, label) in [
+            (CGKeyCode(55), CGEventFlags.maskCommand, "Left Command"),
+            (CGKeyCode(59), CGEventFlags.maskControl, "Left Control"),
+            (FN_KEYCODE, CGEventFlags.maskSecondaryFn, "Fn"),
+        ] {
+            var modifier = HotkeyRecorderCaptureState()
+            try expect(
+                modifier.consume(event(.flagsChanged,
+                                       keycode: keycode,
+                                       flags: flags.rawValue)),
+                equals: .candidate(hotkeyChoice(forKeycode: keycode)),
+                "pressing \(label) should select it immediately"
+            )
+        }
 
         var chord = HotkeyRecorderCaptureState()
         _ = chord.consume(optionDown)
