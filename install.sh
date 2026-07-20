@@ -146,7 +146,7 @@ if [[ "$NO_OPEN" == "1" ]]; then
 else
     say "Готово. Открываю SuperDictate..."
     open "$APP_PATH"
-    printf '\n1. Нажмите Grant для Microphone, Accessibility и Input Monitoring.\n'
-    printf '2. Дождитесь загрузки локальной модели и статуса Ready.\n'
+    printf '\n1. Нажмите «Разрешить» для микрофона, универсального доступа и мониторинга ввода.\n'
+    printf '2. Дождитесь загрузки локальной модели и статуса «Работает».\n'
     printf '3. Нажмите правый Command и начинайте говорить.\n\n'
 fi
