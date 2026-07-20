@@ -47,6 +47,7 @@ let PENDING_DICTATION_MAX_SECONDS: TimeInterval = 30 * 60
 let PENDING_DICTATION_MAX_BYTES = Int(PENDING_DICTATION_MAX_SECONDS * SAMPLE_RATE * 4) + PENDING_DICTATION_HEADER_SIZE
 let DEFAULT_HOTKEY_KEYCODE: CGKeyCode = 54  // Right Command
 let RIGHT_COMMAND_KEYCODE: CGKeyCode = 54
+let LEFT_COMMAND_KEYCODE: CGKeyCode = 55
 let RIGHT_OPTION_KEYCODE: CGKeyCode = 61
 let RIGHT_SHIFT_KEYCODE: CGKeyCode = 60
 let FN_KEYCODE: CGKeyCode = 63
@@ -4098,8 +4099,13 @@ private struct HotkeyShortcutState {
 
         if suppressingChordRelease {
             let allModifiers = shortcut.requiredModifiers.union(primaryMask)
+            if event.keycode == shortcut.keycode {
+                primaryModifierDown = false
+            }
             if event.flags.intersection(allModifiers).isEmpty {
                 suppressingChordRelease = false
+                primaryModifierDown = false
+                shortcutDown = false
             }
             return .suppress
         }
@@ -19435,6 +19441,72 @@ private enum ParakeySelfTest {
                                   isRecording: false),
             equals: .suppressOnly,
             "history chord should suppress the paired right shift release"
+        )
+
+        var requiredModifierReleasedFirst = HotkeyTransitionState()
+        _ = requiredModifierReleasedFirst.transition(
+            for: event(.flagsChanged,
+                       keycode: RIGHT_SHIFT_KEYCODE,
+                       flags: CGEventFlags.maskShift.rawValue),
+            hotkey: rightCommand,
+            triggerMode: .toggle,
+            isRecording: false
+        )
+        _ = requiredModifierReleasedFirst.transition(
+            for: event(.flagsChanged,
+                       keycode: RIGHT_COMMAND_KEYCODE,
+                       flags: commandShift),
+            hotkey: rightCommand,
+            triggerMode: .toggle,
+            isRecording: false
+        )
+        try expect(
+            requiredModifierReleasedFirst.transition(
+                for: event(.flagsChanged,
+                           keycode: RIGHT_SHIFT_KEYCODE,
+                           flags: CGEventFlags.maskCommand.rawValue),
+                hotkey: rightCommand,
+                triggerMode: .toggle,
+                isRecording: false
+            ),
+            equals: .suppressOnly,
+            "releasing Shift first should begin suppressing the history chord release"
+        )
+        try expect(
+            requiredModifierReleasedFirst.transition(
+                for: event(.flagsChanged,
+                           keycode: RIGHT_COMMAND_KEYCODE,
+                           flags: 0),
+                hotkey: rightCommand,
+                triggerMode: .toggle,
+                isRecording: false
+            ),
+            equals: .suppressOnly,
+            "releasing right Command last should clear the history chord state"
+        )
+        try expect(
+            requiredModifierReleasedFirst.transition(
+                for: event(.flagsChanged,
+                           keycode: LEFT_COMMAND_KEYCODE,
+                           flags: CGEventFlags.maskCommand.rawValue),
+                hotkey: rightCommand,
+                triggerMode: .toggle,
+                isRecording: false
+            ),
+            equals: .pass,
+            "left Command must not reuse stale right Command state"
+        )
+        try expect(
+            requiredModifierReleasedFirst.transition(
+                for: event(.flagsChanged,
+                           keycode: RIGHT_SHIFT_KEYCODE,
+                           flags: commandShift),
+                hotkey: rightCommand,
+                triggerMode: .toggle,
+                isRecording: false
+            ),
+            equals: .suppressOnly,
+            "left Command plus Shift must not trigger right Command history"
         )
 
         var commandFirst = HotkeyTransitionState()
