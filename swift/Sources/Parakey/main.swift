@@ -2489,6 +2489,9 @@ final class Settings: @unchecked Sendable {
     private static let keyHotkeyModifiers = "hotkey_modifiers"
     private static let keyEnterHotkeyKeycode = "enter_hotkey_keycode"
     private static let keyEnterHotkeyModifiers = "enter_hotkey_modifiers"
+    private static let keyEnterHotkeyEnabled = "enter_hotkey_enabled"
+    private static let keyHistoryHotkeyKeycode = "history_hotkey_keycode"
+    private static let keyHistoryHotkeyModifiers = "history_hotkey_modifiers"
     private static let keyInterfaceLanguage = "interface_language"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
@@ -2603,6 +2606,48 @@ final class Settings: @unchecked Sendable {
     func setConfiguredEnterHotkey(_ choice: HotkeyChoice) {
         enterHotkeyKeycode = choice.keycode
         enterHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var enterHotkeyEnabled: Bool {
+        get {
+            guard defaults.object(forKey: Self.keyEnterHotkeyEnabled) != nil else { return true }
+            return defaults.bool(forKey: Self.keyEnterHotkeyEnabled)
+        }
+        set { defaults.set(newValue, forKey: Self.keyEnterHotkeyEnabled) }
+    }
+
+    var historyHotkeyKeycode: CGKeyCode {
+        get {
+            normalizedHotkeyKeycode(storedValue: defaults.object(forKey: Self.keyHistoryHotkeyKeycode))
+                ?? RIGHT_COMMAND_KEYCODE
+        }
+        set {
+            let normalized = normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(newValue)))
+                ?? RIGHT_COMMAND_KEYCODE
+            defaults.set(Int(normalized), forKey: Self.keyHistoryHotkeyKeycode)
+        }
+    }
+
+    var historyHotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyHistoryHotkeyModifiers) as? NSNumber
+            if raw == nil { return .maskShift }
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyHistoryHotkeyModifiers)
+        }
+    }
+
+    var configuredHistoryHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: historyHotkeyKeycode, modifiers: historyHotkeyModifiers)
+    }
+
+    func setConfiguredHistoryHotkey(_ choice: HotkeyChoice) {
+        historyHotkeyKeycode = choice.keycode
+        historyHotkeyModifiers = choice.requiredModifiers
     }
 
     var interfaceLanguage: InterfaceLanguage {
@@ -4063,33 +4108,20 @@ private struct HotkeyShortcutState {
 private struct HotkeyTransitionState {
     private var standardShortcutState = HotkeyShortcutState()
     private var enterShortcutState = HotkeyShortcutState()
+    private var historyShortcutState = HotkeyShortcutState()
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
-    private var historyChordRightCommandDown = false
-    private var historyChordRightShiftDown = false
-    private var historyChordActive = false
-    private var historyChordPassedRightShiftDown = false
 
     mutating func resetAll() {
         standardShortcutState.reset()
         enterShortcutState.reset()
+        historyShortcutState.reset()
         toggleActive = false
         suppressEscapeKeyUp = false
-        historyChordRightCommandDown = false
-        historyChordRightShiftDown = false
-        historyChordActive = false
-        historyChordPassedRightShiftDown = false
     }
 
     mutating func resetToggleState() {
         toggleActive = false
-    }
-
-    mutating func resetHistoryChordState() {
-        historyChordRightCommandDown = false
-        historyChordRightShiftDown = false
-        historyChordActive = false
-        historyChordPassedRightShiftDown = false
     }
 
     /// `canStartRecording` mirrors the app-side guard on handlePress
@@ -4102,6 +4134,9 @@ private struct HotkeyTransitionState {
         hotkey: HotkeyChoice,
         enterHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                  modifiers: .maskAlternate),
+        enterHotkeyEnabled: Bool = true,
+        historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                   modifiers: .maskShift),
         triggerMode: TriggerMode,
         isRecording: Bool,
         canStartRecording: Bool = true
@@ -4110,16 +4145,20 @@ private struct HotkeyTransitionState {
             return transitionEscape(for: event, isRecording: isRecording)
         }
 
-        if let chord = transitionHistoryChord(for: event, isRecording: isRecording) {
-            return chord
+        if let history = transitionHistoryShortcut(for: event,
+                                                    isRecording: isRecording,
+                                                    historyHotkey: historyHotkey) {
+            return history
         }
 
-        if !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
+        if enterHotkeyEnabled, !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
             if let completion = transitionEnterShortcut(for: event,
                                                          isRecording: isRecording,
                                                          enterHotkey: enterHotkey) {
                 return completion
             }
+        } else if !enterHotkeyEnabled {
+            enterShortcutState.reset()
         }
 
         let edge = standardShortcutState.consume(event, shortcut: hotkey)
@@ -4153,53 +4192,24 @@ private struct HotkeyTransitionState {
         }
     }
 
-    private mutating func transitionHistoryChord(
+    private mutating func transitionHistoryShortcut(
         for event: HotkeyEventSnapshot,
-        isRecording: Bool
+        isRecording: Bool,
+        historyHotkey: HotkeyChoice
     ) -> HotkeyTransitionResult? {
-        guard event.typeRawValue == CGEventType.flagsChanged.rawValue,
-              event.keycode == RIGHT_COMMAND_KEYCODE || event.keycode == RIGHT_SHIFT_KEYCODE else {
-            return nil
-        }
-
-        let previousRightShiftDown = historyChordRightShiftDown
-
-        if event.keycode == RIGHT_COMMAND_KEYCODE {
-            if historyChordRightCommandDown {
-                historyChordRightCommandDown = false
-            } else if event.flags.contains(.maskCommand) {
-                historyChordRightCommandDown = true
-            }
-        } else if event.keycode == RIGHT_SHIFT_KEYCODE {
-            if historyChordRightShiftDown {
-                historyChordRightShiftDown = false
-            } else if event.flags.contains(.maskShift) {
-                historyChordRightShiftDown = true
-            }
-        }
-
-        let bothDown = historyChordRightCommandDown && historyChordRightShiftDown
-        if bothDown {
-            guard !historyChordActive else { return .suppressOnly }
-            historyChordActive = true
-            historyChordPassedRightShiftDown = previousRightShiftDown && event.keycode == RIGHT_COMMAND_KEYCODE
+        switch historyShortcutState.consume(event, shortcut: historyHotkey) {
+        case .press:
             standardShortcutState.reset()
+            enterShortcutState.reset()
             if !isRecording {
                 toggleActive = false
             }
             return HotkeyTransitionResult(suppress: true, actions: [.showHistory])
+        case .release, .suppress:
+            return .suppressOnly
+        case .pass:
+            return nil
         }
-
-        if historyChordActive {
-            let shouldSuppress = event.keycode != RIGHT_SHIFT_KEYCODE || !historyChordPassedRightShiftDown
-            if !historyChordRightCommandDown && !historyChordRightShiftDown {
-                historyChordActive = false
-                historyChordPassedRightShiftDown = false
-            }
-            return shouldSuppress ? .suppressOnly : .pass
-        }
-
-        return nil
     }
 
     private mutating func transitionEnterShortcut(
@@ -4255,6 +4265,9 @@ final class HotkeyListener {
     var hotkey: HotkeyChoice = hotkeyChoice(forKeycode: DEFAULT_HOTKEY_KEYCODE)
     var enterHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                  modifiers: .maskAlternate)
+    var enterHotkeyEnabled = true
+    var historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                   modifiers: .maskShift)
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
@@ -4347,6 +4360,18 @@ final class HotkeyListener {
         log("HotkeyListener: Enter hotkey changed → \(choice.name)")
     }
 
+    func setEnterHotkeyEnabled(_ enabled: Bool) {
+        enterHotkeyEnabled = enabled
+        transitionState.resetAll()
+        log("HotkeyListener: Enter hotkey \(enabled ? "enabled" : "disabled")")
+    }
+
+    func setHistoryHotkey(_ choice: HotkeyChoice) {
+        historyHotkey = choice
+        transitionState.resetAll()
+        log("HotkeyListener: history hotkey changed → \(choice.name)")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
@@ -4368,6 +4393,8 @@ final class HotkeyListener {
         let result = transitionState.transition(for: event,
                                                 hotkey: hotkey,
                                                 enterHotkey: enterHotkey,
+                                                enterHotkeyEnabled: enterHotkeyEnabled,
+                                                historyHotkey: historyHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
@@ -4391,9 +4418,7 @@ final class HotkeyListener {
             case .release: onRelease?(detectedAt)
             case .releaseAlternate: onReleaseAlternate?(detectedAt)
             case .cancel: onCancel?()
-            case .showHistory:
-                transitionState.resetHistoryChordState()
-                onShowHistory?()
+            case .showHistory: onShowHistory?()
             }
         }
     }
@@ -9612,6 +9637,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // saved choice the moment the tap goes live.
         hotkey.setHotkey(settings.configuredHotkey)
         hotkey.setEnterHotkey(settings.configuredEnterHotkey)
+        hotkey.setEnterHotkeyEnabled(settings.enterHotkeyEnabled)
+        hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -15915,9 +15942,11 @@ private enum ParakeySelfTest {
         try testCustomShortcutMatching()
         try testModifierOnlyChordMatching()
         try testConfigurableEnterShortcut()
+        try testDisabledEnterShortcutPassesThrough()
         try testFKeyAutoRepeatSuppressesWithoutAction()
         try testRightModifierReleaseWithLeftFlagStillSet()
         try testHistoryChordShowsOverlay()
+        try testConfigurableHistoryShortcut()
         try testOptionCommandEnterChordStopsWithEnter()
         try testEnterShortcutModeSelection()
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
@@ -19275,6 +19304,27 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testDisabledEnterShortcutPassesThrough() throws {
+        var state = HotkeyTransitionState()
+        let standard = hotkeyChoice(forKeycode: 96)
+        let enterShortcut = hotkeyChoice(forKeycode: 40,
+                                         modifiers: [.maskCommand, .maskShift])
+        let commandShift = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue
+
+        try expect(
+            state.transition(for: event(.keyDown,
+                                        keycode: 40,
+                                        flags: commandShift),
+                             hotkey: standard,
+                             enterHotkey: enterShortcut,
+                             enterHotkeyEnabled: false,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: .pass,
+            "a disabled Enter shortcut should not intercept keyboard input"
+        )
+    }
+
     private static func testFKeyAutoRepeatSuppressesWithoutAction() throws {
         var state = HotkeyTransitionState()
         let f5 = hotkeyChoice(forKeycode: 96)
@@ -19347,8 +19397,8 @@ private enum ParakeySelfTest {
                                   hotkey: rightCommand,
                                   triggerMode: .toggle,
                                   isRecording: false),
-            equals: .pass,
-            "right shift alone should pass through before the history chord is complete"
+            equals: .suppressOnly,
+            "the first key of the history chord should be reserved until the chord completes"
         )
         try expect(
             shiftFirst.transition(for: event(.flagsChanged,
@@ -19377,8 +19427,8 @@ private enum ParakeySelfTest {
                                   hotkey: rightCommand,
                                   triggerMode: .toggle,
                                   isRecording: false),
-            equals: .pass,
-            "history chord should pass the right shift release when its press was passed through"
+            equals: .suppressOnly,
+            "history chord should suppress the paired right shift release"
         )
 
         var commandFirst = HotkeyTransitionState()
@@ -19431,6 +19481,35 @@ private enum ParakeySelfTest {
                                     isRecording: true),
             equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
             "right command after the history chord should still stop active dictation"
+        )
+    }
+
+    private static func testConfigurableHistoryShortcut() throws {
+        var state = HotkeyTransitionState()
+        let standard = hotkeyChoice(forKeycode: 96)
+        let history = hotkeyChoice(forKeycode: 40,
+                                   modifiers: [.maskCommand, .maskShift])
+        let commandShift = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue
+
+        try expect(
+            state.transition(for: event(.keyDown,
+                                        keycode: 40,
+                                        flags: commandShift),
+                             hotkey: standard,
+                             historyHotkey: history,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.showHistory]),
+            "a user-configured history shortcut should open history without stopping recording"
+        )
+        try expect(
+            state.transition(for: event(.keyUp, keycode: 40),
+                             hotkey: standard,
+                             historyHotkey: history,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: .suppressOnly,
+            "a configurable history shortcut should suppress its paired release"
         )
     }
 
@@ -19639,11 +19718,14 @@ private enum ControlPanelServiceOperation: String, Sendable {
 private enum ControlPanelShortcutKind: Int {
     case withoutEnter = 0
     case withEnter = 1
+    case history = 2
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
     var hotkeyWithoutEnter: HotkeyChoice
+    var enterHotkeyEnabled: Bool
     var hotkeyWithEnter: HotkeyChoice
+    var historyHotkey: HotkeyChoice
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -19651,7 +19733,9 @@ private struct ControlPanelSettingsDraft: Equatable {
 
     init(settings: Settings) {
         hotkeyWithoutEnter = settings.configuredHotkey
+        enterHotkeyEnabled = settings.enterHotkeyEnabled
         hotkeyWithEnter = settings.configuredEnterHotkey
+        historyHotkey = settings.configuredHistoryHotkey
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -19672,13 +19756,6 @@ private func hotkeyIsModifierPrefix(_ prefix: HotkeyChoice,
         return shortcut.requiredModifiers.contains(prefixMask)
     }
     return shortcut.requiredModifiers.contains(prefixMask)
-}
-
-private func isReservedHistoryHotkey(_ choice: HotkeyChoice) -> Bool {
-    guard choice.isModifier else { return false }
-    let allModifiers = choice.requiredModifiers.union(choice.modifierFlag ?? [])
-    guard allModifiers == [.maskShift, .maskCommand] else { return false }
-    return choice.keycode == RIGHT_COMMAND_KEYCODE || choice.keycode == RIGHT_SHIFT_KEYCODE
 }
 
 private enum ControlPanelUpdateState: Equatable, Sendable {
@@ -19829,8 +19906,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         if serviceOperation != nil {
             stateToken = "operation"
         } else {
-            stateToken = [state?.status ?? "none",
-                          state?.detail ?? "",
+            let rawStatus = state?.status ?? "none"
+            let isHealthyRuntimeState = ["ready", "recording", "transcribing"].contains(rawStatus)
+            stateToken = [isHealthyRuntimeState ? "ready" : rawStatus,
+                          isHealthyRuntimeState ? "" : state?.detail ?? "",
                           String(state?.pid ?? 0),
                           state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
         }
@@ -19841,7 +19920,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 stateToken,
                 permissions,
                 settings.configuredHotkey.name,
+                settings.enterHotkeyEnabled ? "enter-enabled" : "enter-disabled",
                 settings.configuredEnterHotkey.name,
+                settings.configuredHistoryHotkey.name,
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
                 settings.recordingHUDTranscribingColor.rawValue,
@@ -19905,39 +19986,59 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 14
+        root.spacing = 11
         root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
         root.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(settingsHeaderView())
         root.addArrangedSubview(separator())
         root.addArrangedSubview(statusRow(
-            title: t("Диктовка без Enter", "Dictation without Enter"),
-            detail: t("Запускает запись; повторное нажатие вставляет текст без Enter: ",
-                      "Starts recording; press again to insert without Enter: ")
-                + localizedHotkeyName(draft.hotkeyWithoutEnter, language: language),
-            status: "",
-            statusColor: .secondaryLabelColor,
+            title: t("Диктовка", "Dictation"),
+            detail: t("Начать запись или вставить распознанный текст.",
+                      "Start recording or insert the transcribed text."),
+            status: localizedHotkeyName(draft.hotkeyWithoutEnter, language: language),
+            statusColor: .labelColor,
             buttonTitle: t("Изменить…", "Change…"),
             action: #selector(recordDictationShortcutClicked(_:)),
             tag: ControlPanelShortcutKind.withoutEnter.rawValue,
             buttonEnabled: serviceOperation == nil,
-            toolTip: t("Назначить клавишу или сочетание для запуска и завершения без Enter.",
-                       "Assign a key or shortcut that starts dictation and finishes without Enter.")
+            toolTip: t("Назначить любую клавишу или сочетание для диктовки.",
+                       "Assign any key or shortcut for dictation.")
+        ))
+        root.addArrangedSubview(toggleRow(
+            title: t("Enter после диктовки", "Enter after dictation"),
+            detail: t("Разрешить отдельную кнопку, которая вставит текст и сразу нажмёт Enter.",
+                      "Enable a separate shortcut that inserts text and immediately presses Enter."),
+            isOn: draft.enterHotkeyEnabled,
+            action: #selector(toggleEnterHotkeyEnabled(_:)),
+            toolTip: t("Выключите, если отдельное сочетание с Enter не нужно.",
+                       "Turn this off if you do not need a separate Enter shortcut.")
         ))
         root.addArrangedSubview(statusRow(
-            title: t("Завершить с Enter", "Finish with Enter"),
-            detail: t("Во время записи вставляет весь текст, затем нажимает Enter: ",
-                      "While recording, inserts all text and then presses Enter: ")
-                + localizedHotkeyName(draft.hotkeyWithEnter, language: language),
-            status: "",
-            statusColor: .secondaryLabelColor,
+            title: t("Диктовка + Enter", "Dictation + Enter"),
+            detail: t("Закончить диктовку, вставить текст и нажать Enter.",
+                      "Finish dictation, insert the text, and press Enter."),
+            status: localizedHotkeyName(draft.hotkeyWithEnter, language: language),
+            statusColor: draft.enterHotkeyEnabled ? .labelColor : .tertiaryLabelColor,
             buttonTitle: t("Изменить…", "Change…"),
             action: #selector(recordDictationShortcutClicked(_:)),
             tag: ControlPanelShortcutKind.withEnter.rawValue,
+            buttonEnabled: draft.enterHotkeyEnabled && serviceOperation == nil,
+            toolTip: t("Назначить сочетание для вставки текста с последующим Enter.",
+                       "Assign a shortcut that inserts text and then presses Enter.")
+        ))
+        root.addArrangedSubview(statusRow(
+            title: t("История", "History"),
+            detail: t("Открыть или закрыть последние транскрипции.",
+                      "Open or close recent transcriptions."),
+            status: localizedHotkeyName(draft.historyHotkey, language: language),
+            statusColor: .labelColor,
+            buttonTitle: t("Изменить…", "Change…"),
+            action: #selector(recordDictationShortcutClicked(_:)),
+            tag: ControlPanelShortcutKind.history.rawValue,
             buttonEnabled: serviceOperation == nil,
-            toolTip: t("Назначить отдельное сочетание для завершения диктовки с Enter.",
-                       "Assign a separate shortcut that finishes dictation and sends Enter.")
+            toolTip: t("Назначить клавишу или сочетание для панели истории.",
+                       "Assign a key or shortcut for the history panel.")
         ))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
@@ -20092,14 +20193,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.alignment = .leading
         text.spacing = 2
         text.addArrangedSubview(panelLabel(presentation.status, size: 14, weight: .semibold))
+        let primaryShortcut = "\(t("Диктовка", "Dictation")): \(localizedHotkeyName(settings.configuredHotkey, language: language))"
+        let historyShortcut = "\(t("История", "History")): \(localizedHotkeyName(settings.configuredHistoryHotkey, language: language))"
+        let enterShortcut = settings.enterHotkeyEnabled
+            ? "\(t("С Enter", "With Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
+            : t("С Enter: выключено", "With Enter: off")
         let detail = panelLabel(
-            "\(presentation.detail)\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(t("с Enter", "with Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))",
+            "\(presentation.detail)\n\(primaryShortcut) · \(historyShortcut)",
             size: 11.5,
             color: .secondaryLabelColor
         )
         detail.maximumNumberOfLines = 2
         detail.lineBreakMode = .byTruncatingTail
-        detail.toolTip = "\(presentation.detail)\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language))\n\(t("С Enter", "With Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
+        detail.toolTip = "\(presentation.detail)\n\(primaryShortcut)\n\(enterShortcut)\n\(historyShortcut)"
         text.addArrangedSubview(detail)
 
         let actions = NSStackView()
@@ -20301,18 +20407,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 7
-        row.addArrangedSubview(panelSymbol("lock.fill",
+        row.addArrangedSubview(panelSymbol("xmark.circle",
                                            color: .tertiaryLabelColor,
                                            description: nil,
                                            pointSize: 10))
         let label = panelLabel(
-            t("Аудио и распознавание остаются на этом Mac.",
-              "Audio and transcription stay on this Mac."),
+            t("Панель можно закрыть — диктовка продолжит работать в фоне.",
+              "You can close this panel — dictation keeps running in the background."),
             size: 10.5,
             color: .tertiaryLabelColor
         )
-        label.toolTip = t("Интернет используется только для первой загрузки модели и обновлений.",
-                          "Internet is only used for the first model download and updates.")
+        label.toolTip = t("Это только панель управления. Аудио и распознавание остаются на Mac.",
+                          "This is only the control panel. Audio and transcription stay on this Mac.")
         row.addArrangedSubview(label)
         row.addArrangedSubview(NSView())
         return row
@@ -20348,6 +20454,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return (operationTitle(operation), operationDetail(operation), .systemBlue)
         }
         if running, let state {
+            if ["ready", "recording", "transcribing"].contains(state.status) {
+                return (t("Работает", "Running"),
+                        t("Фоновая служба включена.", "The background service is running."),
+                        .systemGreen)
+            }
             return (displayStatus(state.status), localizedServiceDetail(state), colorForStatus(state.status))
         }
         if running {
@@ -20583,6 +20694,40 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func toggleRow(title: String,
+                           detail: String,
+                           isOn: Bool,
+                           action: Selector,
+                           toolTip: String? = nil) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
+        let detailLabel = panelLabel(detail, size: 12, color: .secondaryLabelColor)
+        detailLabel.preferredMaxLayoutWidth = 440
+        text.addArrangedSubview(detailLabel)
+
+        let toggle = NSSwitch(frame: .zero)
+        toggle.state = isOn ? .on : .off
+        toggle.target = self
+        toggle.action = action
+        toggle.isEnabled = serviceOperation == nil
+        toggle.toolTip = toolTip
+        toggle.setAccessibilityLabel(title)
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -20659,17 +20804,24 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
-        if hotkeysConflict(draft.hotkeyWithoutEnter, draft.hotkeyWithEnter) {
-            return t("Сочетания должны отличаться.", "The two shortcuts must be different.")
+        var shortcuts = [draft.hotkeyWithoutEnter, draft.historyHotkey]
+        if draft.enterHotkeyEnabled {
+            shortcuts.append(draft.hotkeyWithEnter)
         }
-        if hotkeyIsModifierPrefix(draft.hotkeyWithoutEnter, of: draft.hotkeyWithEnter)
-            || hotkeyIsModifierPrefix(draft.hotkeyWithEnter, of: draft.hotkeyWithoutEnter) {
-            return t("Одно сочетание не должно быть частью другого.",
-                     "One shortcut cannot be a prefix of the other.")
-        }
-        if isReservedHistoryHotkey(draft.hotkeyWithoutEnter)
-            || isReservedHistoryHotkey(draft.hotkeyWithEnter) {
-            return t("⇧⌘ зарезервировано для истории.", "⇧⌘ is reserved for history.")
+        for firstIndex in shortcuts.indices {
+            for secondIndex in shortcuts.indices where secondIndex > firstIndex {
+                let first = shortcuts[firstIndex]
+                let second = shortcuts[secondIndex]
+                if hotkeysConflict(first, second) {
+                    return t("Сочетания для диктовки, Enter и истории должны отличаться.",
+                             "Dictation, Enter, and history shortcuts must be different.")
+                }
+                if hotkeyIsModifierPrefix(first, of: second)
+                    || hotkeyIsModifierPrefix(second, of: first) {
+                    return t("Одна активная комбинация не должна быть частью другой.",
+                             "One active shortcut cannot be a prefix of another.")
+                }
+            }
         }
         return nil
     }
@@ -20792,8 +20944,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func displayStatus(_ raw: String) -> String {
         switch raw {
         case "ready": return t("Работает", "Running")
-        case "recording": return t("Запись", "Recording")
-        case "transcribing": return t("Распознавание", "Transcribing")
+        case "recording", "transcribing": return t("Работает", "Running")
         case "starting": return t("Запускается", "Starting")
         case "needs_permissions": return t("Нужен доступ", "Needs Access")
         case "error": return t("Ошибка", "Error")
@@ -20805,11 +20956,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func localizedServiceDetail(_ state: AgentRuntimeState) -> String {
         switch state.status {
-        case "ready":
+        case "ready", "recording", "transcribing":
             return t("Фоновая служба готова к диктовке.",
                      "The background service is ready for dictation.")
-        case "recording": return t("Микрофон записывает текущую диктовку.", "The microphone is recording dictation.")
-        case "transcribing": return t("Локальная модель преобразует речь в текст.", "The local model is converting speech to text.")
         case "starting": return t("Загружаю модель и подключаю глобальный хоткей.", "Loading the model and enabling the global shortcut.")
         case "needs_permissions": return t("Выдайте недостающие разрешения ниже.", "Grant the missing permissions below.")
         case "stopped": return t("Фоновая служба остановлена.", "The background service is stopped.")
@@ -20984,14 +21133,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 535),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 650),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 600, height: 535)
-        settingsWindow.contentMaxSize = NSSize(width: 600, height: 535)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 650)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 650)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -21048,9 +21197,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let recorderTitle: String
         switch kind {
         case .withoutEnter:
-            recorderTitle = t("Новое сочетание без Enter", "Shortcut Without Enter")
+            recorderTitle = t("Новое сочетание для диктовки", "New Dictation Shortcut")
         case .withEnter:
-            recorderTitle = t("Новое сочетание с Enter", "Shortcut With Enter")
+            recorderTitle = t("Новое сочетание с Enter", "New Enter Shortcut")
+        case .history:
+            recorderTitle = t("Новое сочетание для истории", "New History Shortcut")
         }
         let recorder = HotkeyRecorderController(language: language,
                                                 titleOverride: recorderTitle) { [weak self] selected in
@@ -21067,6 +21218,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             switch kind {
             case .withoutEnter: draft.hotkeyWithoutEnter = selected
             case .withEnter: draft.hotkeyWithEnter = selected
+            case .history: draft.historyHotkey = selected
             }
             self.settingsDraft = draft
             self.refreshSettingsWindow()
@@ -21083,6 +21235,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         _ = settings.refreshFromDisk()
         lastRenderFingerprint = ""
         refresh(force: true)
+    }
+
+    @objc private func toggleEnterHotkeyEnabled(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.enterHotkeyEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
     }
 
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
@@ -21130,7 +21289,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
         settings.setConfiguredHotkey(draft.hotkeyWithoutEnter)
+        settings.enterHotkeyEnabled = draft.enterHotkeyEnabled
         settings.setConfiguredEnterHotkey(draft.hotkeyWithEnter)
+        settings.setConfiguredHistoryHotkey(draft.historyHotkey)
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
