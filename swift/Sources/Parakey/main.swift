@@ -4061,6 +4061,10 @@ private enum HotkeyTransitionAction: Equatable, Sendable {
     case releaseAlternate
     case cancel
     case showHistory
+    /// Toggle mode: the press was suppressed because the app is busy
+    /// (transcription in flight). Does NOT flip toggle state. Lets the
+    /// app play feedback so the user knows the press was received.
+    case rejectedBusyPress
 }
 
 private struct HotkeyTransitionResult: Equatable, Sendable {
@@ -4242,7 +4246,12 @@ private struct HotkeyTransitionState {
             // the app discards, and only the third press records —
             // with zero feedback in between. Same gate-callback
             // pattern Escape uses via isRecording.
-            guard canStartRecording else { return .suppressOnly }
+            // .rejectedBusyPress lets the app play feedback without
+            // flipping toggle state — handlePress() is never reached
+            // in toggle mode because the state machine gates it here.
+            guard canStartRecording else {
+                return HotkeyTransitionResult(suppress: true, actions: [.rejectedBusyPress])
+            }
             toggleActive = true
             return HotkeyTransitionResult(suppress: true, actions: [.press])
         }
@@ -4335,6 +4344,10 @@ final class HotkeyListener {
     var onReleaseAlternate: ((TimeInterval) -> Void)?
     var onCancel: (() -> Void)?
     var onShowHistory: (() -> Void)?
+    /// Toggle mode: a press arrived while the app is busy (transcription
+    /// in flight). The toggle did NOT flip. Play feedback so the user
+    /// knows the press was received but rejected.
+    var onRejectedBusyPress: (() -> Void)?
     var isRecordingActive: (() -> Bool)?
     /// Asks the app whether a new recording would actually start if
     /// onPress fired right now (ready, idle, not transcribing, not
@@ -4475,6 +4488,7 @@ final class HotkeyListener {
             case .releaseAlternate: onReleaseAlternate?(detectedAt)
             case .cancel: onCancel?()
             case .showHistory: onShowHistory?()
+            case .rejectedBusyPress: onRejectedBusyPress?()
             }
         }
     }
@@ -5349,6 +5363,7 @@ enum SpeechModelTextRepair {
 
         if !replaceWithYo {
             result = result
+                .replacingOccurrences(of: #"\s+([.,!?;:])"#, with: "$1", options: .regularExpression)
                 .replacingOccurrences(of: "  ", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -9665,6 +9680,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
         hotkey.onShowHistory = { [weak self] in self?.toggleHistoryOverlay() }
+        hotkey.onRejectedBusyPress = { [weak self] in
+            guard let self, self.settings.playFeedbackSounds else { return }
+            Sounds.playError()
+        }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
@@ -9688,6 +9707,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.onReleaseAlternate = nil
             hotkey.onCancel = nil
             hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
             hotkey.isRecordingActive = nil
             hotkey.canStartRecording = nil
             hotkey.resetToggleState()
@@ -10115,6 +10135,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -10185,6 +10206,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -10292,6 +10314,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -10352,6 +10375,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -10407,6 +10431,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -11277,13 +11302,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // bar just slips back to idle and the user can't tell their speech was
     // dropped from "pasted somewhere I wasn't looking."
     //
-    // The error sound plays unconditionally (not gated by
-    // playFeedbackSounds): start/done sounds are optional polish, but
-    // a dropped dictation is a failure the user must notice. The HUD
-    // flash provides a visual channel for users who run silent or
-    // have the menu-bar icon hidden.
+    // The error sound honours playFeedbackSounds — the HUD flash
+    // (added below) already solves the original "invisible error"
+    // problem for users who run silent. Gating the sound avoids
+    // unexpected noise during meetings or screen recordings.
     private func signalDictationFailure() {
-        Sounds.playError()
+        if settings.playFeedbackSounds {
+            Sounds.playError()
+        }
         flashErrorFeedback()
     }
 
@@ -11293,6 +11319,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// channels so they always expire together.
     private func flashErrorFeedback() {
         errorFlashWorkItem?.cancel()
+        // Invalidate any pending delayed hide from finishBusyHUD() —
+        // without this the transcribing cleanup closure fires shortly
+        // after and hides the error capsule prematurely.
+        recordingHUDTranscribingStartedAt = nil
         setMenuBarState(.error)
         if settings.showRecordingWaveform {
             showRecordingHUD(mode: .error, level: 0)
@@ -11671,6 +11701,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = nil
         hotkey.onCancel = nil
         hotkey.onShowHistory = nil
+        hotkey.onRejectedBusyPress = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.stop()
@@ -19079,6 +19110,16 @@ private enum ParakeySelfTest {
             "non-Russian language should remove <unk> tokens, not replace with Cyrillic ё"
         )
 
+        let removedUnkPunctuation = SpeechModelTextRepair.apply(
+            to: "Hello <unk>, world.",
+            language: .english
+        )
+        try expect(
+            removedUnkPunctuation,
+            equals: "Hello, world.",
+            "removing <unk> should not leave a space before punctuation"
+        )
+
         let removedUnkFrench = SpeechModelTextRepair.apply(
             to: "Bonjour <unk> le monde.",
             language: .french
@@ -19868,8 +19909,8 @@ private enum ParakeySelfTest {
         // only the third press records.
         try expect(
             state.transition(for: event(.keyDown, keycode: f5.keycode), hotkey: f5, triggerMode: .toggle, isRecording: false, canStartRecording: false),
-            equals: .suppressOnly,
-            "gated toggle press should suppress without flipping state"
+            equals: HotkeyTransitionResult(suppress: true, actions: [.rejectedBusyPress]),
+            "gated toggle press should suppress without flipping state but emit rejectedBusyPress for feedback"
         )
         try expect(
             state.transition(for: event(.keyDown, keycode: f5.keycode), hotkey: f5, triggerMode: .toggle, isRecording: false, canStartRecording: true),
