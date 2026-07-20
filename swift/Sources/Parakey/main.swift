@@ -304,6 +304,17 @@ let TRIGGER_DISPLAY: [TriggerMode: String] = [
     .toggle: "Press to toggle",
 ]
 
+enum DictationCompletionBehavior: String, CaseIterable {
+    case insert
+    case insertAndEnter
+
+    var opposite: DictationCompletionBehavior {
+        self == .insert ? .insertAndEnter : .insert
+    }
+
+    var pressesEnter: Bool { self == .insertAndEnter }
+}
+
 enum InterfaceLanguage: String, CaseIterable {
     case russian = "ru"
     case english = "en"
@@ -2491,6 +2502,8 @@ final class Settings: @unchecked Sendable {
     private static let keyEnterHotkeyModifiers = "enter_hotkey_modifiers"
     private static let keyHistoryHotkeyKeycode = "history_hotkey_keycode"
     private static let keyHistoryHotkeyModifiers = "history_hotkey_modifiers"
+    private static let keyPrimaryCompletionBehavior = "primary_completion_behavior_v1"
+    private static let keyAlternateCompletionEnabled = "alternate_completion_enabled_v1"
     private static let keyInterfaceLanguage = "interface_language"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
@@ -2605,6 +2618,29 @@ final class Settings: @unchecked Sendable {
     func setConfiguredEnterHotkey(_ choice: HotkeyChoice) {
         enterHotkeyKeycode = choice.keycode
         enterHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var primaryCompletionBehavior: DictationCompletionBehavior {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyPrimaryCompletionBehavior),
+                  let behavior = DictationCompletionBehavior(rawValue: raw) else {
+                // Preserve the behavior of releases before v0.2.35.
+                return .insert
+            }
+            return behavior
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyPrimaryCompletionBehavior) }
+    }
+
+    var alternateCompletionEnabled: Bool {
+        get {
+            guard defaults.object(forKey: Self.keyAlternateCompletionEnabled) != nil else {
+                // The alternate finish shortcut was always enabled before v0.2.35.
+                return true
+            }
+            return defaults.bool(forKey: Self.keyAlternateCompletionEnabled)
+        }
+        set { defaults.set(newValue, forKey: Self.keyAlternateCompletionEnabled) }
     }
 
     var historyHotkeyKeycode: CGKeyCode {
@@ -4125,6 +4161,7 @@ private struct HotkeyTransitionState {
         hotkey: HotkeyChoice,
         enterHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                  modifiers: .maskAlternate),
+        alternateCompletionEnabled: Bool = true,
         historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                    modifiers: .maskShift),
         triggerMode: TriggerMode,
@@ -4141,7 +4178,8 @@ private struct HotkeyTransitionState {
             return history
         }
 
-        if !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
+        if alternateCompletionEnabled,
+           !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
             if let completion = transitionEnterShortcut(for: event,
                                                          isRecording: isRecording,
                                                          enterHotkey: enterHotkey) {
@@ -4253,6 +4291,7 @@ final class HotkeyListener {
     var hotkey: HotkeyChoice = hotkeyChoice(forKeycode: DEFAULT_HOTKEY_KEYCODE)
     var enterHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                  modifiers: .maskAlternate)
+    var alternateCompletionEnabled = true
     var historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                    modifiers: .maskShift)
     var triggerMode: TriggerMode = .hold
@@ -4344,7 +4383,13 @@ final class HotkeyListener {
     func setEnterHotkey(_ choice: HotkeyChoice) {
         enterHotkey = choice
         transitionState.resetAll()
-        log("HotkeyListener: Enter hotkey changed → \(choice.name)")
+        log("HotkeyListener: alternate completion hotkey changed → \(choice.name)")
+    }
+
+    func setAlternateCompletionEnabled(_ enabled: Bool) {
+        alternateCompletionEnabled = enabled
+        transitionState.resetAll()
+        log("HotkeyListener: alternate completion → \(enabled ? "enabled" : "disabled")")
     }
 
     func setHistoryHotkey(_ choice: HotkeyChoice) {
@@ -4374,6 +4419,7 @@ final class HotkeyListener {
         let result = transitionState.transition(for: event,
                                                 hotkey: hotkey,
                                                 enterHotkey: enterHotkey,
+                                                alternateCompletionEnabled: alternateCompletionEnabled,
                                                 historyHotkey: historyHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
@@ -7903,13 +7949,12 @@ private enum DictationReleaseShortcut: Equatable {
     case alternate
 }
 
-private func shouldPressEnterAfterDictation(shortcut: DictationReleaseShortcut) -> Bool {
-    switch shortcut {
-    case .standard:
-        return false
-    case .alternate:
-        return true
-    }
+private func shouldPressEnterAfterDictation(
+    shortcut: DictationReleaseShortcut,
+    primaryBehavior: DictationCompletionBehavior
+) -> Bool {
+    let behavior = shortcut == .standard ? primaryBehavior : primaryBehavior.opposite
+    return behavior.pressesEnter
 }
 
 @MainActor
@@ -9617,6 +9662,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // saved choice the moment the tap goes live.
         hotkey.setHotkey(settings.configuredHotkey)
         hotkey.setEnterHotkey(settings.configuredEnterHotkey)
+        hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
@@ -11219,7 +11265,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let settingsRefreshStartedAt = ProcessInfo.processInfo.systemUptime
         settings.refreshFromDisk()
         let settingsRefreshedAt = ProcessInfo.processInfo.systemUptime
-        let shouldPressEnterAfterInsertion = shouldPressEnterAfterDictation(shortcut: shortcut)
+        let shouldPressEnterAfterInsertion = shouldPressEnterAfterDictation(
+            shortcut: shortcut,
+            primaryBehavior: settings.primaryCompletionBehavior
+        )
         let releasePermissionCheckStartedAt = ProcessInfo.processInfo.systemUptime
         let missing = missingPermissions()
         let releasePermissionCheckCompletedAt = ProcessInfo.processInfo.systemUptime
@@ -19521,14 +19570,42 @@ private enum ParakeySelfTest {
 
     private static func testEnterShortcutModeSelection() throws {
         try expect(
-            shouldPressEnterAfterDictation(shortcut: .standard),
+            shouldPressEnterAfterDictation(shortcut: .standard,
+                                           primaryBehavior: .insert),
             equals: false,
-            "the standard dictation shortcut should finish without Enter"
+            "insert mode should make the primary shortcut finish without Enter"
         )
         try expect(
-            shouldPressEnterAfterDictation(shortcut: .alternate),
+            shouldPressEnterAfterDictation(shortcut: .alternate,
+                                           primaryBehavior: .insert),
             equals: true,
-            "the dedicated Enter shortcut should always press Enter after insertion"
+            "the alternate shortcut should invert insert mode"
+        )
+        try expect(
+            shouldPressEnterAfterDictation(shortcut: .standard,
+                                           primaryBehavior: .insertAndEnter),
+            equals: true,
+            "insert-and-Enter mode should make the primary shortcut press Enter"
+        )
+        try expect(
+            shouldPressEnterAfterDictation(shortcut: .alternate,
+                                           primaryBehavior: .insertAndEnter),
+            equals: false,
+            "the alternate shortcut should invert insert-and-Enter mode"
+        )
+
+        var state = HotkeyTransitionState()
+        let primary = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        let alternate = hotkeyChoice(forKeycode: 96)
+        try expect(
+            state.transition(for: event(.keyDown, keycode: alternate.keycode),
+                             hotkey: primary,
+                             enterHotkey: alternate,
+                             alternateCompletionEnabled: false,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: .pass,
+            "a disabled alternate shortcut should not be intercepted"
         )
     }
 
@@ -19673,24 +19750,28 @@ private enum ControlPanelServiceOperation: String, Sendable {
 }
 
 private enum ControlPanelShortcutKind: Int {
-    case withoutEnter = 0
-    case withEnter = 1
+    case dictation = 0
+    case alternateCompletion = 1
     case history = 2
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
-    var hotkeyWithoutEnter: HotkeyChoice
-    var hotkeyWithEnter: HotkeyChoice
+    var dictationHotkey: HotkeyChoice
+    var alternateCompletionHotkey: HotkeyChoice
     var historyHotkey: HotkeyChoice
+    var primaryCompletionBehavior: DictationCompletionBehavior
+    var alternateCompletionEnabled: Bool
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
 
     init(settings: Settings) {
-        hotkeyWithoutEnter = settings.configuredHotkey
-        hotkeyWithEnter = settings.configuredEnterHotkey
+        dictationHotkey = settings.configuredHotkey
+        alternateCompletionHotkey = settings.configuredEnterHotkey
         historyHotkey = settings.configuredHistoryHotkey
+        primaryCompletionBehavior = settings.primaryCompletionBehavior
+        alternateCompletionEnabled = settings.alternateCompletionEnabled
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -19877,6 +19958,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.configuredHotkey.name,
                 settings.configuredEnterHotkey.name,
                 settings.configuredHistoryHotkey.name,
+                settings.primaryCompletionBehavior.rawValue,
+                settings.alternateCompletionEnabled ? "alternate-on" : "alternate-off",
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
                 settings.recordingHUDTranscribingColor.rawValue,
@@ -19948,18 +20031,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(separator())
         root.addArrangedSubview(hotkeyRow(
             title: t("Диктовка", "Dictation"),
-            shortcut: draft.hotkeyWithoutEnter,
-            kind: .withoutEnter,
-            toolTip: t("Начать запись или вставить распознанный текст.",
-                       "Start recording or insert the transcribed text.")
+            shortcut: draft.dictationHotkey,
+            kind: .dictation,
+            toolTip: t("Начать запись. Повторное нажатие завершает её выбранным способом.",
+                       "Start recording. Press again to finish using the selected action.")
         ))
-        root.addArrangedSubview(hotkeyRow(
-            title: t("Завершить + Enter", "Finish + Enter"),
-            shortcut: draft.hotkeyWithEnter,
-            kind: .withEnter,
-            toolTip: t("Только завершить текущую запись, вставить текст и нажать Enter.",
-                       "Only finish the current recording, insert its text, and press Enter.")
-        ))
+        root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
+        root.addArrangedSubview(alternateCompletionRow(draft))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
             shortcut: draft.historyHotkey,
@@ -20122,7 +20200,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.addArrangedSubview(panelLabel(presentation.status, size: 14, weight: .semibold))
         let primaryShortcut = "\(t("Диктовка", "Dictation")): \(localizedHotkeyName(settings.configuredHotkey, language: language))"
         let historyShortcut = "\(t("История", "History")): \(localizedHotkeyName(settings.configuredHistoryHotkey, language: language))"
-        let enterShortcut = "\(t("Завершить + Enter", "Finish + Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
+        let primaryBehavior = localizedCompletionBehavior(settings.primaryCompletionBehavior)
+        let primaryAction = "\(t("Повторное нажатие", "Press again")): \(primaryBehavior)"
+        let alternateAction = localizedCompletionBehavior(settings.primaryCompletionBehavior.opposite)
+        let alternateShortcut = settings.alternateCompletionEnabled
+            ? "\(t("Альтернативно", "Alternative")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language)) — \(alternateAction)"
+            : t("Альтернативное завершение выключено", "Alternative finish is disabled")
         let detail = panelLabel(
             "\(presentation.detail)\n\(primaryShortcut) · \(historyShortcut)",
             size: 11.5,
@@ -20130,7 +20213,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         detail.maximumNumberOfLines = 2
         detail.lineBreakMode = .byTruncatingTail
-        detail.toolTip = "\(presentation.detail)\n\(primaryShortcut)\n\(enterShortcut)\n\(historyShortcut)"
+        detail.toolTip = "\(presentation.detail)\n\(primaryShortcut)\n\(primaryAction)\n\(alternateShortcut)\n\(historyShortcut)"
         text.addArrangedSubview(detail)
 
         let actions = NSStackView()
@@ -20642,6 +20725,96 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func primaryCompletionBehaviorRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Повторное нажатие", "Press again"),
+                                           size: 13,
+                                           weight: .semibold))
+        text.addArrangedSubview(panelLabel(
+            t("Что сделать после вставки распознанного текста.",
+              "What to do after inserting the transcribed text."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let control = NSSegmentedControl(
+            labels: [t("Вставить", "Insert"), t("Вставить + Enter", "Insert + Enter")],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(selectPrimaryCompletionBehavior(_:))
+        )
+        control.selectedSegment = draft.primaryCompletionBehavior == .insert ? 0 : 1
+        control.isEnabled = serviceOperation == nil
+        control.toolTip = t("Выберите действие при повторном нажатии основного хоткея.",
+                            "Choose what the main shortcut does when pressed again.")
+        control.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(control)
+        return row
+    }
+
+    private func alternateCompletionRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let behavior = draft.primaryCompletionBehavior.opposite
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            behavior == .insert
+                ? t("Завершить без Enter", "Finish without Enter")
+                : t("Завершить + Enter", "Finish + Enter"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Дополнительный хоткей работает только во время записи.",
+              "The alternative shortcut only works while recording."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleAlternateCompletion(_:))
+        toggle.state = draft.alternateCompletionEnabled ? .on : .off
+        toggle.isEnabled = serviceOperation == nil
+        toggle.toolTip = t("Включить дополнительный способ завершения записи.",
+                           "Enable the alternative way to finish recording.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        let button = panelButton(
+            localizedHotkeyName(draft.alternateCompletionHotkey, language: language),
+            action: #selector(recordDictationShortcutClicked(_:)),
+            enabled: draft.alternateCompletionEnabled && serviceOperation == nil,
+            toolTip: t("Изменить дополнительный хоткей завершения.",
+                       "Change the alternative finish shortcut.")
+        )
+        button.tag = ControlPanelShortcutKind.alternateCompletion.rawValue
+        button.controlSize = .regular
+        button.widthAnchor.constraint(equalToConstant: 200).isActive = true
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        row.addArrangedSubview(button)
+        return row
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -20718,14 +20891,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
-        let shortcuts = [draft.hotkeyWithoutEnter, draft.hotkeyWithEnter, draft.historyHotkey]
+        let shortcuts = draft.alternateCompletionEnabled
+            ? [draft.dictationHotkey, draft.alternateCompletionHotkey, draft.historyHotkey]
+            : [draft.dictationHotkey, draft.historyHotkey]
         for firstIndex in shortcuts.indices {
             for secondIndex in shortcuts.indices where secondIndex > firstIndex {
                 let first = shortcuts[firstIndex]
                 let second = shortcuts[secondIndex]
                 if hotkeysConflict(first, second) {
-                    return t("Сочетания для диктовки, Enter и истории должны отличаться.",
-                             "Dictation, Enter, and history shortcuts must be different.")
+                    return t("Сочетания для диктовки, завершения и истории должны отличаться.",
+                             "Dictation, finish, and history shortcuts must be different.")
                 }
                 if hotkeyIsModifierPrefix(first, of: second)
                     || hotkeyIsModifierPrefix(second, of: first) {
@@ -20851,6 +21026,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         switch settings.triggerMode {
         case .hold: return t("Удерживать", "Press and hold")
         case .toggle: return t("Нажать для старта и ещё раз для остановки", "Press to start, press again to stop")
+        }
+    }
+
+    private func localizedCompletionBehavior(_ behavior: DictationCompletionBehavior) -> String {
+        switch behavior {
+        case .insert:
+            return t("Вставить", "Insert")
+        case .insertAndEnter:
+            return t("Вставить + Enter", "Insert + Enter")
         }
     }
 
@@ -21046,14 +21230,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 535),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 590),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 535)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 535)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 590)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 590)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -21109,10 +21293,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         let recorderTitle: String
         switch kind {
-        case .withoutEnter:
+        case .dictation:
             recorderTitle = t("Новое сочетание для диктовки", "New Dictation Shortcut")
-        case .withEnter:
-            recorderTitle = t("Сочетание «Завершить + Enter»", "Finish + Enter Shortcut")
+        case .alternateCompletion:
+            recorderTitle = t("Дополнительное сочетание завершения", "Alternative Finish Shortcut")
         case .history:
             recorderTitle = t("Новое сочетание для истории", "New History Shortcut")
         }
@@ -21129,8 +21313,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             guard let selected else { return }
             var draft = self.settingsDraft ?? ControlPanelSettingsDraft(settings: self.settings)
             switch kind {
-            case .withoutEnter: draft.hotkeyWithoutEnter = selected
-            case .withEnter: draft.hotkeyWithEnter = selected
+            case .dictation: draft.dictationHotkey = selected
+            case .alternateCompletion: draft.alternateCompletionHotkey = selected
             case .history: draft.historyHotkey = selected
             }
             self.settingsDraft = draft
@@ -21148,6 +21332,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         _ = settings.refreshFromDisk()
         lastRenderFingerprint = ""
         refresh(force: true)
+    }
+
+    @objc private func selectPrimaryCompletionBehavior(_ sender: NSSegmentedControl) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.primaryCompletionBehavior = sender.selectedSegment == 1 ? .insertAndEnter : .insert
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleAlternateCompletion(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.alternateCompletionEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
     }
 
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
@@ -21194,9 +21392,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     @objc private func saveSettingsClicked(_ sender: NSButton) {
         guard let draft = settingsDraft,
               settingsValidationMessage(draft) == nil else { return }
-        settings.setConfiguredHotkey(draft.hotkeyWithoutEnter)
-        settings.setConfiguredEnterHotkey(draft.hotkeyWithEnter)
+        settings.setConfiguredHotkey(draft.dictationHotkey)
+        settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
+        settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
+        settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
