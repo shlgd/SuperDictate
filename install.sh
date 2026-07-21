@@ -2,12 +2,14 @@
 
 set -euo pipefail
 
-REPOSITORY="shlgd/SuperDictate"
+REPOSITORY="${SUPERDICTATE_REPOSITORY:-shlgd/SuperDictate}"
 RELEASE_VERSION="0.2.36"
 RELEASE_SHA256="ae8f3e3c0d0d18c0723a63b5b54957d5956668840dc3916c629ea2f207fdd234"
+SOURCE_COMMIT="450f127d98415d36e6912f969ebb7361a6212968"
 RELEASE_URL="${SUPERDICTATE_RELEASE_URL:-https://github.com/$REPOSITORY/releases/download/v$RELEASE_VERSION/SuperDictate.zip}"
 EXPECTED_SHA256="${SUPERDICTATE_RELEASE_SHA256:-$RELEASE_SHA256}"
-REF="${SUPERDICTATE_REF:-main}"
+REF="${SUPERDICTATE_REF:-v$RELEASE_VERSION}"
+EXPECTED_SOURCE_COMMIT="${SUPERDICTATE_SOURCE_COMMIT:-$SOURCE_COMMIT}"
 APP_PATH="${SUPERDICTATE_APP_PATH:-/Applications/SuperDictate.app}"
 BUILD_FROM_SOURCE="${SUPERDICTATE_BUILD_FROM_SOURCE:-0}"
 NO_OPEN="${SUPERDICTATE_NO_OPEN:-0}"
@@ -75,6 +77,20 @@ download_release() {
     ditto "$work_dir/release/SuperDictate.app" "$work_dir/SuperDictate.app"
 }
 
+verify_source_ref() {
+    local actual
+
+    [[ "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "Ожидался полный 40-символьный SHA исходников."
+
+    actual="$(curl --fail --location --silent --show-error --retry 3 --retry-delay 1 --retry-all-errors \
+        "https://api.github.com/repos/$REPOSITORY/commits/$REF" \
+        | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+        | head -n 1)"
+
+    [[ -n "$actual" ]] || fail "Не удалось проверить коммит исходников $REF."
+    [[ "$actual" == "$EXPECTED_SOURCE_COMMIT" ]] || fail "Коммит исходников не совпал: ожидался $EXPECTED_SOURCE_COMMIT, получен $actual."
+}
+
 build_from_source() {
     local work_dir="$1"
     local source_dir
@@ -85,6 +101,9 @@ build_from_source() {
         printf '\nПосле установки снова запустите ту же команду.\n'
         exit 0
     }
+
+    say "Проверяю закреплённый коммит исходного кода..."
+    verify_source_ref
 
     say "Скачиваю открытый исходный код..."
     curl --fail --location --silent --show-error --retry 3 --retry-delay 1 --retry-all-errors \
@@ -100,7 +119,7 @@ build_from_source() {
 [[ "$(uname -m)" == "arm64" ]] || fail "Нужен Mac с Apple Silicon (M1 или новее)."
 version_at_least_14 || fail "Нужна macOS 14 или новее."
 
-for command_name in curl ditto shasum plutil file codesign; do
+for command_name in curl ditto shasum plutil file codesign sed head; do
     command -v "$command_name" >/dev/null 2>&1 || fail "Не найдена системная команда: $command_name"
 done
 
