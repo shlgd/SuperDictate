@@ -1,7 +1,6 @@
 // Parakey — push-to-talk dictation for macOS Apple Silicon.
 //
-// Single-file Swift menu-bar app. The whole runtime lives in this
-// file: hotkey capture (`CGEventTap`), audio capture
+// Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
 // (`AVAudioEngine`), transcription (`FluidAudio` on the Apple
 // Neural Engine), paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
@@ -318,17 +317,6 @@ enum DictationCompletionBehavior: String, CaseIterable {
     }
 
     var pressesEnter: Bool { self == .insertAndEnter }
-}
-
-enum InterfaceLanguage: String, CaseIterable {
-    case russian = "ru"
-    case english = "en"
-}
-
-func localizedText(_ russian: String,
-                   _ english: String,
-                   language: InterfaceLanguage) -> String {
-    language == .russian ? russian : english
 }
 
 func localizedHotkeyName(_ choice: HotkeyChoice,
