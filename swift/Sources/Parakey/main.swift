@@ -2185,6 +2185,7 @@ struct AgentRuntimeState: Codable {
     var missingPermissions: [String]
     var hotkeyName: String
     var triggerMode: String
+    var downloadProgressFraction: Double?
 }
 
 enum AgentRuntimeStateStore {
@@ -5677,7 +5678,7 @@ func speechModelStartupStatusTitle(_ progress: DownloadUtils.DownloadProgress) -
     case .downloading(let completedFiles, let totalFiles):
         guard totalFiles > 0 else { return "Loading cached speech model…" }
         let downloadFraction = min(max(progress.fractionCompleted / 0.5, 0), 1)
-        let percent = min(100, max(0, Int((downloadFraction * 20).rounded()) * 5))
+        let percent = min(100, max(0, Int((downloadFraction * 100).rounded())))
         return "Downloading speech model… \(percent)% (\(completedFiles)/\(totalFiles))"
     case .compiling:
         return "Preparing speech model…"
@@ -5688,9 +5689,28 @@ func speechModelStartupProgressValue(_ progress: DownloadUtils.DownloadProgress)
     switch progress.phase {
     case .downloading(_, let totalFiles):
         guard totalFiles > 0 else { return nil }
-        return min(max(progress.fractionCompleted / 0.5, 0), 1)
+        let raw = min(max(progress.fractionCompleted / 0.5, 0), 1)
+        return (raw * 100).rounded() / 100.0   // round to 1%
     case .listing, .compiling:
         return nil
+    }
+}
+
+/// Thread-safe throttle that drops duplicate percent values
+/// before they hit @MainActor, preventing main-thread flooding.
+final class ProgressThrottler: @unchecked Sendable {
+    private var lastTitle: String = ""
+    private var lastFraction: Double? = nil
+    private let lock = NSLock()
+
+    /// Returns true when the progress actually changed and should be dispatched.
+    func shouldDispatch(_ title: String, _ fraction: Double?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard title != lastTitle || fraction != lastFraction else { return false }
+        lastTitle = title
+        lastFraction = fraction
+        return true
     }
 }
 
@@ -10015,7 +10035,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
 
             do {
+                let throttler = ProgressThrottler()
                 try await asr.load(profile: speechModelProfile) { [weak self] progress in
+                    let title = speechModelStartupStatusTitle(progress)
+                    let fraction = speechModelStartupProgressValue(progress)
+                    guard throttler.shouldDispatch(title, fraction) else { return }
                     Task { @MainActor in
                         self?.updateSpeechModelStartupProgress(progress)
                     }
@@ -12732,7 +12756,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                               speechModelReady: isSpeechModelReady,
                               missingPermissions: missing,
                               hotkeyName: hotkey.hotkey.name,
-                              triggerMode: settings.triggerMode.rawValue)
+                              triggerMode: settings.triggerMode.rawValue,
+                              downloadProgressFraction: speechModelStartupProgressFraction)
         )
     }
 
@@ -20227,6 +20252,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             let isHealthyRuntimeState = ["ready", "recording", "transcribing"].contains(rawStatus)
             stateToken = [isHealthyRuntimeState ? "ready" : rawStatus,
                           isHealthyRuntimeState ? "" : state?.detail ?? "",
+                          state?.downloadProgressFraction.map { String(format: "%.2f", $0) } ?? "",
                           String(state?.pid ?? 0),
                           state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
         }
@@ -20498,6 +20524,31 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         detail.toolTip = "\(presentation.detail)\n\(primaryShortcut)\n\(primaryAction)\n\(alternateShortcut)\n\(historyShortcut)"
         text.addArrangedSubview(detail)
 
+        // Progress bar for download
+        if running, state?.status == "starting", let fraction = state?.downloadProgressFraction {
+            let progressBar = NSProgressIndicator()
+            progressBar.style = .bar
+            progressBar.controlSize = .small
+            progressBar.isIndeterminate = false
+            progressBar.minValue = 0
+            progressBar.maxValue = 1
+            progressBar.doubleValue = fraction
+            progressBar.translatesAutoresizingMaskIntoConstraints = false
+            progressBar.heightAnchor.constraint(equalToConstant: 6).isActive = true
+            text.addArrangedSubview(progressBar)
+            progressBar.widthAnchor.constraint(equalTo: text.widthAnchor).isActive = true
+        } else if running, state?.status == "starting" {
+            let progressBar = NSProgressIndicator()
+            progressBar.style = .bar
+            progressBar.controlSize = .small
+            progressBar.isIndeterminate = true
+            progressBar.startAnimation(nil)
+            progressBar.translatesAutoresizingMaskIntoConstraints = false
+            progressBar.heightAnchor.constraint(equalToConstant: 6).isActive = true
+            text.addArrangedSubview(progressBar)
+            progressBar.widthAnchor.constraint(equalTo: text.widthAnchor).isActive = true
+        }
+
         let actions = NSStackView()
         actions.orientation = .horizontal
         actions.alignment = .centerY
@@ -20727,8 +20778,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func operationDetail(_ operation: ControlPanelServiceOperation) -> String {
         switch operation {
         case .starting:
-            return t("Подключаю глобальный хоткей и локальную модель. Обычно 1–3 секунды; при первой загрузке дольше.",
-                     "Enabling the global shortcut and local model. Usually 1–3 seconds; the first download takes longer.")
+            return t("Подключаю глобальный хоткей и локальную модель.\nОбычно 1–3 секунды; при первой загрузке дольше.",
+                     "Enabling the global shortcut and local model.\nUsually 1–3 seconds; the first download takes longer.")
         case .restarting, .applyingSettings:
             return t("Диктовка временно недоступна. Панель не зависла — новый воркер уже запускается.",
                      "Dictation is temporarily unavailable. The panel is responsive while the new worker starts.")
@@ -21360,7 +21411,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case "ready", "recording", "transcribing":
             return t("Фоновая служба готова к диктовке.",
                      "The background service is ready for dictation.")
-        case "starting": return t("Загружаю модель и подключаю глобальный хоткей.", "Loading the model and enabling the global shortcut.")
+        case "starting":
+            if state.detail.hasPrefix("Downloading speech model") {
+                if let percentRange = state.detail.range(of: "\\d+%", options: .regularExpression) {
+                    let percent = state.detail[percentRange]
+                    return t("Скачиваю языковую модель… \(percent)", "Downloading speech model… \(percent)")
+                }
+                return t("Скачиваю языковую модель…", "Downloading speech model…")
+            } else if state.detail.hasPrefix("Checking speech model") {
+                return t("Проверяю список файлов модели…", "Checking speech model files…")
+            } else if state.detail.hasPrefix("Preparing speech model") {
+                return t("Подготавливаю модель…", "Preparing speech model…")
+            } else if state.detail.hasPrefix("Loading cached speech model") {
+                return t("Загружаю модель из кэша…", "Loading cached speech model…")
+            } else if state.detail.hasPrefix("Loading speech model") {
+                return t("Загружаю языковую модель…", "Loading speech model…")
+            }
+            return t("Запускаю службу диктовки…", "Starting dictation service…")
         case "needs_permissions": return t("Выдайте недостающие разрешения ниже.", "Grant the missing permissions below.")
         case "stopped": return t("Фоновая служба остановлена.", "The background service is stopped.")
         case "error": return t("Служба сообщила об ошибке: \(state.detail)", "Service error: \(state.detail)")
