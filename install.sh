@@ -30,6 +30,18 @@ version_at_least_14() {
     [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 14 ))
 }
 
+is_apple_silicon() {
+    local machine translated
+
+    machine="$(/usr/bin/uname -m)"
+    [[ "$machine" == "arm64" ]] && return 0
+
+    # A shell launched through Rosetta reports x86_64 even on Apple
+    # Silicon. Apple exposes this flag specifically for that case.
+    translated="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
+    [[ "$machine" == "x86_64" && "$translated" == "1" ]]
+}
+
 run_as_admin() {
     if [[ -w "$(dirname "$APP_PATH")" ]]; then
         "$@"
@@ -115,8 +127,8 @@ build_from_source() {
     "$source_dir/scripts/build-app.sh" "$work_dir/SuperDictate.app"
 }
 
-[[ "$(uname -s)" == "Darwin" ]] || fail "Работает только на macOS."
-[[ "$(uname -m)" == "arm64" ]] || fail "Нужен Mac с Apple Silicon (M1 или новее)."
+[[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "Работает только на macOS."
+is_apple_silicon || fail "Нужен Mac с Apple Silicon (M1 или новее)."
 version_at_least_14 || fail "Нужна macOS 14 или новее."
 
 for command_name in curl ditto shasum plutil file codesign sed head; do
