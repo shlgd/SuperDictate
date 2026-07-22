@@ -814,12 +814,12 @@ func addingDictationUsageSample(to stats: [DailyDictationUsage],
     return mergedDailyDictationUsage(next)
 }
 
-func lastSevenCompletedDictationUsage(_ stats: [DailyDictationUsage],
-                                      referenceDate: Date,
-                                      calendar: Calendar) -> DictationUsageWeekSnapshot {
+func lastSevenDictationUsage(_ stats: [DailyDictationUsage],
+                             referenceDate: Date,
+                             calendar: Calendar) -> DictationUsageWeekSnapshot {
     let byDay = Dictionary(uniqueKeysWithValues: mergedDailyDictationUsage(stats).map { ($0.day, $0) })
     let today = calendar.startOfDay(for: referenceDate)
-    let days = (1...7).reversed().compactMap { offset -> DictationUsageDaySlot? in
+    let days = (0..<7).reversed().compactMap { offset -> DictationUsageDaySlot? in
         guard let date = calendar.date(byAdding: .day, value: -offset, to: today) else { return nil }
         let key = dictationUsageDayKey(for: date, calendar: calendar)
         return DictationUsageDaySlot(date: date,
@@ -4161,6 +4161,7 @@ private struct HotkeyTransitionState {
     private var historyShortcutState = HotkeyShortcutState()
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
+    private var deferringToggleForHistoryShortcut = false
 
     mutating func resetAll() {
         standardShortcutState.reset()
@@ -4168,6 +4169,7 @@ private struct HotkeyTransitionState {
         historyShortcutState.reset()
         toggleActive = false
         suppressEscapeKeyUp = false
+        deferringToggleForHistoryShortcut = false
     }
 
     mutating func resetToggleState() {
@@ -4223,6 +4225,29 @@ private struct HotkeyTransitionState {
             // Toggle mode: every press flips between "start recording"
             // and "stop recording". Releases are no-ops.
             guard edge != .pass else { return .pass }
+            let historySharesPrimaryShortcut = hotkey.keycode == historyHotkey.keycode
+                && hotkey.requiredModifiers != historyHotkey.requiredModifiers
+                && hotkey.requiredModifiers.intersection(historyHotkey.requiredModifiers)
+                    == hotkey.requiredModifiers
+            if edge == .press, historySharesPrimaryShortcut {
+                // The default history shortcut is Right Command + Right
+                // Shift, while Right Command alone starts dictation. Delay
+                // the primary action until release so Command → Shift opens
+                // history without turning the microphone on first.
+                deferringToggleForHistoryShortcut = true
+                return .suppressOnly
+            }
+            if deferringToggleForHistoryShortcut {
+                guard edge == .release else { return .suppressOnly }
+                deferringToggleForHistoryShortcut = false
+                if toggleActive {
+                    toggleActive = false
+                    return HotkeyTransitionResult(suppress: true, actions: [.release])
+                }
+                guard canStartRecording else { return .suppressOnly }
+                toggleActive = true
+                return HotkeyTransitionResult(suppress: true, actions: [.press])
+            }
             guard edge == .press else { return .suppressOnly }
             if toggleActive {
                 toggleActive = false
@@ -4255,6 +4280,7 @@ private struct HotkeyTransitionState {
         case .press:
             standardShortcutState.reset()
             enterShortcutState.reset()
+            deferringToggleForHistoryShortcut = false
             if !isRecording {
                 toggleActive = false
             }
@@ -12353,7 +12379,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func makeStatisticsOverlayContent() -> NSView {
         let calendar = Calendar.current
-        let snapshot = lastSevenCompletedDictationUsage(
+        let snapshot = lastSevenDictationUsage(
             settings.dailyDictationUsage,
             referenceDate: Date(),
             calendar: calendar
@@ -12390,7 +12416,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         title.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(title)
 
-        let subtitle = HistoryItemLabel("\(russianUsageDateRange(snapshot, calendar: calendar)) · сегодня не учитывается")
+        let subtitle = HistoryItemLabel("\(russianUsageDateRange(snapshot, calendar: calendar)) · включая сегодня")
         subtitle.font = .systemFont(ofSize: 14, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
         subtitle.translatesAutoresizingMaskIntoConstraints = false
@@ -16912,23 +16938,23 @@ private enum ParakeySelfTest {
                                            asrSeconds: 1.2,
                                            calendar: calendar)
 
-        let snapshot = lastSevenCompletedDictationUsage(stats,
-                                                         referenceDate: reference,
-                                                         calendar: calendar)
+        let snapshot = lastSevenDictationUsage(stats,
+                                               referenceDate: reference,
+                                               calendar: calendar)
         try expect(snapshot.days.count, equals: 7,
-                   "statistics should always contain seven completed calendar days")
-        try expect(snapshot.days.first?.usage.day, equals: "2026-07-11",
-                   "statistics should begin seven days before today")
-        try expect(snapshot.days.last?.usage.day, equals: "2026-07-17",
-                   "statistics should end yesterday")
-        try expect(snapshot.totalCharacters, equals: 400,
-                   "statistics should exclude both older data and today's dictations")
+                   "statistics should always contain seven calendar days")
+        try expect(snapshot.days.first?.usage.day, equals: "2026-07-12",
+                   "statistics should begin six days before today")
+        try expect(snapshot.days.last?.usage.day, equals: "2026-07-18",
+                   "statistics should include today")
+        try expect(snapshot.totalCharacters, equals: 1_200,
+                   "statistics should include today's dictations and exclude older data")
         try expect(snapshot.totalDictations, equals: 2,
-                   "statistics should aggregate completed dictations")
-        try expect(snapshot.totalAudioSeconds, equals: 40,
-                   "statistics should aggregate recorded audio duration")
-        try expect(snapshot.totalASRSeconds, equals: 1.25,
-                   "statistics should aggregate ASR duration")
+                   "statistics should aggregate dictations including today")
+        try expect(snapshot.totalAudioSeconds, equals: 120,
+                   "statistics should aggregate recorded audio duration including today")
+        try expect(snapshot.totalASRSeconds, equals: 1.95,
+                   "statistics should aggregate ASR duration including today")
 
         let log = """
         [23:59:58] 2.00 s audio → 0.20 s → 20 chars
@@ -19737,8 +19763,8 @@ private enum ParakeySelfTest {
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
                                     isRecording: false),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
-            "right command alone should still start toggle dictation"
+            equals: .suppressOnly,
+            "right command should defer toggle dictation while waiting for a history chord"
         )
         try expect(
             commandFirst.transition(for: event(.flagsChanged,
@@ -19746,9 +19772,9 @@ private enum ParakeySelfTest {
                                                flags: commandShift),
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
-                                    isRecording: true),
+                                    isRecording: false),
             equals: HotkeyTransitionResult(suppress: true, actions: [.showHistory]),
-            "history chord should show history without canceling active dictation"
+            "command then shift should show history without starting dictation"
         )
         try expect(
             commandFirst.transition(for: event(.flagsChanged,
@@ -19756,9 +19782,9 @@ private enum ParakeySelfTest {
                                                flags: CGEventFlags.maskShift.rawValue),
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
-                                    isRecording: true),
+                                    isRecording: false),
             equals: .suppressOnly,
-            "history chord should suppress the paired right command release while recording"
+            "history chord should suppress the paired right command release"
         )
         try expect(
             commandFirst.transition(for: event(.flagsChanged,
@@ -19766,19 +19792,51 @@ private enum ParakeySelfTest {
                                                flags: 0),
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
-                                    isRecording: true),
+                                    isRecording: false),
             equals: .suppressOnly,
             "history chord should suppress the paired right shift release"
         )
+
+        var commandOnly = HotkeyTransitionState()
         try expect(
-            commandFirst.transition(for: event(.flagsChanged,
-                                               keycode: RIGHT_COMMAND_KEYCODE,
-                                               flags: CGEventFlags.maskCommand.rawValue),
-                                    hotkey: rightCommand,
-                                    triggerMode: .toggle,
-                                    isRecording: true),
+            commandOnly.transition(for: event(.flagsChanged,
+                                              keycode: RIGHT_COMMAND_KEYCODE,
+                                              flags: CGEventFlags.maskCommand.rawValue),
+                                   hotkey: rightCommand,
+                                   triggerMode: .toggle,
+                                   isRecording: false),
+            equals: .suppressOnly,
+            "right command alone should wait until release"
+        )
+        try expect(
+            commandOnly.transition(for: event(.flagsChanged,
+                                              keycode: RIGHT_COMMAND_KEYCODE,
+                                              flags: 0),
+                                   hotkey: rightCommand,
+                                   triggerMode: .toggle,
+                                   isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
+            "right command release should start toggle dictation when no history chord follows"
+        )
+        try expect(
+            commandOnly.transition(for: event(.flagsChanged,
+                                              keycode: RIGHT_COMMAND_KEYCODE,
+                                              flags: CGEventFlags.maskCommand.rawValue),
+                                   hotkey: rightCommand,
+                                   triggerMode: .toggle,
+                                   isRecording: true),
+            equals: .suppressOnly,
+            "right command should defer stopping toggle dictation until release"
+        )
+        try expect(
+            commandOnly.transition(for: event(.flagsChanged,
+                                              keycode: RIGHT_COMMAND_KEYCODE,
+                                              flags: 0),
+                                   hotkey: rightCommand,
+                                   triggerMode: .toggle,
+                                   isRecording: true),
             equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
-            "right command after the history chord should still stop active dictation"
+            "right command release should stop toggle dictation when no history chord follows"
         )
     }
 
