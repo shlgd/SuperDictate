@@ -8,7 +8,7 @@
 2. Вставьте эту команду и нажмите Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 3. В открывшемся SuperDictate нажмите `Разрешить` для **Микрофона**,
@@ -33,7 +33,7 @@ SuperDictate — быстрая локальная диктовка для macOS
 удаляйте. Откройте Terminal и ещё раз выполните ту же команду:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 Команда заменяет только `/Applications/SuperDictate.app`. История, настройки и
@@ -124,7 +124,7 @@ Xcode и Command Line Tools для обычной установки не нуж
 Эта же команда остаётся запасным способом для любой версии:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 Приложение само не устанавливает обновления в фоне: запуск обновления всегда
@@ -138,7 +138,7 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.
 результат в `/Applications`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 SUPERDICTATE_REF=v0.2.36 SUPERDICTATE_SOURCE_COMMIT=450f127d98415d36e6912f969ebb7361a6212968 bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.36/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 SUPERDICTATE_REF=v0.2.36 SUPERDICTATE_SOURCE_COMMIT=450f127d98415d36e6912f969ebb7361a6212968 /usr/bin/arch -arm64 /bin/bash
 ```
 
 Понадобятся бесплатные Apple Command Line Tools. Если их нет, установщик
