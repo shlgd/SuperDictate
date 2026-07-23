@@ -20,7 +20,7 @@ jobs:
         run: |
           test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
           test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "com.local.superdictate"
-          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "0.2.36"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "0.2.37"
           file /Applications/SuperDictate.app/Contents/MacOS/SuperDictate | grep -q arm64
           codesign --verify --deep --strict /Applications/SuperDictate.app
           codesign -d --entitlements :- /Applications/SuperDictate.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
