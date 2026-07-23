@@ -31,7 +31,7 @@ grep -q 'com.apple.security.device.microphone' entitlements.plist
 
 ! grep -q 'raw.githubusercontent.com/shlgd/SuperDictate/main/' README.md
 grep -q 'raw.githubusercontent.com/shlgd/SuperDictate/v'"$app_version"'/' README.md
-grep -q '^REF="${SUPERDICTATE_REF:-v\$RELEASE_VERSION}"$' install.sh
+grep -q '^REF="${SUPERDICTATE_REF:-\$SOURCE_COMMIT}"$' install.sh
 grep -q '^EXPECTED_SOURCE_COMMIT="${SUPERDICTATE_SOURCE_COMMIT:-\$SOURCE_COMMIT}"$' install.sh
 grep -q 'verify_source_ref' install.sh
 grep -q 'sysctl.proc_translated' install.sh
