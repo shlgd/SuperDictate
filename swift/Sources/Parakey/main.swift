@@ -4071,33 +4071,47 @@ private enum HotkeyShortcutEdge: Equatable {
     case pass
 }
 
+private struct HotkeyShortcutResult: Equatable {
+    let edge: HotkeyShortcutEdge
+    let suppress: Bool
+
+    static let pass = HotkeyShortcutResult(edge: .pass, suppress: false)
+    static let suppressOnly = HotkeyShortcutResult(edge: .suppress, suppress: true)
+
+    static func press(suppress: Bool) -> HotkeyShortcutResult {
+        HotkeyShortcutResult(edge: .press, suppress: suppress)
+    }
+
+    static func release(suppress: Bool) -> HotkeyShortcutResult {
+        HotkeyShortcutResult(edge: .release, suppress: suppress)
+    }
+}
+
 private struct HotkeyShortcutState {
     private var primaryModifierDown = false
     private var shortcutDown = false
-    private var suppressingChordRelease = false
 
-    var isEngaged: Bool { primaryModifierDown || shortcutDown || suppressingChordRelease }
+    var isEngaged: Bool { primaryModifierDown || shortcutDown }
 
     mutating func reset() {
         primaryModifierDown = false
         shortcutDown = false
-        suppressingChordRelease = false
     }
 
     mutating func consume(_ event: HotkeyEventSnapshot,
-                          shortcut: HotkeyChoice) -> HotkeyShortcutEdge {
+                          shortcut: HotkeyChoice) -> HotkeyShortcutResult {
         if !shortcut.isModifier {
             guard event.keycode == shortcut.keycode else { return .pass }
             if event.typeRawValue == CGEventType.keyDown.rawValue {
-                guard !event.isAutoRepeat else { return shortcutDown ? .suppress : .pass }
+                guard !event.isAutoRepeat else { return shortcutDown ? .suppressOnly : .pass }
                 let modifiers = event.flags.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
                 guard modifiers == shortcut.requiredModifiers else { return .pass }
                 shortcutDown = true
-                return .press
+                return .press(suppress: true)
             }
             if event.typeRawValue == CGEventType.keyUp.rawValue, shortcutDown {
                 shortcutDown = false
-                return .release
+                return .release(suppress: true)
             }
             return .pass
         }
@@ -4114,19 +4128,6 @@ private struct HotkeyShortcutState {
         let isRelevant = event.keycode == shortcut.keycode || isRequiredModifierEvent
         guard isRelevant else { return .pass }
 
-        if suppressingChordRelease {
-            let allModifiers = shortcut.requiredModifiers.union(primaryMask)
-            if event.keycode == shortcut.keycode {
-                primaryModifierDown = false
-            }
-            if event.flags.intersection(allModifiers).isEmpty {
-                suppressingChordRelease = false
-                primaryModifierDown = false
-                shortcutDown = false
-            }
-            return .suppress
-        }
-
         if event.keycode == shortcut.keycode {
             if primaryModifierDown {
                 primaryModifierDown = false
@@ -4141,15 +4142,17 @@ private struct HotkeyShortcutState {
         let isNowDown = primaryModifierDown && requirementsMet
         if isNowDown, !shortcutDown {
             shortcutDown = true
-            return .press
+            // Modifier-only chords are observed rather than consumed so
+            // incomplete prefixes such as Shift keep working in the frontmost
+            // app. A single-modifier shortcut remains fully intercepted.
+            return .press(suppress: shortcut.requiredModifiers.isEmpty)
         }
         if shortcutDown, !isNowDown {
             shortcutDown = false
-            suppressingChordRelease = !shortcut.requiredModifiers.isEmpty
-            return .release
+            return .release(suppress: shortcut.requiredModifiers.isEmpty)
         }
-        if shortcutDown || isRequiredModifierEvent {
-            return .suppress
+        if shortcutDown, shortcut.requiredModifiers.isEmpty {
+            return .suppressOnly
         }
         return .pass
     }
@@ -4210,23 +4213,27 @@ private struct HotkeyTransitionState {
             }
         }
 
-        let edge = standardShortcutState.consume(event, shortcut: hotkey)
+        let shortcutResult = standardShortcutState.consume(event, shortcut: hotkey)
 
         switch triggerMode {
         case .hold:
             var actions: [HotkeyTransitionAction] = []
-            if edge == .press { actions.append(.press) }
-            if edge == .release { actions.append(.release) }
-            guard edge != .pass else { return .pass }
-            return HotkeyTransitionResult(suppress: true, actions: actions)
+            if shortcutResult.edge == .press { actions.append(.press) }
+            if shortcutResult.edge == .release { actions.append(.release) }
+            guard shortcutResult.edge != .pass || shortcutResult.suppress else { return .pass }
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress, actions: actions)
         case .toggle:
             // Toggle mode: every press flips between "start recording"
             // and "stop recording". Releases are no-ops.
-            guard edge != .pass else { return .pass }
-            guard edge == .press else { return .suppressOnly }
+            guard shortcutResult.edge != .pass else {
+                return shortcutResult.suppress ? .suppressOnly : .pass
+            }
+            guard shortcutResult.edge == .press else {
+                return shortcutResult.suppress ? .suppressOnly : .pass
+            }
             if toggleActive {
                 toggleActive = false
-                return HotkeyTransitionResult(suppress: true, actions: [.release])
+                return HotkeyTransitionResult(suppress: shortcutResult.suppress, actions: [.release])
             }
             // A press the app will reject (model loading, a
             // transcription in flight, terminating) must not flip the
@@ -4239,10 +4246,11 @@ private struct HotkeyTransitionState {
             // flipping toggle state — handlePress() is never reached
             // in toggle mode because the state machine gates it here.
             guard canStartRecording else {
-                return HotkeyTransitionResult(suppress: true, actions: [.rejectedBusyPress])
+                return HotkeyTransitionResult(suppress: shortcutResult.suppress,
+                                              actions: [.rejectedBusyPress])
             }
             toggleActive = true
-            return HotkeyTransitionResult(suppress: true, actions: [.press])
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress, actions: [.press])
         }
     }
 
@@ -4251,16 +4259,18 @@ private struct HotkeyTransitionState {
         isRecording: Bool,
         historyHotkey: HotkeyChoice
     ) -> HotkeyTransitionResult? {
-        switch historyShortcutState.consume(event, shortcut: historyHotkey) {
+        let shortcutResult = historyShortcutState.consume(event, shortcut: historyHotkey)
+        switch shortcutResult.edge {
         case .press:
             standardShortcutState.reset()
             enterShortcutState.reset()
             if !isRecording {
                 toggleActive = false
             }
-            return HotkeyTransitionResult(suppress: true, actions: [.showHistory])
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress,
+                                          actions: [.showHistory])
         case .release, .suppress:
-            return .suppressOnly
+            return shortcutResult.suppress ? .suppressOnly : nil
         case .pass:
             return nil
         }
@@ -4272,13 +4282,15 @@ private struct HotkeyTransitionState {
         enterHotkey: HotkeyChoice
     ) -> HotkeyTransitionResult? {
         guard isRecording || enterShortcutState.isEngaged else { return nil }
-        switch enterShortcutState.consume(event, shortcut: enterHotkey) {
+        let shortcutResult = enterShortcutState.consume(event, shortcut: enterHotkey)
+        switch shortcutResult.edge {
         case .press where isRecording:
             standardShortcutState.reset()
             toggleActive = false
-            return HotkeyTransitionResult(suppress: true, actions: [.releaseAlternate])
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress,
+                                          actions: [.releaseAlternate])
         case .press, .release, .suppress:
-            return .suppressOnly
+            return shortcutResult.suppress ? .suppressOnly : nil
         case .pass:
             return nil
         }
@@ -19490,8 +19502,29 @@ private enum ParakeySelfTest {
                              enterHotkey: unrelatedEnterShortcut,
                              triggerMode: .toggle,
                              isRecording: false),
-            equals: .suppressOnly,
-            "the first modifier in a configured chord should be reserved"
+            equals: .pass,
+            "an incomplete modifier chord must not reserve Option globally"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_OPTION_KEYCODE),
+                             hotkey: shortcut,
+                             enterHotkey: unrelatedEnterShortcut,
+                             triggerMode: .toggle,
+                             isRecording: false),
+            equals: .pass,
+            "releasing an incomplete modifier chord must reach the frontmost app"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_OPTION_KEYCODE,
+                                        flags: alternate),
+                             hotkey: shortcut,
+                             enterHotkey: unrelatedEnterShortcut,
+                             triggerMode: .toggle,
+                             isRecording: false),
+            equals: .pass,
+            "Option should still pass through before the full shortcut activates"
         )
         try expect(
             state.transition(for: event(.flagsChanged,
@@ -19501,8 +19534,8 @@ private enum ParakeySelfTest {
                              enterHotkey: unrelatedEnterShortcut,
                              triggerMode: .toggle,
                              isRecording: false),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
-            "Option+Command should start dictation when configured as the main shortcut"
+            equals: HotkeyTransitionResult(suppress: false, actions: [.press]),
+            "Option+Command should start dictation without stealing modifier events"
         )
         _ = state.transition(for: event(.flagsChanged,
                                         keycode: RIGHT_COMMAND_KEYCODE,
@@ -19532,8 +19565,53 @@ private enum ParakeySelfTest {
                              enterHotkey: unrelatedEnterShortcut,
                              triggerMode: .toggle,
                              isRecording: true),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
-            "the same modifier chord should stop dictation on its next activation"
+            equals: HotkeyTransitionResult(suppress: false, actions: [.release]),
+            "the same modifier chord should stop dictation without stealing modifiers"
+        )
+
+        var holdState = HotkeyTransitionState()
+        try expect(
+            holdState.transition(for: event(.flagsChanged,
+                                           keycode: RIGHT_OPTION_KEYCODE,
+                                           flags: alternate),
+                                 hotkey: shortcut,
+                                 enterHotkey: unrelatedEnterShortcut,
+                                 triggerMode: .hold,
+                                 isRecording: false),
+            equals: .pass,
+            "hold-mode chord prefixes must pass through"
+        )
+        try expect(
+            holdState.transition(for: event(.flagsChanged,
+                                           keycode: RIGHT_COMMAND_KEYCODE,
+                                           flags: commandAlternate),
+                                 hotkey: shortcut,
+                                 enterHotkey: unrelatedEnterShortcut,
+                                 triggerMode: .hold,
+                                 isRecording: false),
+            equals: HotkeyTransitionResult(suppress: false, actions: [.press]),
+            "hold-mode modifier chords should press without stealing modifiers"
+        )
+        try expect(
+            holdState.transition(for: event(.flagsChanged,
+                                           keycode: RIGHT_OPTION_KEYCODE,
+                                           flags: CGEventFlags.maskCommand.rawValue),
+                                 hotkey: shortcut,
+                                 enterHotkey: unrelatedEnterShortcut,
+                                 triggerMode: .hold,
+                                 isRecording: true),
+            equals: HotkeyTransitionResult(suppress: false, actions: [.release]),
+            "hold-mode modifier chords should release without stealing modifiers"
+        )
+        try expect(
+            holdState.transition(for: event(.flagsChanged,
+                                           keycode: RIGHT_COMMAND_KEYCODE),
+                                 hotkey: shortcut,
+                                 enterHotkey: unrelatedEnterShortcut,
+                                 triggerMode: .hold,
+                                 isRecording: false),
+            equals: .pass,
+            "the final modifier release must pass through"
         )
     }
 
@@ -19621,6 +19699,28 @@ private enum ParakeySelfTest {
         let rightCommand = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
         let commandShift = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue
 
+        var shiftAlone = HotkeyTransitionState()
+        try expect(
+            shiftAlone.transition(for: event(.flagsChanged,
+                                            keycode: RIGHT_SHIFT_KEYCODE,
+                                            flags: CGEventFlags.maskShift.rawValue),
+                                  hotkey: rightCommand,
+                                  triggerMode: .toggle,
+                                  isRecording: false),
+            equals: .pass,
+            "Shift alone must pass through for app gestures such as Blender navigation"
+        )
+        try expect(
+            shiftAlone.transition(for: event(.flagsChanged,
+                                            keycode: RIGHT_SHIFT_KEYCODE,
+                                            flags: 0),
+                                  hotkey: rightCommand,
+                                  triggerMode: .toggle,
+                                  isRecording: false),
+            equals: .pass,
+            "Shift release must pass through when the history chord never completed"
+        )
+
         var shiftFirst = HotkeyTransitionState()
         try expect(
             shiftFirst.transition(for: event(.flagsChanged,
@@ -19629,8 +19729,8 @@ private enum ParakeySelfTest {
                                   hotkey: rightCommand,
                                   triggerMode: .toggle,
                                   isRecording: false),
-            equals: .suppressOnly,
-            "the first key of the history chord should be reserved until the chord completes"
+            equals: .pass,
+            "the first key of the history chord must remain available to other apps"
         )
         try expect(
             shiftFirst.transition(for: event(.flagsChanged,
@@ -19639,8 +19739,8 @@ private enum ParakeySelfTest {
                                   hotkey: rightCommand,
                                   triggerMode: .toggle,
                                   isRecording: false),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.showHistory]),
-            "right shift then right command should show history without starting dictation"
+            equals: HotkeyTransitionResult(suppress: false, actions: [.showHistory]),
+            "right shift then right command should show history without stealing modifiers"
         )
         try expect(
             shiftFirst.transition(for: event(.flagsChanged,
@@ -19649,8 +19749,8 @@ private enum ParakeySelfTest {
                                   hotkey: rightCommand,
                                   triggerMode: .toggle,
                                   isRecording: false),
-            equals: .suppressOnly,
-            "history chord should suppress the paired right command release"
+            equals: .pass,
+            "history chord should pass the paired right command release"
         )
         try expect(
             shiftFirst.transition(for: event(.flagsChanged,
@@ -19659,8 +19759,8 @@ private enum ParakeySelfTest {
                                   hotkey: rightCommand,
                                   triggerMode: .toggle,
                                   isRecording: false),
-            equals: .suppressOnly,
-            "history chord should suppress the paired right shift release"
+            equals: .pass,
+            "history chord should pass the paired right shift release"
         )
 
         var requiredModifierReleasedFirst = HotkeyTransitionState()
@@ -19689,8 +19789,8 @@ private enum ParakeySelfTest {
                 triggerMode: .toggle,
                 isRecording: false
             ),
-            equals: .suppressOnly,
-            "releasing Shift first should begin suppressing the history chord release"
+            equals: .pass,
+            "releasing Shift first should remain visible to the frontmost app"
         )
         try expect(
             requiredModifierReleasedFirst.transition(
@@ -19701,8 +19801,8 @@ private enum ParakeySelfTest {
                 triggerMode: .toggle,
                 isRecording: false
             ),
-            equals: .suppressOnly,
-            "releasing right Command last should clear the history chord state"
+            equals: .pass,
+            "releasing right Command last should clear the history chord without interception"
         )
         try expect(
             requiredModifierReleasedFirst.transition(
@@ -19725,8 +19825,8 @@ private enum ParakeySelfTest {
                 triggerMode: .toggle,
                 isRecording: false
             ),
-            equals: .suppressOnly,
-            "left Command plus Shift must not trigger right Command history"
+            equals: .pass,
+            "left Command plus Shift must pass through and not trigger right Command history"
         )
 
         var commandFirst = HotkeyTransitionState()
@@ -19747,8 +19847,8 @@ private enum ParakeySelfTest {
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
                                     isRecording: true),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.showHistory]),
-            "history chord should show history without canceling active dictation"
+            equals: HotkeyTransitionResult(suppress: false, actions: [.showHistory]),
+            "history chord should show history without canceling dictation or stealing Shift"
         )
         try expect(
             commandFirst.transition(for: event(.flagsChanged,
@@ -19757,8 +19857,8 @@ private enum ParakeySelfTest {
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
                                     isRecording: true),
-            equals: .suppressOnly,
-            "history chord should suppress the paired right command release while recording"
+            equals: .pass,
+            "history chord should pass the paired right command release while recording"
         )
         try expect(
             commandFirst.transition(for: event(.flagsChanged,
@@ -19767,8 +19867,8 @@ private enum ParakeySelfTest {
                                     hotkey: rightCommand,
                                     triggerMode: .toggle,
                                     isRecording: true),
-            equals: .suppressOnly,
-            "history chord should suppress the paired right shift release"
+            equals: .pass,
+            "history chord should pass the paired right shift release"
         )
         try expect(
             commandFirst.transition(for: event(.flagsChanged,
@@ -19824,8 +19924,8 @@ private enum ParakeySelfTest {
                              hotkey: rightCommand,
                              triggerMode: .toggle,
                              isRecording: true),
-            equals: .suppressOnly,
-            "right option should be held for the enter chord while recording"
+            equals: .pass,
+            "right Option alone must remain available while recording"
         )
         try expect(
             state.transition(for: event(.flagsChanged,
@@ -19834,8 +19934,8 @@ private enum ParakeySelfTest {
                              hotkey: rightCommand,
                              triggerMode: .toggle,
                              isRecording: true),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.releaseAlternate]),
-            "right option + right command should stop dictation through the alternate release path"
+            equals: HotkeyTransitionResult(suppress: false, actions: [.releaseAlternate]),
+            "right Option + right Command should stop dictation without stealing modifiers"
         )
         try expect(
             state.transition(for: event(.flagsChanged,
@@ -19844,8 +19944,8 @@ private enum ParakeySelfTest {
                              hotkey: rightCommand,
                              triggerMode: .toggle,
                              isRecording: false),
-            equals: .suppressOnly,
-            "enter chord should suppress the paired right command release"
+            equals: .pass,
+            "enter chord should pass the paired right command release"
         )
         try expect(
             state.transition(for: event(.flagsChanged,
@@ -19854,8 +19954,8 @@ private enum ParakeySelfTest {
                              hotkey: rightCommand,
                              triggerMode: .toggle,
                              isRecording: false),
-            equals: .suppressOnly,
-            "enter chord should suppress the paired right option release"
+            equals: .pass,
+            "enter chord should pass the paired right Option release"
         )
 
     }
