@@ -1618,15 +1618,96 @@ enum ModelIntegrity {
     }
 }
 
-private func resolvedFluidAudioSupportDirectory(_ override: URL?) -> URL? {
+// MARK: - Whisper model download + checksum verification
+
+/// Replaces FluidAudio's `DownloadUtils.ProgressHandler` (dropped along with
+/// the package in Task 2). Not called anywhere yet — `downloadWhisperModelIfNeeded()`
+/// takes no progress callback today; this type exists so `TranscriptionWorker.load`
+/// (Task 5) keeps a progress-handler parameter of some concrete type at its call
+/// sites, unchanged from before this port.
+typealias WhisperDownloadProgressHandler = @Sendable (Double) -> Void
+
+enum WhisperModelDownloadError: LocalizedError {
+    case checksumMismatch(expected: String, actual: String)
+    case downloadFailed(underlying: Error)
+    case httpError(statusCode: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .checksumMismatch(let expected, let actual):
+            return "Downloaded whisper model checksum mismatch: expected \(expected), got \(actual)"
+        case .downloadFailed(let underlying):
+            return "Failed to download whisper model: \(underlying.localizedDescription)"
+        case .httpError(let statusCode):
+            return "Whisper model download failed with HTTP \(statusCode)"
+        }
+    }
+}
+
+/// Pinned to a specific Hugging Face revision commit, never `main` — see
+/// Global Constraints in the implementation plan for why.
+private let WHISPER_MODEL_URL = URL(
+    string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin"
+)!
+private let WHISPER_MODEL_SHA256 = "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+private let WHISPER_MODEL_SIZE_BYTES: Int64 = 1_624_555_275
+
+/// Computes the SHA-256 digest of a single known file, hex-encoded.
+///
+/// This is intentionally separate from `ModelIntegrity.sha256Hex(of:relativePath:)`,
+/// which verifies files within a FluidAudio CoreML manifest tree (relative-path
+/// aware, part of the manifest-verification machinery above). This function has
+/// a simpler job: verify one specific downloaded model file against a single
+/// pinned checksum.
+func sha256Hex(ofFileAt url: URL) throws -> String {
+    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+    var hasher = SHA256()
+    hasher.update(data: data)
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+@discardableResult
+func downloadWhisperModelIfNeeded() async throws -> URL {
+    let destination = speechModelCacheDirectory(for: .productionDefault)
+    if FileManager.default.fileExists(atPath: destination.path) {
+        let actual = try sha256Hex(ofFileAt: destination)
+        if actual == WHISPER_MODEL_SHA256 {
+            return destination
+        }
+        log("ASR: cached whisper model failed checksum verification; redownloading")
+        try? FileManager.default.removeItem(at: destination)
+    }
+
+    try FileManager.default.createDirectory(
+        at: destination.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+
+    let (tempURL, response) = try await URLSession.shared.download(from: WHISPER_MODEL_URL)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+        throw WhisperModelDownloadError.httpError(statusCode: code)
+    }
+
+    let actual = try sha256Hex(ofFileAt: tempURL)
+    guard actual == WHISPER_MODEL_SHA256 else {
+        try? FileManager.default.removeItem(at: tempURL)
+        throw WhisperModelDownloadError.checksumMismatch(expected: WHISPER_MODEL_SHA256, actual: actual)
+    }
+
+    try FileManager.default.moveItem(at: tempURL, to: destination)
+    return destination
+}
+
+private func resolvedWhisperSupportDirectory(_ override: URL?) -> URL? {
     override
         ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("FluidAudio", isDirectory: true)
+            .appendingPathComponent("Whisper", isDirectory: true)
 }
 
 func isSafeSpeechModelCacheDirectory(_ cacheDir: URL,
-                                     fluidAudioSupportDirectory: URL? = nil) -> Bool {
-    let supportDirectory = resolvedFluidAudioSupportDirectory(fluidAudioSupportDirectory)
+                                     whisperSupportDirectory: URL? = nil) -> Bool {
+    let supportDirectory = resolvedWhisperSupportDirectory(whisperSupportDirectory)
     guard let supportDirectory else { return false }
 
     let cacheURL = cacheDir.standardizedFileURL
@@ -1648,11 +1729,11 @@ func isSafeSpeechModelCacheDirectory(_ cacheDir: URL,
 
 func isExistingSpeechModelCacheDirectorySafeForRemoval(
     _ cacheDir: URL,
-    fluidAudioSupportDirectory: URL? = nil
+    whisperSupportDirectory: URL? = nil
 ) -> Bool {
     guard isSafeSpeechModelCacheDirectory(cacheDir,
-                                          fluidAudioSupportDirectory: fluidAudioSupportDirectory),
-          let supportDirectory = resolvedFluidAudioSupportDirectory(fluidAudioSupportDirectory) else {
+                                          whisperSupportDirectory: whisperSupportDirectory),
+          let supportDirectory = resolvedWhisperSupportDirectory(whisperSupportDirectory) else {
         return false
     }
 
@@ -1675,8 +1756,21 @@ func speechModelCacheBaseDirectory() -> URL {
     MLModelConfigurationUtils.defaultModelsDirectory()
 }
 
+/// The directory whisper model files live under (`~/Library/Application
+/// Support/Whisper/Models`). Consumed by Task 5's `TranscriptionWorker`.
+func whisperModelCacheDirectory() -> URL {
+    resolvedWhisperSupportDirectory(nil)!
+        .appendingPathComponent("Models", isDirectory: true)
+}
+
+/// The single whisper model file Parakey downloads and loads. Consumed by
+/// Task 5's `TranscriptionWorker`.
+func whisperModelPath() -> URL {
+    whisperModelCacheDirectory().appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: false)
+}
+
 func speechModelCacheDirectory(for _: SpeechModelProfile) -> URL {
-    AsrModels.defaultCacheDirectory(for: .v3)
+    whisperModelPath()
 }
 
 func speechModelDownloadRequiredBytes(for profile: SpeechModelProfile,
