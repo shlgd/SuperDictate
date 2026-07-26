@@ -25,7 +25,14 @@ struct WhisperTranscription: Sendable {
 /// (main.swift) is the single caller and already serializes transcribe calls;
 /// see the comment above that actor for why re-entrancy would corrupt state.
 actor WhisperEngine {
-    private let context: OpaquePointer
+    // `OpaquePointer` doesn't conform to `Sendable`, which under Swift 6
+    // strict concurrency would otherwise block reading this property from
+    // `deinit` (always nonisolated) and from the C interop calls below.
+    // Safety is still provided by the actor: `context` is only ever mutated
+    // once (in `init`) and every other access is serialized through
+    // `WhisperEngine`'s actor isolation — `nonisolated(unsafe)` just tells
+    // the compiler what's already true.
+    private nonisolated(unsafe) let context: OpaquePointer
 
     init(modelPath: String) throws {
         var params = whisper_context_default_params()
@@ -52,9 +59,7 @@ actor WhisperEngine {
         }
 
         let encodeStartedAt = ProcessInfo.processInfo.systemUptime
-        let result = samples.withUnsafeBufferPointer { buffer in
-            whisper_full(context, params, buffer.baseAddress, Int32(buffer.count))
-        }
+        let result = Self.runWhisperFull(context: context, params: params, samples: samples)
         let encodeCompletedAt = ProcessInfo.processInfo.systemUptime
         guard result == 0 else {
             throw WhisperEngineError.transcriptionFailed(code: result)
@@ -77,5 +82,23 @@ actor WhisperEngine {
 
     deinit {
         whisper_free(context)
+    }
+
+    /// A `static` (hence non-actor-isolated) helper so the `withUnsafeBufferPointer`
+    /// closure below isn't treated as capturing actor-isolated state — under Swift 6
+    /// strict concurrency, a closure defined inside an actor-isolated instance method
+    /// that captures a `whisper_full_params` value is flagged as "sending" a
+    /// non-Sendable value across isolation even though the closure is synchronous
+    /// and non-escaping. Moving the call into a plain (non-isolated) static function
+    /// sidesteps that false positive; `context` stays safe to read here because it
+    /// is `nonisolated(unsafe)` and, per the actor's own contract, never mutated
+    /// after `init` and never called concurrently (see the doc comment above this
+    /// actor and above `TranscriptionWorker` in main.swift).
+    private static func runWhisperFull(context: OpaquePointer,
+                                       params: whisper_full_params,
+                                       samples: [Float]) -> Int32 {
+        samples.withUnsafeBufferPointer { buffer in
+            whisper_full(context, params, buffer.baseAddress, Int32(buffer.count))
+        }
     }
 }

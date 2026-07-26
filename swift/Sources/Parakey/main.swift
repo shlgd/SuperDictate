@@ -1,8 +1,8 @@
-// Parakey — push-to-talk dictation for macOS Apple Silicon.
+// Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (`FluidAudio` on the Apple
-// Neural Engine), paste-at-cursor (`NSPasteboard` + `CGEvent`),
+// (`AVAudioEngine`), transcription (vendored `whisper.cpp`, CPU-only),
+// paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, TCC self-healing.
 //
@@ -30,7 +30,6 @@ import CoreGraphics
 import CryptoKit
 import Darwin
 import ApplicationServices
-import FluidAudio
 import IOKit
 import QuartzCore
 import ServiceManagement
@@ -374,14 +373,12 @@ let PASTE_SUFFIX_DISPLAY: [PasteSuffix: String] = [
     .appendNewline: "Append newline",
 ]
 
-/// User-visible language choice for the v3 decoder script filter. `.auto`
-/// passes no hint and lets the decoder pick freely — the right default for
-/// almost everyone. Selecting a specific language biases the joint head
-/// toward that script (Latin vs Cyrillic), which prevents the occasional
-/// Cyrillic-character bleed-through that v3 can emit when transcribing
-/// Latin-script speech (FluidAudio v0.14.1 fix). Raw values match
-/// FluidAudio's `Language` BCP-47-ish keys so `fluidLanguage` is a direct
-/// lookup.
+/// User-visible language choice for the whisper.cpp decoder's language hint.
+/// `.auto` passes no hint and lets whisper.cpp detect the language freely —
+/// the right default for almost everyone. Selecting a specific language
+/// biases decoding toward that language, which prevents occasional
+/// cross-script bleed-through. Raw values are ISO-639-1 codes, matching
+/// whisper.cpp's own language table directly (see `whisperLanguageCode`).
 enum DictationLanguage: String, CaseIterable {
     case auto
     case english = "en"
@@ -403,30 +400,10 @@ enum DictationLanguage: String, CaseIterable {
     case bulgarian = "bg"
     case serbian = "sr"
 
-    /// Map to FluidAudio's `Language` enum. Returns nil for `.auto` so the
-    /// caller passes no hint and the decoder script filter stays off.
-    var fluidLanguage: Language? {
-        switch self {
-        case .auto:        return nil
-        case .english:     return .english
-        case .spanish:     return .spanish
-        case .french:      return .french
-        case .german:      return .german
-        case .italian:     return .italian
-        case .portuguese:  return .portuguese
-        case .romanian:    return .romanian
-        case .polish:      return .polish
-        case .czech:       return .czech
-        case .slovak:      return .slovak
-        case .slovenian:   return .slovenian
-        case .croatian:    return .croatian
-        case .bosnian:     return .bosnian
-        case .russian:     return .russian
-        case .ukrainian:   return .ukrainian
-        case .belarusian:  return .belarusian
-        case .bulgarian:   return .bulgarian
-        case .serbian:     return .serbian
-        }
+    /// whisper.cpp identifies languages by ISO-639-1 string, which is
+    /// exactly this enum's raw value; `.auto` passes nil for auto-detect.
+    var whisperLanguageCode: String? {
+        self == .auto ? nil : rawValue
     }
 }
 
@@ -471,7 +448,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var displayName: String {
         switch self {
         case .multilingualV3:
-            return "Multilingual (Parakeet TDT v3)"
+            return "Multilingual (Whisper large-v3-turbo)"
         case .englishUnified:
             return "English optimized (Parakeet Unified, deprecated)"
         }
@@ -480,7 +457,7 @@ enum SpeechModelProfile: String, CaseIterable {
     var shortName: String {
         switch self {
         case .multilingualV3:
-            return "Parakeet TDT v3"
+            return "Whisper large-v3-turbo"
         case .englishUnified:
             return "Parakeet Unified"
         }
@@ -489,9 +466,9 @@ enum SpeechModelProfile: String, CaseIterable {
     var aboutModelText: String {
         switch self {
         case .multilingualV3:
-            return "FluidAudio · Parakeet TDT v3 multilingual (CoreML / ANE)"
+            return "whisper.cpp · large-v3-turbo multilingual (CPU)"
         case .englishUnified:
-            return "FluidAudio · Parakeet Unified English (deprecated)"
+            return "Parakeet Unified English (deprecated)"
         }
     }
 
@@ -502,9 +479,9 @@ enum SpeechModelProfile: String, CaseIterable {
     var cacheResetDetail: String {
         switch self {
         case .multilingualV3:
-            return "Parakey will delete the local Parakeet TDT v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
+            return "Parakey will delete the local Whisper large-v3-turbo model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
         case .englishUnified:
-            return "Parakey will delete the local Parakeet TDT v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
+            return "Parakey will delete the local Whisper large-v3-turbo model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
         }
     }
 
@@ -649,23 +626,23 @@ struct ASRTimingBreakdown: Codable, Equatable, Sendable {
     let totalSeconds: Double
     let workerQueueSeconds: Double
     let decoderPreparationSeconds: Double
-    let fluidCallSeconds: Double
-    let fluidProcessingSeconds: Double
+    let engineCallSeconds: Double
+    let engineProcessingSeconds: Double
 
     init(totalSeconds: Double,
          workerQueueSeconds: Double,
          decoderPreparationSeconds: Double,
-         fluidCallSeconds: Double,
-         fluidProcessingSeconds: Double) {
+         engineCallSeconds: Double,
+         engineProcessingSeconds: Double) {
         self.totalSeconds = max(0, totalSeconds.isFinite ? totalSeconds : 0)
         self.workerQueueSeconds = max(0, workerQueueSeconds.isFinite ? workerQueueSeconds : 0)
         self.decoderPreparationSeconds = max(0, decoderPreparationSeconds.isFinite ? decoderPreparationSeconds : 0)
-        self.fluidCallSeconds = max(0, fluidCallSeconds.isFinite ? fluidCallSeconds : 0)
-        self.fluidProcessingSeconds = max(0, fluidProcessingSeconds.isFinite ? fluidProcessingSeconds : 0)
+        self.engineCallSeconds = max(0, engineCallSeconds.isFinite ? engineCallSeconds : 0)
+        self.engineProcessingSeconds = max(0, engineProcessingSeconds.isFinite ? engineProcessingSeconds : 0)
     }
 
     var frameworkOverheadSeconds: Double {
-        max(0, totalSeconds - workerQueueSeconds - decoderPreparationSeconds - fluidProcessingSeconds)
+        max(0, totalSeconds - workerQueueSeconds - decoderPreparationSeconds - engineProcessingSeconds)
     }
 }
 
@@ -899,7 +876,7 @@ func asrTimingTooltip(_ timing: ASRTimingBreakdown?) -> String? {
     guard let timing else { return nil }
     return [
         "ASR total  \(millisecondsLabel(timing.totalSeconds))",
-        "FluidAudio  \(millisecondsLabel(timing.fluidProcessingSeconds))",
+        "whisper.cpp  \(millisecondsLabel(timing.engineProcessingSeconds))",
         "Decoder setup  \(millisecondsLabel(timing.decoderPreparationSeconds))",
         "Actor + framework  \(millisecondsLabel(timing.workerQueueSeconds + timing.frameworkOverheadSeconds))",
     ].joined(separator: "\n")
@@ -952,8 +929,8 @@ struct DictationLatencyMetrics: Equatable {
             "release_to_asr=\(millisecondsLabel(releaseToASRSeconds))",
             "worker_queue=\(millisecondsLabel(asrTiming.workerQueueSeconds))",
             "decoder_setup=\(millisecondsLabel(asrTiming.decoderPreparationSeconds))",
-            "fluid_call=\(millisecondsLabel(asrTiming.fluidCallSeconds))",
-            "fluid_processing=\(millisecondsLabel(asrTiming.fluidProcessingSeconds))",
+            "engine_call=\(millisecondsLabel(asrTiming.engineCallSeconds))",
+            "engine_processing=\(millisecondsLabel(asrTiming.engineProcessingSeconds))",
             "framework_overhead=\(millisecondsLabel(asrTiming.frameworkOverheadSeconds))",
             "asr_total=\(millisecondsLabel(asrTiming.totalSeconds))",
             "postprocess=\(millisecondsLabel(postprocessingSeconds))",
@@ -1321,20 +1298,22 @@ func shouldStopCorrectionSync(afterPathValidationError error: Error) -> Bool {
 
 // MARK: - Model registry hardening
 //
-// FluidAudio reads REGISTRY_URL and MODEL_REGISTRY_URL from the process
-// environment to override the speech-model download base URL. Parakey
-// does not document either as a feature, so a value here means either
+// These historically overrode the speech-model download base URL for
+// the previous CoreML-based ASR stack. Parakey's whisper.cpp download
+// path (`downloadWhisperModelIfNeeded`) uses a single hardcoded, pinned
+// URL and does not consult either variable, but the hardening check
+// stays as defense in depth: a value here still means either
 // (a) a developer is debugging a mirror — uncommon — or (b) a process
-// or LaunchAgent has injected one to redirect first-launch model
-// downloads to an attacker-controlled host. An attacker who can plant
-// `~/Library/LaunchAgents/*.plist` with `EnvironmentVariables` gets
-// this persistence channel for free on every GUI app launch. Treat
-// any value as adversarial: log it, present a blocking alert, refuse
-// to start. The user fixes the env source and relaunches.
+// or LaunchAgent has injected one, which is worth surfacing regardless.
+// An attacker who can plant `~/Library/LaunchAgents/*.plist` with
+// `EnvironmentVariables` gets this persistence channel for free on
+// every GUI app launch. Treat any value as adversarial: log it, present
+// a blocking alert, refuse to start. The user fixes the env source and
+// relaunches.
 //
-// We do not block HF_TOKEN etc. — those are auth headers FluidAudio
-// sends to the (unchanged) huggingface.co host; a user with HF_TOKEN
-// set for unrelated tooling shouldn't be punished.
+// We do not block HF_TOKEN etc. — those are auth headers some download
+// tooling sends to the (unchanged) huggingface.co host; a user with
+// HF_TOKEN set for unrelated tooling shouldn't be punished.
 
 let HOSTILE_REGISTRY_ENV_VARS = ["REGISTRY_URL", "MODEL_REGISTRY_URL"]
 
@@ -1354,7 +1333,7 @@ func refuseHostileRegistryEnvironmentAndExit() {
     alert.informativeText = """
         These environment variable(s) are set in Parakey's process: \(names).
 
-        FluidAudio uses them to override the speech-model download URL. Parakey does not support this and treats it as a sign that the launch environment has been tampered with.
+        Parakey does not support overriding the speech-model download URL and treats their presence as a sign that the launch environment has been tampered with.
 
         Check ~/Library/LaunchAgents/, your shell rc files, and any parent process. Once the variables are gone, launch Parakey again.
         """
@@ -1365,12 +1344,14 @@ func refuseHostileRegistryEnvironmentAndExit() {
 
 // MARK: - Speech model integrity
 //
-// FluidAudio owns the Hugging Face download mechanics, but it does not
-// pin the downloaded CoreML bundle contents. Parakey downloads first,
-// verifies the files that will be loaded by CoreML, and only then asks
-// FluidAudio to compile/load the models. The manifest is intentionally
-// tied to one upstream repo commit; a legitimate upstream model change
-// should arrive as an explicit Parakey update with refreshed hashes.
+// `ModelIntegrity` originally verified the previous CoreML-based ASR
+// stack's downloaded bundle contents (a multi-file manifest tree) before
+// handing them off to be compiled/loaded. The current whisper.cpp engine
+// downloads a single pinned `.bin` file and verifies it with a plain
+// SHA-256 check (`sha256Hex(ofFileAt:)`/`WHISPER_MODEL_SHA256`) instead —
+// see "Whisper model download + checksum verification" below. This
+// manifest-verification machinery is kept for its self-tests and in case
+// a future model ships as a multi-file bundle again.
 
 struct ModelFileDigest: Equatable {
     let relativePath: String
@@ -1620,11 +1601,12 @@ enum ModelIntegrity {
 
 // MARK: - Whisper model download + checksum verification
 
-/// Replaces FluidAudio's `DownloadUtils.ProgressHandler` (dropped along with
-/// the package in Task 2). Not called anywhere yet — `downloadWhisperModelIfNeeded()`
-/// takes no progress callback today; this type exists so `TranscriptionWorker.load`
-/// (Task 5) keeps a progress-handler parameter of some concrete type at its call
-/// sites, unchanged from before this port.
+/// Replaces the previous CoreML-based ASR stack's download progress-handler
+/// type (dropped along with that dependency in Task 2). `downloadWhisperModelIfNeeded()`
+/// takes no progress callback today, so `TranscriptionWorker.load`'s
+/// `progressHandler` parameter of this type currently goes unused inside it —
+/// this type exists so the call sites keep a progress-handler parameter of
+/// some concrete type, unchanged from before this port.
 typealias WhisperDownloadProgressHandler = @Sendable (Double) -> Void
 
 enum WhisperModelDownloadError: LocalizedError {
@@ -1655,7 +1637,7 @@ private let WHISPER_MODEL_SIZE_BYTES: Int64 = 1_624_555_275
 /// Computes the SHA-256 digest of a single known file, hex-encoded.
 ///
 /// This is intentionally separate from `ModelIntegrity.sha256Hex(of:relativePath:)`,
-/// which verifies files within a FluidAudio CoreML manifest tree (relative-path
+/// which verifies files within the previous ASR stack's CoreML manifest tree (relative-path
 /// aware, part of the manifest-verification machinery above). This function has
 /// a simpler job: verify one specific downloaded model file against a single
 /// pinned checksum.
@@ -1745,15 +1727,24 @@ func isExistingSpeechModelCacheDirectorySafeForRemoval(
 
     guard isExistingPlainDirectory(supportPath) else { return false }
     var currentPath = supportPath
-    for component in components {
+    // Walk every component except the last through the plain-directory
+    // check — that confirms the whole parent chain is real directories with
+    // no symlink hops. The cache target itself (last component) may be
+    // either a plain file (the whisper `.bin` model) or a plain directory
+    // (older cache shapes), so it gets a looser leaf check below rather
+    // than being forced through isExistingPlainDirectory.
+    for component in components.dropLast() {
         currentPath = (currentPath as NSString).appendingPathComponent(String(component))
         guard isExistingPlainDirectory(currentPath) else { return false }
     }
-    return currentPath == cachePath
+    guard let lastComponent = components.last else { return false }
+    currentPath = (currentPath as NSString).appendingPathComponent(String(lastComponent))
+    guard currentPath == cachePath else { return false }
+    return isExistingPlainDirectory(currentPath) || isExistingPlainFile(currentPath)
 }
 
 func speechModelCacheBaseDirectory() -> URL {
-    MLModelConfigurationUtils.defaultModelsDirectory()
+    resolvedWhisperSupportDirectory(nil) ?? FileManager.default.temporaryDirectory
 }
 
 /// The directory whisper model files live under (`~/Library/Application
@@ -1858,6 +1849,12 @@ private func isExistingPlainDirectory(_ path: String) -> Bool {
     var st = stat()
     guard lstat(path, &st) == 0 else { return false }
     return (st.st_mode & S_IFMT) == S_IFDIR
+}
+
+private func isExistingPlainFile(_ path: String) -> Bool {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return false }
+    return (st.st_mode & S_IFMT) == S_IFREG
 }
 
 func normalizedTranscriptCorrectionSource(_ source: String) -> String {
@@ -5270,36 +5267,36 @@ private final class AudioConverterInputProvider: @unchecked Sendable {
 
 // MARK: - Transcription worker
 //
-// Owns the FluidAudio AsrManager. The Apple Neural Engine doesn't
-// tolerate concurrent inference calls against the same compiled
-// CoreML graph — but the actor alone does NOT keep that contract.
-// Actors are reentrant at suspension points: while
-// `await asr.transcribe(...)` is suspended, a second transcribe()
-// call would enter the actor and start concurrent inference. The
-// real guard is ParakeyApp.isBusy, which ensures the app never
-// issues a second transcribe while one is in flight. The `inFlight`
-// flag below is a cheap defensive backstop should that invariant
-// ever break: it refuses (and, in DEBUG, asserts on) a re-entrant
-// call instead of corrupting ANE state.
+// Owns the whisper.cpp WhisperEngine. whisper.cpp's single loaded
+// context doesn't tolerate concurrent `whisper_full` calls — but the
+// actor alone does NOT keep that contract. Actors are reentrant at
+// suspension points: while `await whisper.transcribe(...)` is
+// suspended, a second transcribe() call would enter the actor and
+// start a concurrent inference against the same context. The real
+// guard is ParakeyApp.isBusy, which ensures the app never issues a
+// second transcribe while one is in flight. The `inFlight` flag below
+// is a cheap defensive backstop should that invariant ever break: it
+// refuses (and, in DEBUG, asserts on) a re-entrant call instead of
+// corrupting engine state.
 
 private enum LoadedSpeechEngine {
-    case parakeetV3(AsrManager)
+    case whisperLargeV3Turbo(WhisperEngine)
 }
 
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
     let workerQueueSeconds: Double
     let decoderPreparationSeconds: Double
-    let fluidCallSeconds: Double
-    let fluidProcessingSeconds: Double
+    let engineCallSeconds: Double
+    let engineProcessingSeconds: Double
 
     func timing(totalSeconds: Double) -> ASRTimingBreakdown {
         ASRTimingBreakdown(
             totalSeconds: totalSeconds,
             workerQueueSeconds: workerQueueSeconds,
             decoderPreparationSeconds: decoderPreparationSeconds,
-            fluidCallSeconds: fluidCallSeconds,
-            fluidProcessingSeconds: fluidProcessingSeconds
+            engineCallSeconds: engineCallSeconds,
+            engineProcessingSeconds: engineProcessingSeconds
         )
     }
 }
@@ -5318,7 +5315,7 @@ actor TranscriptionWorker {
     private var inFlight = false
 
     func load(profile requestedProfile: SpeechModelProfile,
-              progressHandler: DownloadUtils.ProgressHandler? = nil) async throws {
+              progressHandler: WhisperDownloadProgressHandler? = nil) async throws {
         let profile = requestedProfile.productionProfile
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
@@ -5333,41 +5330,24 @@ actor TranscriptionWorker {
         }
 
         if speechModelCacheExists(for: profile) {
-            log("ASR: verifying + loading cached \(profile.shortName) CoreML weights…")
+            log("ASR: verifying + loading cached \(profile.shortName) weights…")
         } else {
-            log("ASR: downloading + verifying + loading \(profile.shortName) CoreML weights…")
+            log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        engine = .parakeetV3(try await loadParakeetV3(progressHandler: progressHandler))
+        engine = .whisperLargeV3Turbo(try await loadWhisperEngine(progressHandler: progressHandler))
         loadedProfile = profile
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
     }
 
-    private func loadParakeetV3(progressHandler: DownloadUtils.ProgressHandler?) async throws -> AsrManager {
-        if !speechModelCacheExists(for: .multilingualV3) {
-            try assertSufficientDiskSpaceForSpeechModelDownload(profile: .multilingualV3)
-        }
-        var modelDirectory = try await AsrModels.download(version: .v3,
-                                                          progressHandler: progressHandler)
-        do {
-            try ModelIntegrity.verifyParakeetV3Model(at: modelDirectory)
-        } catch {
-            log("ASR: model integrity check failed; redownloading once: \(error.localizedDescription)")
-            try assertSufficientDiskSpaceForSpeechModelDownload(profile: .multilingualV3)
-            modelDirectory = try await AsrModels.download(force: true,
-                                                          version: .v3,
-                                                          progressHandler: progressHandler)
-            try ModelIntegrity.verifyParakeetV3Model(at: modelDirectory)
-        }
-        let models = try await AsrModels.load(from: modelDirectory,
-                                              version: .v3,
-                                              progressHandler: progressHandler)
-        return AsrManager(config: .default, models: models)
+    private func loadWhisperEngine(progressHandler: WhisperDownloadProgressHandler?) async throws -> WhisperEngine {
+        let modelPath = try await downloadWhisperModelIfNeeded()
+        return try WhisperEngine(modelPath: modelPath.path)
     }
 
     fileprivate func transcribe(samples: [Float],
-                               language: Language? = nil,
+                               language: DictationLanguage? = nil,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
@@ -5379,18 +5359,19 @@ actor TranscriptionWorker {
         inFlight = true
         defer { inFlight = false }
         switch engine {
-        case .parakeetV3(let asr):
-            let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
-            var state = try TdtDecoderState()
-            let fluidCallStartedAt = ProcessInfo.processInfo.systemUptime
-            let result = try await asr.transcribe(samples, decoderState: &state, language: language)
-            let fluidCallCompletedAt = ProcessInfo.processInfo.systemUptime
+        case .whisperLargeV3Turbo(let whisper):
+            let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
+            let result = try await whisper.transcribe(
+                samples: samples,
+                languageCode: language?.whisperLanguageCode
+            )
+            let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
             return TranscriptionWorkerResult(
                 text: result.text,
                 workerQueueSeconds: workerEnteredAt - requestedAt,
-                decoderPreparationSeconds: fluidCallStartedAt - decoderPreparationStartedAt,
-                fluidCallSeconds: fluidCallCompletedAt - fluidCallStartedAt,
-                fluidProcessingSeconds: result.processingTime
+                decoderPreparationSeconds: 0,
+                engineCallSeconds: engineCallCompletedAt - engineCallStartedAt,
+                engineProcessingSeconds: result.encodeSeconds
             )
         }
     }
@@ -5765,29 +5746,28 @@ func pastedText(from correctedTranscript: String, suffix: PasteSuffix) -> String
     }
 }
 
-func speechModelStartupStatusTitle(_ progress: DownloadUtils.DownloadProgress) -> String {
-    switch progress.phase {
-    case .listing:
+/// `fractionCompleted` is the whisper model download's overall progress in
+/// `0...1`, as reported by `WhisperDownloadProgressHandler`. Unlike the
+/// previous CoreML ASR stack's multi-file, multi-phase download (list →
+/// download N files → compile), whisper.cpp downloads and verifies a single
+/// pinned `.bin` file, so there is only one phase to describe: 0 means the
+/// download hasn't started yet (or the cached file is being checked), values
+/// strictly between 0 and 1 mean bytes are actively arriving, and 1 means
+/// the file is present and being handed to whisper.cpp for loading.
+func speechModelStartupStatusTitle(_ fractionCompleted: Double) -> String {
+    if fractionCompleted <= 0 {
         return "Checking speech model files…"
-    case .downloading(let completedFiles, let totalFiles):
-        guard totalFiles > 0 else { return "Loading cached speech model…" }
-        let downloadFraction = min(max(progress.fractionCompleted / 0.5, 0), 1)
-        let percent = min(100, max(0, Int((downloadFraction * 100).rounded())))
-        return "Downloading speech model… \(percent)% (\(completedFiles)/\(totalFiles))"
-    case .compiling:
+    } else if fractionCompleted < 1 {
+        let percent = min(100, max(0, Int((fractionCompleted * 100).rounded())))
+        return "Downloading speech model… \(percent)%"
+    } else {
         return "Preparing speech model…"
     }
 }
 
-func speechModelStartupProgressValue(_ progress: DownloadUtils.DownloadProgress) -> Double? {
-    switch progress.phase {
-    case .downloading(_, let totalFiles):
-        guard totalFiles > 0 else { return nil }
-        let raw = min(max(progress.fractionCompleted / 0.5, 0), 1)
-        return (raw * 100).rounded() / 100.0   // round to 1%
-    case .listing, .compiling:
-        return nil
-    }
+func speechModelStartupProgressValue(_ fractionCompleted: Double) -> Double? {
+    guard fractionCompleted > 0, fractionCompleted < 1 else { return nil }
+    return (fractionCompleted * 100).rounded() / 100.0   // round to 1%
 }
 
 /// Thread-safe throttle that drops duplicate percent values
@@ -10130,12 +10110,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             do {
                 let throttler = ProgressThrottler()
-                try await asr.load(profile: speechModelProfile) { [weak self] progress in
-                    let title = speechModelStartupStatusTitle(progress)
-                    let fraction = speechModelStartupProgressValue(progress)
+                try await asr.load(profile: speechModelProfile) { [weak self] fractionCompleted in
+                    let title = speechModelStartupStatusTitle(fractionCompleted)
+                    let fraction = speechModelStartupProgressValue(fractionCompleted)
                     guard throttler.shouldDispatch(title, fraction) else { return }
                     Task { @MainActor in
-                        self?.updateSpeechModelStartupProgress(progress)
+                        self?.updateSpeechModelStartupProgress(fractionCompleted)
                     }
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
@@ -10197,7 +10177,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: samples,
-                    language: settings.dictationLanguage.fluidLanguage,
+                    language: settings.dictationLanguage,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -10266,10 +10246,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
-    private func updateSpeechModelStartupProgress(_ progress: DownloadUtils.DownloadProgress) {
+    private func updateSpeechModelStartupProgress(_ fractionCompleted: Double) {
         guard startupTask != nil, !isTerminating else { return }
-        let next = speechModelStartupStatusTitle(progress)
-        let nextProgressFraction = speechModelStartupProgressValue(progress)
+        let next = speechModelStartupStatusTitle(fractionCompleted)
+        let nextProgressFraction = speechModelStartupProgressValue(fractionCompleted)
         guard next != startupStatusTitle
             || nextProgressFraction != speechModelStartupProgressFraction else { return }
         startupStatusTitle = next
@@ -11566,7 +11546,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // immediately, but its disk/menu updates now overlap inference.
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
-        let language = settings.dictationLanguage.fluidLanguage
+        let language = settings.dictationLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             let transcription = try await transcriptionWorker.transcribe(
                 samples: samples,
@@ -11752,7 +11732,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: captured.samples,
-                    language: settings.dictationLanguage.fluidLanguage,
+                    language: settings.dictationLanguage,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -16155,7 +16135,7 @@ private enum ParakeySelfTest {
                 memoryLines: ["Resident: 100 MB"],
                 permissionLines: ["Microphone: granted", "Accessibility: granted", "Input Monitoring: granted"],
                 settingLines: [
-                    "Speech model: Multilingual (Parakeet TDT v3)",
+                    "Speech model: Multilingual (Whisper large-v3-turbo)",
                     "Language: Auto-detect",
                     "Recent transcripts: Last 5 (1 in memory)",
                     "Text corrections: 1 configured",
@@ -16173,7 +16153,7 @@ private enum ParakeySelfTest {
                    "diagnostics report should not include text correction contents")
         try expect(report.contains("Text corrections: 1 configured"), equals: true,
                    "diagnostics report should include correction counts")
-        try expect(report.contains("Speech model: Multilingual (Parakeet TDT v3)"), equals: true,
+        try expect(report.contains("Speech model: Multilingual (Whisper large-v3-turbo)"), equals: true,
                    "diagnostics report should include the speech model")
         try expect(report.contains("Recent log lines:"), equals: true,
                    "diagnostics report should include the recent log section")
@@ -16597,7 +16577,7 @@ private enum ParakeySelfTest {
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
                                      failure: nil),
-            equals: SetupChecklistRowState(detail: "Parakeet TDT v3 is loaded locally.",
+            equals: SetupChecklistRowState(detail: "Whisper large-v3-turbo is loaded locally.",
                                            status: "Ready",
                                            buttonTitle: nil),
             "setup checklist should show the speech model when ready"
@@ -16918,8 +16898,8 @@ private enum ParakeySelfTest {
             totalSeconds: 0.295,
             workerQueueSeconds: 0.001,
             decoderPreparationSeconds: 0.002,
-            fluidCallSeconds: 0.290,
-            fluidProcessingSeconds: 0.286
+            engineCallSeconds: 0.290,
+            engineProcessingSeconds: 0.286
         )
         let entriesWithBreakdown = [
             TranscriptHistoryEntry(
@@ -16935,9 +16915,9 @@ private enum ParakeySelfTest {
             "history timing metadata should survive persistence"
         )
         try expect(
-            asrTimingTooltip(timing)?.contains("FluidAudio  286.0 ms"),
+            asrTimingTooltip(timing)?.contains("whisper.cpp  286.0 ms"),
             equals: true,
-            "history timing tooltip should expose FluidAudio's own processing time"
+            "history timing tooltip should expose the whisper.cpp engine's own processing time"
         )
 
         let legacyEntryData = Data(
@@ -16975,7 +16955,7 @@ private enum ParakeySelfTest {
         try expect(
             metricLine.contains("hotkey_dispatch=0.5 ms")
                 && metricLine.contains("journal_flush=1.5 ms")
-                && metricLine.contains("fluid_processing=286.0 ms")
+                && metricLine.contains("engine_processing=286.0 ms")
                 && metricLine.contains("release_to_paste=330.0 ms")
                 && metricLine.contains("paste=ok"),
             equals: true,
@@ -17938,52 +17918,34 @@ private enum ParakeySelfTest {
 
     private static func testSpeechModelStartupStatus() throws {
         try expect(
-            speechModelStartupStatusTitle(.init(fractionCompleted: 0,
-                                                phase: .listing)),
+            speechModelStartupStatusTitle(0),
             equals: "Checking speech model files…",
-            "listing phase should be visible during first-launch model setup"
+            "zero progress should be visible during first-launch model setup"
         )
         try expect(
-            speechModelStartupStatusTitle(.init(fractionCompleted: 0.25,
-                                                phase: .downloading(completedFiles: 2, totalFiles: 4))),
-            equals: "Downloading speech model… 50% (2/4)",
-            "download phase should show quantized progress"
+            speechModelStartupStatusTitle(0.5),
+            equals: "Downloading speech model… 50%",
+            "in-progress download should show quantized progress"
         )
         try expect(
-            speechModelStartupStatusTitle(.init(fractionCompleted: 0.5,
-                                                phase: .downloading(completedFiles: 0, totalFiles: 0))),
-            equals: "Loading cached speech model…",
-            "cached model load should not pretend to download files"
-        )
-        try expect(
-            speechModelStartupStatusTitle(.init(fractionCompleted: 1,
-                                                phase: .compiling(modelName: "Encoder.mlmodelc"))),
+            speechModelStartupStatusTitle(1),
             equals: "Preparing speech model…",
-            "compile phase should be visible without exposing model internals"
+            "completed download should be visible without exposing model internals"
         )
         try expect(
-            speechModelStartupProgressValue(.init(fractionCompleted: 0,
-                                                  phase: .listing)),
+            speechModelStartupProgressValue(0),
             equals: nil,
-            "listing phase should show indeterminate model progress"
+            "zero progress should show indeterminate model progress"
         )
         try expect(
-            speechModelStartupProgressValue(.init(fractionCompleted: 0.25,
-                                                  phase: .downloading(completedFiles: 2, totalFiles: 4))),
+            speechModelStartupProgressValue(0.5),
             equals: 0.5,
-            "download phase should expose normalized model progress"
+            "in-progress download should expose normalized model progress"
         )
         try expect(
-            speechModelStartupProgressValue(.init(fractionCompleted: 0.5,
-                                                  phase: .downloading(completedFiles: 0, totalFiles: 0))),
+            speechModelStartupProgressValue(1),
             equals: nil,
-            "cached model load should show indeterminate model progress"
-        )
-        try expect(
-            speechModelStartupProgressValue(.init(fractionCompleted: 1,
-                                                  phase: .compiling(modelName: "Encoder.mlmodelc"))),
-            equals: nil,
-            "compile phase should show indeterminate model progress"
+            "completed download should show indeterminate model progress"
         )
         let requiredBytes = speechModelDownloadRequiredBytes(for: .multilingualV3,
                                                              headroomBytes: 100)
@@ -18126,9 +18088,13 @@ private enum ParakeySelfTest {
         try expect(rejectedSymlinkHashRead, equals: true,
                    "model integrity hashing should not follow leaf symlinks")
 
-        let localParakeetV3Cache = speechModelCacheDirectory(for: .multilingualV3)
-        if fm.fileExists(atPath: localParakeetV3Cache.path) {
-            try ModelIntegrity.verifyParakeetV3Model(at: localParakeetV3Cache)
+        let localWhisperCache = speechModelCacheDirectory(for: .productionDefault)
+        if fm.fileExists(atPath: localWhisperCache.path) {
+            try expect(
+                try sha256Hex(ofFileAt: localWhisperCache) == WHISPER_MODEL_SHA256,
+                equals: true,
+                "cached whisper model should pass checksum verification"
+            )
         }
     }
 
@@ -18136,61 +18102,61 @@ private enum ParakeySelfTest {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("parakey-cache-safety-\(UUID().uuidString)", isDirectory: true)
-        let support = root.appendingPathComponent("FluidAudio", isDirectory: true)
-        let cache = support.appendingPathComponent("Models/parakeet-v3", isDirectory: true)
+        let support = root.appendingPathComponent("Whisper", isDirectory: true)
+        let cache = support.appendingPathComponent("Models/ggml-large-v3-turbo.bin", isDirectory: true)
         try fm.createDirectory(at: cache, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 
         try expect(
             isSafeSpeechModelCacheDirectory(
                 cache,
-                fluidAudioSupportDirectory: support
+                whisperSupportDirectory: support
             ),
             equals: true,
-            "speech model cache reset should allow nested FluidAudio cache paths"
+            "speech model cache reset should allow nested Whisper cache paths"
         )
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(cache,
-                                                             fluidAudioSupportDirectory: support),
+                                                             whisperSupportDirectory: support),
             equals: true,
             "speech model cache reset should allow existing plain cache directories"
         )
         try expect(
-            isSafeSpeechModelCacheDirectory(support, fluidAudioSupportDirectory: support),
+            isSafeSpeechModelCacheDirectory(support, whisperSupportDirectory: support),
             equals: false,
-            "speech model cache reset should not remove the FluidAudio support root"
+            "speech model cache reset should not remove the Whisper support root"
         )
         try expect(
             isSafeSpeechModelCacheDirectory(
-                support.deletingLastPathComponent().appendingPathComponent("FluidAudioBackup/parakeet-v3", isDirectory: true),
-                fluidAudioSupportDirectory: support
+                support.deletingLastPathComponent().appendingPathComponent("WhisperBackup/ggml-large-v3-turbo.bin", isDirectory: true),
+                whisperSupportDirectory: support
             ),
             equals: false,
             "speech model cache reset should reject sibling support directories"
         )
         try expect(
             isSafeSpeechModelCacheDirectory(
-                support.appendingPathComponent("../Outside/parakeet-v3", isDirectory: true),
-                fluidAudioSupportDirectory: support
+                support.appendingPathComponent("../Outside/ggml-large-v3-turbo.bin", isDirectory: true),
+                whisperSupportDirectory: support
             ),
             equals: false,
-            "speech model cache reset should reject paths that normalize outside FluidAudio support"
+            "speech model cache reset should reject paths that normalize outside Whisper support"
         )
 
         let outside = root.appendingPathComponent("Outside", isDirectory: true)
-        let outsideCache = outside.appendingPathComponent("parakeet-v3", isDirectory: true)
+        let outsideCache = outside.appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: true)
         try fm.createDirectory(at: outsideCache, withIntermediateDirectories: true)
 
         let leafLink = support.appendingPathComponent("Models/link-cache", isDirectory: true)
         try fm.createSymbolicLink(at: leafLink, withDestinationURL: outsideCache)
         try expect(
-            isSafeSpeechModelCacheDirectory(leafLink, fluidAudioSupportDirectory: support),
+            isSafeSpeechModelCacheDirectory(leafLink, whisperSupportDirectory: support),
             equals: true,
             "speech model cache reset path check should remain string-only"
         )
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(leafLink,
-                                                             fluidAudioSupportDirectory: support),
+                                                             whisperSupportDirectory: support),
             equals: false,
             "speech model cache reset should reject leaf symlink directories before deletion"
         )
@@ -18199,25 +18165,43 @@ private enum ParakeySelfTest {
         try fm.createSymbolicLink(at: linkedParent, withDestinationURL: outside)
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(
-                linkedParent.appendingPathComponent("parakeet-v3", isDirectory: true),
-                fluidAudioSupportDirectory: support
+                linkedParent.appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: true),
+                whisperSupportDirectory: support
             ),
             equals: false,
             "speech model cache reset should reject symlinked parent directories before deletion"
         )
         try expect(
-            isSafeSpeechModelCacheDirectory(speechModelCacheDirectory(for: .multilingualV3)),
+            isSafeSpeechModelCacheDirectory(speechModelCacheDirectory(for: .productionDefault)),
             equals: true,
-            "FluidAudio v3 cache path should remain inside FluidAudio Application Support"
+            "Whisper v3 cache path should remain inside Whisper Application Support"
         )
-        let defaultV3Cache = speechModelCacheDirectory(for: .multilingualV3)
+        let defaultV3Cache = speechModelCacheDirectory(for: .productionDefault)
         if fm.fileExists(atPath: defaultV3Cache.path) {
             try expect(
                 isExistingSpeechModelCacheDirectorySafeForRemoval(defaultV3Cache),
                 equals: true,
-                "existing FluidAudio v3 cache path should remain removable"
+                "existing Whisper v3 cache path should remain removable"
             )
         }
+
+        // Exercise the file-leaf case directly: the real whisper cache path
+        // is a regular file, not a directory (fixed as part of this port —
+        // isExistingSpeechModelCacheDirectorySafeForRemoval previously walked
+        // every path component, including the leaf, through
+        // isExistingPlainDirectory, which meant it could never return true
+        // for a file-shaped cache target and removeSpeechModelCacheDirectory
+        // would permanently refuse to remove the cached model).
+        let fileLeafCache = support.appendingPathComponent("Models/ggml-file-leaf.bin", isDirectory: false)
+        try fm.createDirectory(at: fileLeafCache.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+        try Data("fake model bytes".utf8).write(to: fileLeafCache)
+        try expect(
+            isExistingSpeechModelCacheDirectorySafeForRemoval(fileLeafCache,
+                                                             whisperSupportDirectory: support),
+            equals: true,
+            "speech model cache reset should allow removing a file-shaped cache leaf"
+        )
     }
 
     private static func testUpdate() throws {
@@ -22032,7 +22016,7 @@ if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     let delegate = ParakeyApp()
     app.delegate = delegate
     // Refuse to start under a tampered launch environment that would
-    // redirect FluidAudio's model download to an attacker-controlled host.
+    // redirect the speech model download to an attacker-controlled host.
     // Runs after NSApplication.shared is initialised so NSAlert.runModal
     // has its event loop.
     refuseHostileRegistryEnvironmentAndExit()
