@@ -30,18 +30,6 @@ version_at_least_14() {
     [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 14 ))
 }
 
-is_apple_silicon() {
-    local machine translated
-
-    machine="$(/usr/bin/uname -m)"
-    [[ "$machine" == "arm64" ]] && return 0
-
-    # A shell launched through Rosetta reports x86_64 even on Apple
-    # Silicon. Apple exposes this flag specifically for that case.
-    translated="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
-    [[ "$machine" == "x86_64" && "$translated" == "1" ]]
-}
-
 run_as_admin() {
     if [[ -w "$(dirname "$APP_PATH")" ]]; then
         "$@"
@@ -53,7 +41,7 @@ run_as_admin() {
 verify_app() {
     local app="$1"
     local executable="$app/Contents/MacOS/SuperDictate"
-    local bundle_id version minimum_system entitlements_file audio_input microphone
+    local bundle_id version minimum_system entitlements_file audio_input microphone expected_arch
 
     [[ -x "$executable" ]] || fail "В архиве нет исполняемого файла SuperDictate."
     bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")"
@@ -62,7 +50,8 @@ verify_app() {
     [[ "$version" == "$RELEASE_VERSION" ]] || fail "Ожидалась версия $RELEASE_VERSION, получена $version."
     minimum_system="$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")"
     [[ "$minimum_system" == "14.0" ]] || fail "Неожиданная минимальная версия macOS: $minimum_system"
-    file "$executable" | grep -q 'arm64' || fail "Сборка не предназначена для Apple Silicon."
+    expected_arch="$(/usr/bin/uname -m)"
+    file "$executable" | grep -q "$expected_arch" || fail "Сборка не предназначена для этого Mac (ожидалась архитектура $expected_arch)."
     codesign --verify --deep --strict "$app" || fail "Проверка подписи приложения не прошла."
     entitlements_file="$WORK_DIR/verified-entitlements.plist"
     codesign -d --entitlements :- "$app" > "$entitlements_file" 2>/dev/null
@@ -128,7 +117,6 @@ build_from_source() {
 }
 
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "Работает только на macOS."
-is_apple_silicon || fail "Нужен Mac с Apple Silicon (M1 или новее)."
 version_at_least_14 || fail "Нужна macOS 14 или новее."
 
 for command_name in curl ditto shasum plutil file codesign sed head; do

@@ -32,17 +32,9 @@ validate_output_app_path() {
     [[ "$output" != "$ROOT_DIR" && "$parent" != "$ROOT_DIR" ]] || fail "Refusing to replace the repository root."
 }
 
-running_under_rosetta() {
-    [[ "$(/usr/bin/uname -m)" == "x86_64" ]] || return 1
-    [[ "$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)" == "1" ]]
-}
-
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "macOS is required."
-if running_under_rosetta; then
-    say "Restarting the build natively for Apple Silicon..."
-    exec /usr/bin/arch -arm64 /bin/bash "$0" "$@"
-fi
-[[ "$(/usr/bin/uname -m)" == "arm64" ]] || fail "An Apple Silicon Mac (M1 or newer) is required."
+machine="$(/usr/bin/uname -m)"
+[[ "$machine" == "arm64" || "$machine" == "x86_64" ]] || fail "An Apple Silicon or Intel Mac is required."
 validate_output_app_path "$OUTPUT_APP"
 command -v swift >/dev/null 2>&1 || fail "Swift is missing. Run: xcode-select --install"
 command -v codesign >/dev/null 2>&1 || fail "codesign is missing. Run: xcode-select --install"
