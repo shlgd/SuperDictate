@@ -57,10 +57,28 @@ the implementation plan, per-advisor:
 
 - Built whisper.cpp from source (plain `cmake`/`make`, not yet SwiftPM) on
   the Mac Pro with `GGML_METAL=ON`.
-- `parakeet-cli` (ggml's native Parakeet TDT v3 support) **segfaults
-  (SIGSEGV, exit 139)** right after model load, on *both* the Metal path
-  and the `-ng` (CPU-only) path. This code path is too new/unstable to
-  ship. Ruled out entirely, independent of the GPU question.
+- `parakeet-cli` (ggml's native Parakeet TDT v3 support), loading the
+  official `ggml-org/parakeet-GGUF` conversion, fails right after model
+  load — but not consistently the same way. A bare run (both with Metal
+  and with `-ng`/CPU-only) **segfaults** (SIGSEGV, exit 139); the macOS
+  crash report shows `EXC_BAD_ACCESS`/`KERN_INVALID_ADDRESS` at a faulting
+  address adjacent to the stack region — consistent with a stack overflow,
+  not heap corruption. Running the identical command under `lldb`
+  produces a *different* outcome: a caught C++ exception
+  (`exception during model load: vector`) and a clean exit(1) instead of a
+  crash — most likely because the debugger session has different stack
+  limits than the bare SSH shell. Two related open upstream issues,
+  [#3932](https://github.com/ggml-org/whisper.cpp/issues/3932) and
+  [#3933](https://github.com/ggml-org/whisper.cpp/issues/3933), describe
+  unvalidated-input / uncaught-exception bugs in this exact loader
+  (`src/parakeet.cpp`, mel-cache init and duration decoding) — neither
+  matches our crash exactly (both are about crafted/malicious model
+  files, ours is the vendor's own official model), but they corroborate
+  that this integration, merged only days before this investigation, is
+  still being shaken out. Conclusion: too new/unstable to ship, regardless
+  of the GPU question. Not investigated further — this dependency was
+  already rejected on the Metal-correctness grounds below, and root-causing
+  someone else's in-flight bug is out of scope here.
 - `whisper-cli` with Metal enabled, on `ggml-base.en.bin`, transcribing
   the standard `jfk.wav` sample: **produced wrong text** —
   `"verynown, I, a of"` instead of the correct transcript — and took
