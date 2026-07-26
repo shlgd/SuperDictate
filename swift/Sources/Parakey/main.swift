@@ -11498,6 +11498,35 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
+    /// If the user switched to a different app/window after dictation
+    /// started, macOS's synthetic-keystroke insertion (`TextInserter`) would
+    /// otherwise land the transcript in whatever is frontmost at release
+    /// time rather than where dictation began. Bring the original app back
+    /// to the front first — best-effort: if it quit, or is already
+    /// frontmost, or activation doesn't complete quickly, insertion falls
+    /// through to whatever is currently focused, exactly as before this
+    /// method existed.
+    private func reactivateDictationOriginAppIfNeeded(_ originPID: pid_t?) async {
+        guard let originPID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier != originPID,
+              let originApp = NSRunningApplication(processIdentifier: originPID),
+              !originApp.isTerminated else {
+            return
+        }
+        originApp.activate(options: [.activateAllWindows])
+        var pollCount = 0
+        while NSWorkspace.shared.frontmostApplication?.processIdentifier != originPID,
+              pollCount < 10 {
+            try? await Task.sleep(nanoseconds: 20_000_000)  // 20 ms
+            pollCount += 1
+        }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == originPID {
+            log("text insertion: reactivated dictation's original app before pasting")
+        } else {
+            log("text insertion: could not reactivate dictation's original app in time; pasting into current app")
+        }
+    }
+
     private func handleRelease(shortcut: DictationReleaseShortcut = .standard,
                                hotkeyDetectedAt: TimeInterval? = nil) {
         guard isRecording, !isTerminating else { return }
@@ -11521,6 +11550,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         isRecording = false
+        // Captured before stopRecordingLevelMeter/endRecording tear down
+        // the HUD-target tracker's session state, so that whichever app was
+        // frontmost when dictation STARTED — not whichever app happens to be
+        // frontmost now, if the user switched windows mid-dictation — is
+        // what the finished transcript gets pasted into. See
+        // reactivateDictationOriginAppIfNeeded(_:).
+        let dictationOriginPID = recordingHUDTargetStabilizer.initialApplicationPID
         stopRecordingLevelMeter(hideHUD: false)
         cancelMaxDurationAutoRelease()
         unmuteIfWeMuted()
@@ -11625,6 +11661,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
+                        await reactivateDictationOriginAppIfNeeded(dictationOriginPID)
                         let inserted = TextInserter.insert(
                             pastedText(from: cleaned, suffix: settings.pasteSuffix)
                         )
