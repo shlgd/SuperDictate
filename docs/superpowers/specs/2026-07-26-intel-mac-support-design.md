@@ -26,47 +26,81 @@ is Linux and cannot compile or run macOS/Swift/CoreML code).
 
 ## Decision: replace the ASR engine, don't just patch compute units
 
-Given the ANE-tuned model is a real risk on Intel and the user has a
-discrete AMD GPU available, the plan swaps the recognition engine instead
-of trying to force FluidAudio's ANE model onto CPU/GPU:
-
-**whisper.cpp (ggml), vendored as our own SwiftPM C/C++ target, with
-`GGML_METAL` enabled.** whisper.cpp's Metal backend is generic Metal API,
-not Apple-Silicon-specific — it will offload matmuls to the RX 6600 via
-Metal 3, with Accelerate/BLAS as the CPU fallback path. This was chosen
-over:
+Given the ANE-tuned model is a real risk on Intel, the plan swaps the
+recognition engine instead of trying to force FluidAudio's ANE model onto
+CPU/GPU. The engine is **whisper.cpp (ggml), vendored as our own SwiftPM
+C/C++ target, CPU-only (Accelerate/BLAS backend)**. This was chosen over:
 
 - Forcing FluidAudio to `.cpuAndGpu`: keeps the ANE-shaped model, unclear
   correctness/perf without real ANE hardware.
 - **faster-whisper (CTranslate2/Python)**: CTranslate2 only has CPU and
-  CUDA backends — no Metal, no AMD GPU support. On this Mac Pro (no
-  NVIDIA GPU) it would run CPU-only, leaving the RX 6600 unused, and it
-  would drag a Python runtime into a project that today ships a single
-  native binary. Ruled out for this hardware.
+  CUDA backends — no Metal, no AMD GPU support. It would drag a Python
+  runtime into a project that ships a single native binary. Ruled out.
 - **SwiftWhisper (exPHAT)**, a ready-made SwiftPM wrapper around
   whisper.cpp: unmaintained since May 2024, vendors an old whisper.cpp
-  without Metal (CPU+Accelerate only) — would forfeit the GPU entirely.
-- **Official `build-xcframework.sh` → binaryTarget**: gets Metal+CoreML
-  but adds a whole extra xcodebuild/cmake step ahead of `swift build`,
-  breaking the project's "plain `swift build -c release`" pipeline.
+  snapshot. With Metal off the table (see below) its staleness is now the
+  only real demerit versus vendoring our own — vendoring was still chosen
+  for control over the pinned commit and update path.
+- **Official `build-xcframework.sh` → binaryTarget**: adds a whole extra
+  xcodebuild/cmake step ahead of `swift build`. Not needed once Metal is
+  out of scope.
+- **whisper.cpp's built-in Parakeet-TDT support** (`examples/parakeet-cli`,
+  merged into ggml very recently): tempting, since it's the *same* model
+  FluidAudio uses today, just running on ggml instead of CoreML/ANE. Ruled
+  out — see the Metal/GPU finding below.
 
-Trade-off accepted: vendoring our own whisper.cpp/ggml source snapshot
-means we own updating it (pinned commit + an update script), instead of
-depending on someone else's package.
+### Why Metal is off, with evidence
+
+The spec originally called for `GGML_METAL=ON` to use the Mac Pro's AMD
+Radeon RX 6600 (Metal 3). This was tested for real over SSH before writing
+the implementation plan, per-advisor:
+
+- Built whisper.cpp from source (plain `cmake`/`make`, not yet SwiftPM) on
+  the Mac Pro with `GGML_METAL=ON`.
+- `parakeet-cli` (ggml's native Parakeet TDT v3 support) **segfaults
+  (SIGSEGV, exit 139)** right after model load, on *both* the Metal path
+  and the `-ng` (CPU-only) path. This code path is too new/unstable to
+  ship. Ruled out entirely, independent of the GPU question.
+- `whisper-cli` with Metal enabled, on `ggml-base.en.bin`, transcribing
+  the standard `jfk.wav` sample: **produced wrong text** —
+  `"verynown, I, a of"` instead of the correct transcript — and took
+  2.7s total versus 1.5s for the identical run with `-ng` (CPU-only,
+  which produced the correct transcript). The Metal log shows
+  `simdgroup matrix mul. = false` and `has unified memory = false` for
+  this GPU — ggml's Metal backend is hitting an under-exercised fallback
+  path on non-Apple-Silicon/AMD hardware, and that path is both wrong and
+  slower here.
+
+Conclusion: Metal is not merely unnecessary, it is actively broken on this
+GPU. The build is **CPU-only**: `GGML_METAL=OFF`, CPU backend +
+Accelerate/BLAS. This also removes the entire "can SwiftPM compile
+`.metal` shaders" question the original spec left open — there is no
+Metal source to compile, no bundle-resource lookup, no
+`GGML_METAL_EMBED_LIBRARY` mechanism to reproduce outside CMake.
 
 ## Model
 
-Default: **ggml `large-v3`** (~3 GB), multilingual (needed for Russian,
-matching Parakeet v3's multilingual coverage). Chosen over `small`/`medium`
-because the user's existing faster-whisper usage on a Linux server with a
-large model gives acceptably-accurate, acceptably-fast results, and the
-RX 6600 over Metal is expected to make `large-v3` viable on this hardware.
-Downloaded at first run from the ggml-org Hugging Face model repo, cached
-under `~/Library/Application Support/Whisper/Models`, verified with a
-checksum step mirroring the existing `ModelIntegrity` pattern. Model
-choice is expected to be revisited once real timings exist on the Mac Pro
-— `large-v3-turbo` (~1.6 GB, fewer decoder layers, close accuracy, notably
-faster) is the fallback if `large-v3` proves too slow for push-to-talk use.
+Default: **ggml `large-v3-turbo`** (~1.6 GB). Chosen from real CPU-only
+benchmarks run on the Mac Pro (Xeon E5-2678 v3, 24 threads), transcribing
+a ~9.4s Russian sample (macOS `say -v Milena` synthesized speech) — all
+three candidates below produced accurate Russian text:
+
+| Model | Size on disk | Total time (9.4s clip) | Real-time factor |
+|---|---|---|---|
+| `small` | 487 MB | 9.1 s | ~1.0x |
+| `medium` | 1.5 GB | 12.7 s | ~1.35x |
+| `large-v3-turbo` | 1.6 GB | 9.8 s | ~1.0x |
+
+`large-v3-turbo`'s reduced decoder makes it match `small`'s speed on this
+CPU while giving `large-v3`-level accuracy; `medium` is strictly dominated
+(slower, and generally rated less accurate than turbo) and is not used.
+Forcing greedy decoding (`-bo 1 -bs 1`) instead of the default beam-5
+search did not meaningfully change turbo's timing — encode time, not
+decode/search, dominates on this hardware, so decode strategy is left at
+whisper.cpp's default. Downloaded at first run from the `ggml-org`
+Hugging Face model repo (pinned revision, not `main`), cached under
+`~/Library/Application Support/Whisper/Models`, verified with a checksum
+step mirroring the existing `ModelIntegrity` pattern.
 
 ## Integration surface
 
@@ -119,14 +153,15 @@ All real compilation and execution happens over SSH on the Mac Pro
 (192.168.1.246, user `shohart`):
 
 1. `swift build -c release --package-path swift` succeeds on `x86_64`.
-2. `swift run -c debug --package-path swift Parakey --self-test all` passes.
+2. `swift run -c debug --package-path swift Parakey --self-test all` passes
+   (including the FluidAudio/Parakeet-shaped assertions and cache-path
+   tests, updated for the new engine — see the plan).
 3. `./scripts/build-app.sh` produces a signed (ad-hoc) `.app`; `codesign
    --verify --deep --strict` passes.
 4. Manual smoke test: launch the app, grant permissions, record a short
    phrase via the push-to-talk hotkey, confirm transcription + paste.
-5. Benchmark: force CPU-only vs Metal compute path for the same recording
-   to confirm the expected GPU speedup on the RX 6600, and to decide
-   between `large-v3` and `large-v3-turbo` for the shipped default.
+5. Real-hardware benchmark already performed during design (see Model
+   section above) — no further Metal-vs-CPU comparison needed.
 
 ## Out of scope
 
