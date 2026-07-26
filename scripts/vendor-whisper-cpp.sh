@@ -30,6 +30,9 @@ for f in ggml.c ggml.cpp ggml-alloc.c ggml-backend.cpp ggml-backend-reg.cpp \
 done
 cp "$WORK_DIR/src/ggml/include/"*.h "$DEST/include/"
 
+# ggml BLAS backend (Accelerate cblas_sgemm acceleration on macOS)
+cp "$WORK_DIR/src/ggml/src/ggml-blas/ggml-blas.cpp" "$DEST/ggml-blas.cpp"
+
 # ggml CPU backend only — no metal/cuda/vulkan/etc.
 cp -R "$WORK_DIR/src/ggml/src/ggml-cpu/." "$DEST/ggml-cpu/"
 

@@ -36,6 +36,8 @@ let package = Package(
             cSettings: [
                 .define("GGML_USE_ACCELERATE"),
                 .define("GGML_USE_CPU"),
+                .define("GGML_USE_BLAS"),
+                .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
                 .define("GGML_VERSION", to: "\"080bbbe8\""),
@@ -48,6 +50,8 @@ let package = Package(
             cxxSettings: [
                 .define("GGML_USE_ACCELERATE"),
                 .define("GGML_USE_CPU"),
+                .define("GGML_USE_BLAS"),
+                .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
                 .define("GGML_VERSION", to: "\"080bbbe8\""),
