@@ -43,6 +43,14 @@ actor WhisperEngine {
         context = ctx
     }
 
+    /// `languageCode` is `nil` for auto-detect (i.e. `DictationLanguage.auto`).
+    /// `nil` MUST be turned into the literal string `"auto"` before it reaches
+    /// `whisper_full_params.language` — `whisper_full_default_params()` sets
+    /// that field to whisper.cpp's compiled-in default `"en"`, not `nullptr`,
+    /// so leaving `params.language` untouched on `nil` would silently force
+    /// every auto-detect transcription through the English decoder path
+    /// instead of actually detecting the spoken language. Only the literal
+    /// strings `"auto"`, `nullptr`, or `""` make whisper.cpp auto-detect.
     func transcribe(samples: [Float], languageCode: String?) throws -> WhisperTranscription {
         let requestedAt = ProcessInfo.processInfo.systemUptime
         var params = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH)
@@ -52,11 +60,13 @@ actor WhisperEngine {
         params.no_timestamps = true
         params.n_threads = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount))
 
-        let languageCString: UnsafeMutablePointer<CChar>? = languageCode.map { strdup($0) }
-        defer { languageCString.map { free($0) } }
-        if let languageCString {
-            params.language = UnsafePointer(languageCString)
-        }
+        // Always route through strdup/free, even for the nil (auto-detect)
+        // case — assigning a Swift string literal's contents directly to
+        // params.language would create a dangling pointer once the literal's
+        // backing storage is released.
+        let languageCString = strdup(languageCode ?? "auto")
+        defer { free(languageCString) }
+        params.language = UnsafePointer(languageCString)
 
         let encodeStartedAt = ProcessInfo.processInfo.systemUptime
         let result = Self.runWhisperFull(context: context, params: params, samples: samples)

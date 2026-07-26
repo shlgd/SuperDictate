@@ -477,20 +477,19 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var cacheResetDetail: String {
-        switch self {
-        case .multilingualV3:
-            return "Parakey will delete the local Whisper large-v3-turbo model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
-        case .englishUnified:
-            return "Parakey will delete the local Whisper large-v3-turbo model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
-        }
+        // Both cases share one message: `.englishUnified` is deprecated and
+        // always migrated to `.multilingualV3` (see `productionProfile`)
+        // before this is ever shown, so there is only one real model cache
+        // to describe regardless of which case is asked.
+        "Parakey will delete the local Whisper large-v3-turbo model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
     }
 
     var estimatedDownloadBytes: Int64 {
-        700 * 1024 * 1024
+        WHISPER_MODEL_SIZE_BYTES
     }
 
     var downloadSizeText: String {
-        "about 500-700 MB"
+        "about 1.6 GB"
     }
 }
 
@@ -1776,7 +1775,7 @@ func speechModelDiskSpaceFailureDetail(profile: SpeechModelProfile,
         return nil
     }
     return """
-    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for CoreML to prepare it.
+    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for whisper.cpp to prepare it.
 
     Available: \(formattedByteCount(UInt64(availableBytes)))
     Needed: \(formattedByteCount(UInt64(requiredBytes)))
@@ -5342,6 +5341,9 @@ actor TranscriptionWorker {
     }
 
     private func loadWhisperEngine(progressHandler: WhisperDownloadProgressHandler?) async throws -> WhisperEngine {
+        if !speechModelCacheExists(for: .multilingualV3) {
+            try assertSufficientDiskSpaceForSpeechModelDownload(profile: .multilingualV3)
+        }
         let modelPath = try await downloadWhisperModelIfNeeded()
         return try WhisperEngine(modelPath: modelPath.path)
     }
@@ -10096,10 +10098,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         prepareForStartupAttempt()
         let speechModelProfile = settings.speechModelProfile
 
-        // Load ASR FIRST, then audio + hotkey. Reversing this order
-        // makes the first-launch CoreML compile of the ANE Encoder
-        // hang. The bench under experiments/swift-bench/ never opens
-        // an audio session so it doesn't see this.
+        // Load ASR FIRST, then audio + hotkey. This ordering carries over
+        // from the previous CoreML-based ASR stack, where reversing it made
+        // the first-launch ANE Encoder compile hang; whisper.cpp's CPU-only
+        // model load has not been observed to have that failure mode, but
+        // the safe ordering is kept rather than re-verified. The bench
+        // under experiments/swift-bench/ never opens an audio session so
+        // it doesn't see this either way.
         startupTask = Task { @MainActor in
             var stage = StartupFailureStage.speechModel
             defer {
@@ -10122,11 +10127,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                 do {
                     let warmUpTiming = try await asr.warmUp()
-                    log("ASR: CoreML warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
+                    log("ASR: whisper.cpp warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
                 } catch {
                     // Model loading succeeded, so a failed best-effort warm-up
                     // must not make the dictation service unavailable.
-                    log("ASR: CoreML warm-up skipped: \(error.localizedDescription)")
+                    log("ASR: whisper.cpp warm-up skipped: \(error.localizedDescription)")
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
 
@@ -11542,8 +11547,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         isBusy = true
 
-        // Start CoreML before AppKit/menu work. The UI still transitions
-        // immediately, but its disk/menu updates now overlap inference.
+        // Start whisper.cpp inference before AppKit/menu work. The UI still
+        // transitions immediately, but its disk/menu updates now overlap
+        // inference.
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
         let language = settings.dictationLanguage
@@ -17917,6 +17923,24 @@ private enum ParakeySelfTest {
     }
 
     private static func testSpeechModelStartupStatus() throws {
+        // `.auto` must map to `nil` here, and `WhisperEngine.transcribe` must in
+        // turn map `nil` to the literal string "auto" (not leave whisper.cpp's
+        // compiled-in "en" default in place) — see the doc comment on
+        // `WhisperEngine.transcribe(samples:languageCode:)`. This test can only
+        // exercise the DictationLanguage → whisperLanguageCode half of that
+        // contract without a real loaded model; the nil → "auto" half is
+        // asserted by the doc comment + code review, not by an automated test,
+        // since exercising it for real would require a live whisper.cpp context.
+        try expect(
+            DictationLanguage.auto.whisperLanguageCode,
+            equals: nil,
+            "auto-detect must pass no language hint to whisper.cpp"
+        )
+        try expect(
+            DictationLanguage.russian.whisperLanguageCode,
+            equals: "ru",
+            "a specific language selection should pass its ISO-639-1 code through unchanged"
+        )
         try expect(
             speechModelStartupStatusTitle(0),
             equals: "Checking speech model files…",
@@ -17951,7 +17975,7 @@ private enum ParakeySelfTest {
                                                              headroomBytes: 100)
         try expect(
             requiredBytes,
-            equals: 700 * 1024 * 1024 + 100,
+            equals: WHISPER_MODEL_SIZE_BYTES + 100,
             "speech model download requirement should include model estimate plus headroom"
         )
         try expect(
