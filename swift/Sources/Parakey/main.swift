@@ -673,10 +673,17 @@ struct TranscriptHistoryEntry: Codable, Equatable {
     let text: String
     let transcriptionDurationSeconds: Double?
     let asrTiming: ASRTimingBreakdown?
+    /// Wall-clock creation time, used only to enforce `HistoryRetention`.
+    /// Optional because entries written before retention existed have no
+    /// date on disk; `stampedTranscriptHistoryEntries` fills those in at
+    /// load time rather than treating them as expired, so upgrading never
+    /// silently deletes history.
+    let createdAt: Date?
 
     init(text: String,
          transcriptionDurationSeconds: Double? = nil,
-         asrTiming: ASRTimingBreakdown? = nil) {
+         asrTiming: ASRTimingBreakdown? = nil,
+         createdAt: Date? = nil) {
         self.text = text
         if let duration = transcriptionDurationSeconds,
            duration.isFinite,
@@ -686,7 +693,88 @@ struct TranscriptHistoryEntry: Codable, Equatable {
             self.transcriptionDurationSeconds = nil
         }
         self.asrTiming = asrTiming
+        self.createdAt = createdAt
     }
+
+    func stamped(at date: Date) -> TranscriptHistoryEntry {
+        guard createdAt == nil else { return self }
+        return TranscriptHistoryEntry(text: text,
+                                      transcriptionDurationSeconds: transcriptionDurationSeconds,
+                                      asrTiming: asrTiming,
+                                      createdAt: date)
+    }
+}
+
+/// How long a transcript may stay on disk. Orthogonal to
+/// `RecentTranscriptLimit`, which caps how many entries the overlay shows:
+/// the effective history is (age limit ∧ count limit). `.forever` is the
+/// default so an update never deletes existing history without the user
+/// asking for it; "keep nothing" is already reachable through
+/// `RecentTranscriptLimit.off`.
+enum HistoryRetention: String, CaseIterable {
+    case forever
+    case oneDay = "1d"
+    case sevenDays = "7d"
+    case thirtyDays = "30d"
+
+    /// Nil means "never expires".
+    var maximumAgeSeconds: TimeInterval? {
+        switch self {
+        case .forever: return nil
+        case .oneDay: return 24 * 60 * 60
+        case .sevenDays: return 7 * 24 * 60 * 60
+        case .thirtyDays: return 30 * 24 * 60 * 60
+        }
+    }
+}
+
+let DEFAULT_HISTORY_RETENTION = HistoryRetention.forever
+let HISTORY_RETENTION_DISPLAY: [HistoryRetention: String] = [
+    .forever: "Keep forever",
+    .oneDay: "Keep for 1 day",
+    .sevenDays: "Keep for 7 days",
+    .thirtyDays: "Keep for 30 days",
+]
+
+/// Crash-recovery audio is not history: it exists only until the next
+/// successful startup recovery pass. Anything older than this was left
+/// behind by a recovery that never completed, and is deleted regardless
+/// of the history retention setting.
+let PENDING_DICTATION_MAX_AGE_SECONDS: TimeInterval = 24 * 60 * 60
+
+/// Fills in a creation date for entries persisted before retention
+/// existed. Called once when history is loaded, so legacy entries start
+/// their retention window at first launch after the upgrade instead of
+/// disappearing immediately.
+func stampedTranscriptHistoryEntries(_ entries: [TranscriptHistoryEntry],
+                                     now: Date) -> [TranscriptHistoryEntry] {
+    guard entries.contains(where: { $0.createdAt == nil }) else { return entries }
+    return entries.map { $0.stamped(at: now) }
+}
+
+/// Drops entries older than the retention window. Entries that still have
+/// no date are kept — `stampedTranscriptHistoryEntries` is responsible for
+/// giving them one, and an unstamped entry must never be treated as
+/// infinitely old.
+func retainedTranscriptHistoryEntries(_ entries: [TranscriptHistoryEntry],
+                                      retention: HistoryRetention,
+                                      now: Date) -> [TranscriptHistoryEntry] {
+    guard let maximumAge = retention.maximumAgeSeconds else { return entries }
+    return entries.filter { entry in
+        guard let createdAt = entry.createdAt else { return true }
+        // Future-dated entries (clock changes, restored backups) are kept
+        // rather than deleted: a negative age is a broken clock, not an
+        // expired transcript.
+        return now.timeIntervalSince(createdAt) <= maximumAge
+    }
+}
+
+/// Pure companion to the on-disk pending-audio sweep, so the age rule can
+/// be tested without touching the filesystem.
+func expiredPendingDictationPaths<T>(_ files: [(path: T, createdAt: Date)],
+                                     now: Date,
+                                     maximumAgeSeconds: TimeInterval = PENDING_DICTATION_MAX_AGE_SECONDS) -> [T] {
+    files.filter { now.timeIntervalSince($0.createdAt) > maximumAgeSeconds }.map(\.path)
 }
 
 func limitedRecentTranscriptEntries(_ entries: [TranscriptHistoryEntry],
@@ -2535,6 +2623,7 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyHistoryRetention = "history_retention_v1"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -3174,6 +3263,17 @@ final class Settings: @unchecked Sendable {
     var removeFillerWords: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFillerWords) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
+    }
+
+    var historyRetention: HistoryRetention {
+        get {
+            if let v = defaults.string(forKey: Self.keyHistoryRetention),
+               let retention = HistoryRetention(rawValue: v) {
+                return retention
+            }
+            return DEFAULT_HISTORY_RETENTION
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyHistoryRetention) }
     }
 
     var hasActiveRunMarker: Bool {
@@ -4643,6 +4743,37 @@ private enum PendingDictationRecovery {
         } catch {
             log("pending dictation cleanup failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Deletes recovery audio older than `maximumAgeSeconds`. Startup
+    /// recovery removes a file once it has been transcribed, but a
+    /// recovery that keeps failing (unreadable audio, model never ready)
+    /// leaves it on disk forever — issue #8 saw files several days old.
+    @discardableResult
+    static func removeExpired(now: Date,
+                              maximumAgeSeconds: TimeInterval = PENDING_DICTATION_MAX_AGE_SECONDS) -> Int {
+        let dated: [(path: URL, createdAt: Date)] = pendingURLs().map { url in
+            let created = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate)
+            // No creation date means we cannot prove the file is recent;
+            // treat it as old so it cannot linger indefinitely.
+            return (url, created ?? .distantPast)
+        }
+        let expired = expiredPendingDictationPaths(dated,
+                                                   now: now,
+                                                   maximumAgeSeconds: maximumAgeSeconds)
+        for url in expired {
+            remove(url)
+        }
+        return expired.count
+    }
+
+    @discardableResult
+    static func removeAll() -> Int {
+        let urls = pendingURLs()
+        for url in urls {
+            remove(url)
+        }
+        return urls.count
     }
 
     static func headerData() -> Data {
@@ -9615,6 +9746,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// Local transcript archive, newest first. UI applies the user's visible limit.
     private var history: [TranscriptHistoryEntry] = []
+    private var historyRetentionTimer: Timer?
 
     private var visibleHistory: [TranscriptHistoryEntry] {
         limitedRecentTranscriptEntries(history, limit: settings.recentTranscriptLimit)
@@ -9766,6 +9898,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.hasActiveRunMarker = true
         restoreUpdateReminderPause()
         history = settings.recentTranscriptEntries
+        stampLegacyHistoryEntries()
+        pruneHistoryForRetention(reason: "launch")
+        startHistoryRetentionTimer()
+        prunePendingDictationAudio(reason: "launch")
         importDictationUsageFromLogIfNeeded()
 
         refreshActivationPolicy()
@@ -11995,9 +12131,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let entry = TranscriptHistoryEntry(
             text: text,
             transcriptionDurationSeconds: transcriptionDurationSeconds,
-            asrTiming: asrTiming
+            asrTiming: asrTiming,
+            createdAt: Date()
         )
-        let next = limitedTranscriptHistoryArchive([entry] + history)
+        let retained = retainedTranscriptHistoryEntries([entry] + history,
+                                                        retention: settings.historyRetention,
+                                                        now: Date())
+        let next = limitedTranscriptHistoryArchive(retained)
         guard next != history else { return }
         history = next
         settings.recentTranscriptEntries = history
@@ -12012,6 +12152,106 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         history.removeAll()
         settings.recentTranscriptEntries = []
         log("recent transcript history disabled and cleared (\(removed) entries)")
+    }
+
+    /// Gives a creation date to entries persisted before retention existed.
+    /// Runs once at launch; without it those entries could never expire.
+    private func stampLegacyHistoryEntries() {
+        let stamped = stampedTranscriptHistoryEntries(history, now: Date())
+        guard stamped != history else { return }
+        let count = stamped.filter { $0.createdAt != nil }.count - history.filter { $0.createdAt != nil }.count
+        history = stamped
+        settings.recentTranscriptEntries = history
+        log("history retention: stamped \(count) legacy entries with the current date")
+    }
+
+    @discardableResult
+    private func pruneHistoryForRetention(reason: String) -> Int {
+        let retention = settings.historyRetention
+        guard retention != .forever, !history.isEmpty else { return 0 }
+        let retained = retainedTranscriptHistoryEntries(history,
+                                                        retention: retention,
+                                                        now: Date())
+        let removed = history.count - retained.count
+        guard removed > 0 else { return 0 }
+        history = retained
+        settings.recentTranscriptEntries = history
+        log("history retention (\(reason)): removed \(removed) entr\(removed == 1 ? "y" : "ies") older than \(HISTORY_RETENTION_DISPLAY[retention] ?? retention.rawValue)")
+        return removed
+    }
+
+    /// Hourly sweep so a long-running agent expires history without needing
+    /// a relaunch. Cheap: it only touches an in-memory array unless
+    /// something actually expired.
+    private func startHistoryRetentionTimer() {
+        historyRetentionTimer?.invalidate()
+        let timer = Timer(timeInterval: 60 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.isTerminating else { return }
+                if self.pruneHistoryForRetention(reason: "timer") > 0 {
+                    self.rebuildMenu()
+                }
+                self.prunePendingDictationAudio(reason: "timer")
+            }
+        }
+        timer.tolerance = 5 * 60
+        RunLoop.main.add(timer, forMode: .common)
+        historyRetentionTimer = timer
+    }
+
+    /// Deletes crash-recovery audio that no startup pass ever claimed.
+    /// Independent of the history retention setting: these files are a
+    /// recovery buffer, not history.
+    @discardableResult
+    private func prunePendingDictationAudio(reason: String) -> Int {
+        let removed = PendingDictationRecovery.removeExpired(now: Date())
+        if removed > 0 {
+            log("pending dictation cleanup (\(reason)): removed \(removed) stale recording(s)")
+        }
+        return removed
+    }
+
+    /// Issue #8: one action that clears every local artifact holding
+    /// transcript text — history plus any crash-recovery audio.
+    @objc private func clearPrivateDataClicked(_ sender: Any?) {
+        let pendingBefore = PendingDictationRecovery.pendingURLs().count
+        guard confirmClearPrivateData(historyCount: history.count,
+                                      pendingCount: pendingBefore) else { return }
+        let historyCount = history.count
+        history.removeAll()
+        settings.recentTranscriptEntries = []
+        let pendingCount = PendingDictationRecovery.removeAll()
+        log("private data cleared: \(historyCount) history entr\(historyCount == 1 ? "y" : "ies"), \(pendingCount) pending recording(s)")
+        closeHistoryOverlay()
+        rebuildMenu()
+    }
+
+    /// Deleting transcripts cannot be undone, so it always asks first.
+    private func confirmClearPrivateData(historyCount: Int, pendingCount: Int) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Clear all saved transcripts?"
+        var parts: [String] = []
+        if historyCount > 0 {
+            parts.append("\(historyCount) saved transcript\(historyCount == 1 ? "" : "s")")
+        }
+        if pendingCount > 0 {
+            parts.append("\(pendingCount) leftover recovery recording\(pendingCount == 1 ? "" : "s")")
+        }
+        let subject = parts.isEmpty ? "Nothing is stored right now" : parts.joined(separator: " and ")
+        alert.informativeText = "\(subject) will be deleted from disk. This cannot be undone. Settings, the speech model and your custom corrections are not affected."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    @objc private func selectHistoryRetention(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let retention = HistoryRetention(rawValue: raw) else { return }
+        settings.historyRetention = retention
+        log("history retention set to \(HISTORY_RETENTION_DISPLAY[retention] ?? retention.rawValue)")
+        pruneHistoryForRetention(reason: "setting changed")
+        rebuildMenu()
     }
 
     /// 60-char preview with ellipsis. Newlines collapsed so a multi-
@@ -12057,6 +12297,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func showHistoryOverlay() {
+        // Expire before rendering so the overlay never shows a transcript
+        // that the retention setting says should already be gone.
+        pruneHistoryForRetention(reason: "overlay opened")
         guard !historyOverlayPresented else {
             let panel = historyOverlayWindow ?? makeHistoryOverlayWindow()
             historyOverlayWindow = panel
@@ -13581,6 +13824,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(buildPasteSuffixSettingsItem())
         sub.addItem(buildRecentTranscriptLimitSettingsItem())
+        sub.addItem(buildHistoryRetentionSettingsItem())
+        sub.addItem(buildClearPrivateDataItem())
         sub.addItem(buildCorrectionsItem())
 
         let filler = NSMenuItem(title: "Remove filler words (um, uh, ah, er, hmm)",
@@ -13759,6 +14004,34 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         pasteParent.submenu = pasteSub
         return pasteParent
+    }
+
+    private func buildHistoryRetentionSettingsItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Keep History For", action: nil, keyEquivalent: "")
+        parent.toolTip = "Transcripts older than this are deleted from disk. Independent of how many the overlay shows."
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for retention in HistoryRetention.allCases {
+            let item = NSMenuItem(title: HISTORY_RETENTION_DISPLAY[retention] ?? retention.rawValue,
+                                  action: #selector(selectHistoryRetention(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.state = (retention == settings.historyRetention) ? .on : .off
+            item.representedObject = retention.rawValue
+            sub.addItem(item)
+        }
+        parent.submenu = sub
+        return parent
+    }
+
+    private func buildClearPrivateDataItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Clear Private Data Now…",
+                              action: #selector(clearPrivateDataClicked(_:)),
+                              keyEquivalent: "")
+        item.target = self
+        item.toolTip = "Delete all saved transcripts and any leftover crash-recovery audio."
+        item.isEnabled = !history.isEmpty || !PendingDictationRecovery.pendingURLs().isEmpty
+        return item
     }
 
     private func buildRecentTranscriptLimitSettingsItem() -> NSMenuItem {
@@ -16700,6 +16973,116 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testHistoryRetention() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func entry(_ text: String, ageHours: Double) -> TranscriptHistoryEntry {
+            TranscriptHistoryEntry(text: text,
+                                   createdAt: now.addingTimeInterval(-ageHours * 60 * 60))
+        }
+
+        let entries = [
+            entry("fresh", ageHours: 1),
+            entry("yesterday", ageHours: 25),
+            entry("last week", ageHours: 8 * 24),
+            entry("last month", ageHours: 40 * 24),
+        ]
+
+        try expect(
+            retainedTranscriptHistoryEntries(entries, retention: .forever, now: now),
+            equals: entries,
+            "forever retention should never drop an entry"
+        )
+        try expect(
+            retainedTranscriptHistoryEntries(entries, retention: .oneDay, now: now).map(\.text),
+            equals: ["fresh"],
+            "one-day retention should keep only entries younger than 24 hours"
+        )
+        try expect(
+            retainedTranscriptHistoryEntries(entries, retention: .sevenDays, now: now).map(\.text),
+            equals: ["fresh", "yesterday"],
+            "seven-day retention should keep entries younger than a week"
+        )
+        try expect(
+            retainedTranscriptHistoryEntries(entries, retention: .thirtyDays, now: now).map(\.text),
+            equals: ["fresh", "yesterday", "last week"],
+            "thirty-day retention should keep entries younger than a month"
+        )
+
+        let exactlyAtLimit = [entry("boundary", ageHours: 24)]
+        try expect(
+            retainedTranscriptHistoryEntries(exactlyAtLimit, retention: .oneDay, now: now).count,
+            equals: 1,
+            "an entry exactly at the retention limit should be kept, not expired"
+        )
+
+        let futureDated = [TranscriptHistoryEntry(text: "clock skew",
+                                                  createdAt: now.addingTimeInterval(60 * 60))]
+        try expect(
+            retainedTranscriptHistoryEntries(futureDated, retention: .oneDay, now: now).count,
+            equals: 1,
+            "a future-dated entry means a broken clock and must not be deleted"
+        )
+
+        let legacy = [TranscriptHistoryEntry(text: "no date"), entry("dated", ageHours: 1)]
+        try expect(
+            retainedTranscriptHistoryEntries(legacy, retention: .oneDay, now: now).count,
+            equals: 2,
+            "an unstamped legacy entry must survive pruning until it has been stamped"
+        )
+
+        let stamped = stampedTranscriptHistoryEntries(legacy, now: now)
+        try expect(
+            stamped.compactMap(\.createdAt).count,
+            equals: 2,
+            "stamping should give every entry a creation date"
+        )
+        try expect(
+            stamped[1].createdAt,
+            equals: legacy[1].createdAt,
+            "stamping must not overwrite a date that already exists"
+        )
+        try expect(
+            stampedTranscriptHistoryEntries(stamped, now: now.addingTimeInterval(99)),
+            equals: stamped,
+            "stamping an already-stamped history should be a no-op"
+        )
+        try expect(
+            retainedTranscriptHistoryEntries(stamped, retention: .oneDay, now: now.addingTimeInterval(25 * 60 * 60)).count,
+            equals: 0,
+            "a stamped legacy entry should expire one retention window after the upgrade"
+        )
+
+        let decodedWithoutDate = try JSONDecoder().decode(
+            TranscriptHistoryEntry.self,
+            from: Data(#"{"text":"legacy"}"#.utf8)
+        )
+        try expect(
+            decodedWithoutDate.createdAt == nil,
+            equals: true,
+            "history written before retention existed must still decode"
+        )
+        try expect(
+            decodedWithoutDate.text,
+            equals: "legacy",
+            "decoding a dateless legacy entry must preserve its text"
+        )
+
+        let pending: [(path: String, createdAt: Date)] = [
+            ("recent.sdaudio", now.addingTimeInterval(-60 * 60)),
+            ("stale.sdaudio", now.addingTimeInterval(-49 * 60 * 60)),
+        ]
+        try expect(
+            expiredPendingDictationPaths(pending, now: now),
+            equals: ["stale.sdaudio"],
+            "only pending recovery audio older than the age limit should be swept"
+        )
+        try expect(
+            expiredPendingDictationPaths(pending, now: now, maximumAgeSeconds: 90 * 24 * 60 * 60),
+            equals: [],
+            "a longer age limit should spare pending audio"
+        )
+    }
+
     private static func testRecentTranscriptLimit() throws {
         let transcripts = ["newest", "second", "third", "fourth", "fifth", "sixth"]
 
@@ -16753,6 +17136,8 @@ private enum ParakeySelfTest {
             equals: archivedEntries,
             "an invalid history deletion index should leave the archive unchanged"
         )
+
+        try testHistoryRetention()
 
         let historyRowHitTargets = MainActor.assumeIsolated { () -> (delete: Bool, row: Bool, deleteAction: Bool, copyAction: Bool) in
             let row = HistoryTranscriptItemView(
