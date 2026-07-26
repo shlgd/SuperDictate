@@ -1,0 +1,4 @@
+module whisper_cpp {
+    header "whisper_cpp_module.h"
+    export *
+}

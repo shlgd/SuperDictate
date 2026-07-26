@@ -20,16 +20,50 @@ let package = Package(
     products: [
         .executable(name: "Parakey", targets: ["Parakey"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio.git",
-                 revision: "313feb4bd692780a9a5b5fa9048fdb119486dde8"),
-    ],
+    dependencies: [],
     targets: [
+        .target(
+            name: "whisper_cpp",
+            exclude: [
+                "ggml-cpu/arch/arm",
+                "ggml-cpu/arch/riscv",
+                "ggml-cpu/arch/powerpc",
+                "ggml-cpu/arch/s390",
+                "ggml-cpu/arch/wasm",
+                "ggml-cpu/arch/loongarch",
+                "ggml-cpu/spacemit",
+            ],
+            cSettings: [
+                .define("GGML_USE_ACCELERATE"),
+                .define("GGML_USE_CPU"),
+                .define("ACCELERATE_NEW_LAPACK"),
+                .define("ACCELERATE_LAPACK_ILP64"),
+                .define("GGML_VERSION", to: "\"080bbbe8\""),
+                .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
+                .define("WHISPER_VERSION", to: "\"080bbbe8\""),
+                .headerSearchPath("."),
+                .headerSearchPath("ggml-cpu"),
+                .unsafeFlags(["-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2"]),
+            ],
+            cxxSettings: [
+                .define("GGML_USE_ACCELERATE"),
+                .define("GGML_USE_CPU"),
+                .define("ACCELERATE_NEW_LAPACK"),
+                .define("ACCELERATE_LAPACK_ILP64"),
+                .define("GGML_VERSION", to: "\"080bbbe8\""),
+                .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
+                .define("WHISPER_VERSION", to: "\"080bbbe8\""),
+                .headerSearchPath("."),
+                .headerSearchPath("ggml-cpu"),
+                .unsafeFlags(["-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2"]),
+            ],
+            linkerSettings: [
+                .linkedFramework("Accelerate"),
+            ]
+        ),
         .executableTarget(
             name: "Parakey",
-            dependencies: [
-                .product(name: "FluidAudio", package: "FluidAudio"),
-            ]
+            dependencies: ["whisper_cpp"]
             // No `resources:` here on purpose. SwiftPM bundles them as
             // a `<Package>_<Target>.bundle` directory next to the
             // executable, which `codesign --deep` won't accept as a
@@ -40,5 +74,7 @@ let package = Package(
             // path. Source PNGs live in swift/Resources/ at the repo
             // root, NOT in the SwiftPM target, so SwiftPM never sees them.
         ),
-    ]
+    ],
+    cLanguageStandard: .c17,
+    cxxLanguageStandard: .cxx17
 )
