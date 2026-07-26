@@ -2,13 +2,13 @@
 
 ## Установить за минуту
 
-**Нужен Mac с Apple Silicon (`M1` или новее) и macOS 14+.**
+**Нужен Mac на Apple Silicon (`M1` или новее) или Intel, и macOS 14+.**
 
 1. Откройте приложение **Terminal**.
 2. Вставьте эту команду и нажмите Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
 ```
 
 3. В открывшемся SuperDictate нажмите `Разрешить` для **Микрофона**,
@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/install.
    Нажмите **правый Command** ещё раз, чтобы вставить текст.
 
 При первом запуске один раз загрузится локальная модель распознавания. На
-диске она занимает около 460 МБ; для установки лучше иметь не менее 1 ГБ
+диске она занимает около 1,6 ГБ; для установки лучше иметь не менее 2 ГБ
 свободного места. После загрузки интернет для диктовки не нужен.
 
 SuperDictate — быстрая локальная диктовка для macOS. Аудио и расшифровка не
@@ -33,7 +33,7 @@ SuperDictate — быстрая локальная диктовка для macOS
 удаляйте. Откройте Terminal и ещё раз выполните ту же команду:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
 ```
 
 Команда заменяет только `/Applications/SuperDictate.app`. История, настройки и
@@ -41,7 +41,8 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh 
 можно устанавливать прямо из приложения.
 
 Последнюю опубликованную версию также всегда можно увидеть на странице
-[GitHub Releases](https://github.com/shlgd/SuperDictate/releases/latest).
+[GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases/latest)
+(этот форк ещё не выпустил свой первый релиз).
 
 ## Горячие клавиши
 
@@ -95,9 +96,9 @@ macOS не разрешает приложению выдать их самом�
 Установщик:
 
 1. Загружает `SuperDictate.zip` из
-   [GitHub Releases](https://github.com/shlgd/SuperDictate/releases).
-2. Проверяет закреплённую SHA-256, версию, bundle ID, архитектуру arm64,
-   подпись и microphone-entitlements.
+   [GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases).
+2. Проверяет закреплённую SHA-256, версию, bundle ID, архитектуру (Apple
+   Silicon или Intel), подпись и microphone-entitlements.
 3. Безопасно заменяет `/Applications/SuperDictate.app` и открывает панель.
 
 Xcode и Command Line Tools для обычной установки не нужны. История, настройки
@@ -124,7 +125,7 @@ Xcode и Command Line Tools для обычной установки не нуж
 Эта же команда остаётся запасным способом для любой версии:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
 ```
 
 Приложение само не устанавливает обновления в фоне: запуск обновления всегда
@@ -138,7 +139,7 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/install.
 результат в `/Applications`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /bin/bash
 ```
 
 Понадобятся бесплатные Apple Command Line Tools. Если их нет, установщик
@@ -154,7 +155,7 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/install.
 
 ```bash
 xcode-select --install
-git clone https://github.com/shlgd/SuperDictate.git
+git clone https://github.com/shohart/SuperDictate-Intel.git
 cd SuperDictate
 swift run -c debug --package-path swift Parakey --self-test all
 ./scripts/build-app.sh ./dist/SuperDictate.app
@@ -188,8 +189,12 @@ GitHub Actions повторяет самотесты, собирает bundle, �
 
 ## Ограничения
 
-- Поддерживаются только Apple Silicon и macOS 14 или новее. Intel Mac,
-  Windows и Linux пока не поддерживаются.
+- Поддерживаются Apple Silicon и Intel Mac на macOS 14 или новее. Windows и
+  Linux пока не поддерживаются. Поддержка Intel в этом форке проверена ручным
+  тестированием только на одной конкретной машине (Xeon E5-2678 v3 + AMD
+  Radeon RX 6600, macOS 15.7.7), а не через CI: размещённые GitHub раннеры
+  macOS доступны только на Apple Silicon, поэтому автоматической проверки
+  этого пути пока нет.
 - Публичная сборка подписана ad-hoc и не нотарифицирована Apple. Установка
   через команду выше проверена, но ZIP, скачанный вручную через браузер, может
   вызвать предупреждение Gatekeeper.
@@ -204,14 +209,17 @@ GitHub Actions повторяет самотесты, собирает bundle, �
 - Защищённые поля паролей и приложения, которые скрывают Accessibility-данные,
   могут не отдавать координаты каретки. Это влияет на положение анимации, но
   не всегда мешает вставке текста.
-- Ориентир по ресурсам на текущей сборке: около 460 МБ на диске для модели,
-  примерно 100–150 МБ памяти в простое и до 500 МБ во время загрузки/работы
-  модели. Значения зависят от macOS и длины записи.
+- Ориентир по ресурсам на текущей сборке: около 1,6 ГБ на диске для модели
+  (`ggml-large-v3-turbo`, движок whisper.cpp, только CPU). Память в простое и
+  во время работы движка ещё не переизмерена на реальном Intel-железе с этой
+  моделью — старые цифры (100–150 МБ в простое, до 500 МБ во время работы)
+  относились к предыдущему движку FluidAudio/CoreML и для whisper.cpp не
+  применимы. Актуальный ориентир по памяти появится после отдельного прогона.
 
 ## Данные и приватность
 
 - История и настройки: `~/Library/Application Support/SuperDictate`.
-- Модель FluidAudio: `~/Library/Application Support/FluidAudio/Models`.
+- Модель whisper.cpp: `~/Library/Application Support/Whisper/Models`.
 - LaunchAgent: `~/Library/LaunchAgents/com.local.superdictate.agent.plist`.
 - Логи: `~/Library/Logs/SuperDictate*`.
 - Аналитики, аккаунтов и телеметрии нет.
@@ -221,7 +229,7 @@ GitHub Actions повторяет самотесты, собирает bundle, �
 ## Удаление
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.37/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/uninstall.sh | bash
 ```
 
 Приложение и фоновая служба удаляются. История, настройки и модель сохраняются,
