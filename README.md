@@ -1,5 +1,7 @@
 # SuperDictate
 
+**Русский** | [English](README.en.md)
+
 ## Установить за минуту
 
 **Нужен Mac с Apple Silicon (`M1` или новее) и macOS 14+.**
