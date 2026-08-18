@@ -21,8 +21,7 @@ let package = Package(
         .executable(name: "Parakey", targets: ["Parakey"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio.git",
-                 revision: "313feb4bd692780a9a5b5fa9048fdb119486dde8"),
+        .package(path: "FluidAudio"),
     ],
     targets: [
         .executableTarget(
