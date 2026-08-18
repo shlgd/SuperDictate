@@ -2,7 +2,7 @@
 
 **English** | [Русский](README.md)
 
-Fast, private, local push-to-talk dictation for macOS on Apple Silicon (`M1`–`M4` & Apple A18 Pro / MacBook Neo).
+Fast, private, local push-to-talk dictation for macOS on Apple Silicon (M1 and newer, including MacBook Neo / A18 Pro).
 
 - **100% On-Device & Private:** Speech recognition runs entirely locally on your Mac via Apple Neural Engine (CoreML). No cloud audio streaming, no telemetry, and no account required.
 - **Instant Launch (< 0.2 ms):** Fast Model Integrity Fingerprint Cache completely eliminates slow SHA-256 startup verification delays.

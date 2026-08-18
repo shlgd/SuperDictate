@@ -2,7 +2,7 @@
 
 [English](README.en.md) | **Русский**
 
-Быстрая, локальная диктовка push-to-talk для macOS на Apple Silicon (`M1`–`M4` и Apple A18 Pro / MacBook Neo).
+Быстрая, локальная диктовка push-to-talk для macOS на Apple Silicon (от M1 и новее, включая MacBook Neo / A18 Pro).
 
 - **100% On-Device & Приватно:** Распознавание речи работает полностью на вашем Mac через Apple Neural Engine (CoreML). Без облака, телеметрии и аккаунтов.
 - **Мгновенный старт (< 0.2 мс):** Кэш метаданных модели (Fast Fingerprint Cache) исключает задержки при старте приложения.
