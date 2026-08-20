@@ -186,6 +186,12 @@ enum AICleanupService {
         return components.url?.absoluteString
     }
 
+    static func sanitizeInputTextForPrompt(_ input: String) -> String {
+        input
+            .replacingOccurrences(of: "</text>", with: "&lt;/text&gt;")
+            .replacingOccurrences(of: "<text>", with: "&lt;text&gt;")
+    }
+
     static func makeRequestBody(text: String,
                                 language: DictationLanguage,
                                 model: String,
@@ -194,7 +200,8 @@ enum AICleanupService {
         if language != .auto {
             system += "\nThe text is in the language with ISO code \"\(language.rawValue)\"; keep the output in that language."
         }
-        let estimatedInputTokens = max(1, text.count / 4)
+        let safeText = sanitizeInputTextForPrompt(text)
+        let estimatedInputTokens = max(1, safeText.count / 4)
         let outputTokenLimit = max(256, estimatedInputTokens * 2)
         var body: [String: Any] = [
             "model": model,
@@ -210,7 +217,7 @@ enum AICleanupService {
                 ["role": "user", "content": """
                     Correct this dictated text:
                     <text>
-                    \(text)
+                    \(safeText)
                     </text>
                     """],
             ],

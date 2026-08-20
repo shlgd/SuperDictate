@@ -416,6 +416,7 @@ enum TranscriptCorrector {
 
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         var matches: [Match] = []
+        var occupiedRanges = IndexSet()
 
         for correction in active {
             guard let pattern = pattern(for: correction.source),
@@ -423,8 +424,10 @@ enum TranscriptCorrector {
             else { continue }
 
             regex.enumerateMatches(in: text, range: fullRange) { match, _, _ in
-                guard let range = match?.range, range.location != NSNotFound else { return }
-                guard !matches.contains(where: { NSIntersectionRange($0.range, range).length > 0 }) else { return }
+                guard let range = match?.range, range.location != NSNotFound, range.length > 0 else { return }
+                let intRange = range.location..<(range.location + range.length)
+                guard !occupiedRanges.intersects(integersIn: intRange) else { return }
+                occupiedRanges.insert(integersIn: intRange)
                 matches.append(Match(range: range, replacement: correction.replacement))
             }
         }
