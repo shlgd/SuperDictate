@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%2014%2B%20(Apple%20Silicon)-000000?style=flat-square&logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](../LICENSE)
 
-[Возможности](#-ключевые-возможности) • [Установка](#-быстрая-установка) • [Горячие клавиши](#-горячие-клавиши) • [Сборка](#-сборка-из-исходников) • [English Version](README.en.md)
+[Возможности](#-ключевые-возможности) • [Установка](#-быстрая-установка) • [Горячие клавиши](#-горячие-клавиши) • [Сборка](#-сборка-из-исходников) • [English Version](README_EN.md)
 
 </div>
 
