@@ -3,4 +3,5 @@
 swift/.build/
 dist/
 *.xcuserstate
+swift/FluidAudio/
 
