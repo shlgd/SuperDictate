@@ -20,8 +20,6 @@
 
 **SuperDictate** is a native macOS speech-to-text dictation application designed for speed, privacy, and zero reliance on external cloud APIs. Audio transcription is processed completely on-device utilizing the **Apple Neural Engine (ANE)** through CoreML models.
 
-> *Maintained and enhanced by [m0rvey](https://github.com/m0rvey). Fork of [shlgd/SuperDictate](https://github.com/shlgd/SuperDictate).*
-
 ---
 
 ## ✨ Key Features
@@ -38,7 +36,7 @@
 ## 🚀 Quick Install
 
 ### Requirements
-- Mac with **Apple Silicon** (`M1`, `M2`, `M3`, `M4` or A18 Pro).
+- Mac with **Apple Silicon** (from M1 or A18 Pro).
 - **macOS 14 (Sonoma)** or newer.
 
 ```bash

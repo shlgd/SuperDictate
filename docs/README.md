@@ -20,8 +20,6 @@
 
 **SuperDictate** — нативное приложение для транскрибации речи в текст (Speech-to-Text) для macOS. Распознавание работает полностью на устройстве через **Apple Neural Engine (ANE)** на базе оптимизированных CoreML-моделей Whisper, без облака и задержек.
 
-> *Форк от [shlgd/SuperDictate](https://github.com/shlgd/SuperDictate). Развивается и поддерживается [m0rvey](https://github.com/m0rvey).*
-
 ---
 
 ## ✨ Ключевые возможности
@@ -38,7 +36,7 @@
 ## 🚀 Быстрая установка
 
 ### Требования
-- Mac с процессором **Apple Silicon** (`M1`, `M2`, `M3`, `M4` или A18 Pro).
+- Mac с процессором **Apple Silicon** (от M1 или A18 Pro).
 - **macOS 14 (Sonoma)** или новее.
 
 ```bash
