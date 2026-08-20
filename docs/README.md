@@ -40,7 +40,7 @@
 - **macOS 14 (Sonoma)** или новее.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.40/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 1. Запустите SuperDictate и выдайте системные разрешения: **Микрофон**, **Универсальный доступ** и **Мониторинг ввода**.
