@@ -22508,6 +22508,7 @@ private enum ControlPanelShortcutKind: Int {
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
+    var triggerMode: TriggerMode
     var dictationHotkey: HotkeyChoice
     var alternateCompletionHotkey: HotkeyChoice
     var historyHotkey: HotkeyChoice
@@ -22527,6 +22528,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var showInMenuBar: Bool
 
     init(settings: Settings) {
+        triggerMode = settings.triggerMode
         dictationHotkey = settings.configuredHotkey
         alternateCompletionHotkey = settings.configuredEnterHotkey
         historyHotkey = settings.configuredHistoryHotkey
@@ -22857,9 +22859,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             title: t("Диктовка", "Dictation"),
             shortcut: draft.dictationHotkey,
             kind: .dictation,
-            toolTip: t("Начать запись. Повторное нажатие завершает её выбранным способом.",
-                       "Start recording. Press again to finish using the selected action.")
+            toolTip: draft.triggerMode == .hold
+                ? t("Удерживайте для записи. Отпустите, чтобы распознать и вставить текст.",
+                    "Hold to record. Release to transcribe and insert text.")
+                : t("Начать запись. Повторное нажатие завершает её выбранным способом.",
+                    "Start recording. Press again to finish using the selected action.")
         ))
+        root.addArrangedSubview(holdToDictateRow(draft))
         root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
         root.addArrangedSubview(alternateCompletionRow(draft))
         root.addArrangedSubview(enterDelayRow(draft))
@@ -23653,6 +23659,39 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func holdToDictateRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Диктовка при удержании", "Hold to dictate"),
+                                           size: 13, weight: .semibold))
+        let detail = panelLabel(
+            t("Удерживайте хоткей, пока говорите. Отпустите — текст вставится.",
+              "Hold the shortcut while speaking. Release to insert the text."),
+            size: 12, color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        text.addArrangedSubview(detail)
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleHoldToDictate(_:))
+        toggle.state = draft.triggerMode == .hold ? .on : .off
+        toggle.isEnabled = serviceOperation == nil
+        toggle.setAccessibilityLabel(t("Диктовка при удержании", "Hold to dictate"))
+        toggle.toolTip = t("Выключено: нажмите для начала записи и ещё раз для завершения.",
+                           "When off, press to start recording and press again to finish.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private func primaryCompletionBehaviorRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -23663,7 +23702,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 3
-        text.addArrangedSubview(panelLabel(t("Повторное нажатие", "Press again"),
+        text.addArrangedSubview(panelLabel(draft.triggerMode == .hold
+                                            ? t("При отпускании", "On release")
+                                            : t("Повторное нажатие", "Press again"),
                                            size: 13,
                                            weight: .semibold))
         text.addArrangedSubview(panelLabel(
@@ -23681,8 +23722,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         control.selectedSegment = draft.primaryCompletionBehavior == .insert ? 0 : 1
         control.isEnabled = serviceOperation == nil
-        control.toolTip = t("Выберите действие при повторном нажатии основного хоткея.",
-                            "Choose what the main shortcut does when pressed again.")
+        control.toolTip = draft.triggerMode == .hold
+            ? t("Выберите действие при отпускании основного хоткея.",
+                "Choose what the main shortcut does when released.")
+            : t("Выберите действие при повторном нажатии основного хоткея.",
+                "Choose what the main shortcut does when pressed again.")
         control.setContentHuggingPriority(.required, for: .horizontal)
 
         row.addArrangedSubview(text)
@@ -24933,6 +24977,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleHoldToDictate(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.triggerMode = sender.state == .on ? .hold : .toggle
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func toggleMenuBarVisibility(_ sender: NSSwitch) {
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.showInMenuBar = sender.state == .on
@@ -25089,6 +25140,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         settings.setConfiguredHotkey(draft.dictationHotkey)
+        settings.triggerMode = draft.triggerMode
         settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
