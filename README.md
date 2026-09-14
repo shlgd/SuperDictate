@@ -8,7 +8,7 @@
 2. Вставьте эту команду и нажмите Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.43/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.44/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 3. В открывшемся SuperDictate нажмите `Разрешить` для **Микрофона**,
@@ -143,6 +143,13 @@ macOS не разрешает приложению выдать их самом�
 Xcode и Command Line Tools для обычной установки не нужны. История, настройки
 и уже загруженная модель при обновлении сохраняются.
 
+## Настройки управления
+
+- **Иконка в меню-баре**: показывает компактную аудиоволну в верхней строке macOS. Нажатие открывает панель управления. По умолчанию выключено.
+- **Диктовка при удержании**: удерживайте основной хоткей, пока говорите, затем отпустите для распознавания и вставки. По умолчанию выключено: запись начинается и завершается отдельными нажатиями.
+- Действие **«При отпускании»** (или **«Повторное нажатие»**) позволяет выбрать вставку с Enter или без него.
+- Кнопки **«Отменить»** и **«Сохранить»** закреплены внизу окна и всегда видны при прокрутке. Настройки применяются после сохранения без перезапуска модели.
+
 ## Подробнее об обновлении
 
 ### Если установлена v0.2.26 или новее
@@ -164,7 +171,7 @@ Xcode и Command Line Tools для обычной установки не нуж
 Эта же команда остаётся запасным способом для любой версии:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.43/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.44/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 Приложение само не устанавливает обновления в фоне: запуск обновления всегда
@@ -178,7 +185,7 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.43/install.
 результат в `/Applications`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.43/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.44/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /usr/bin/arch -arm64 /bin/bash
 ```
 
 Понадобятся бесплатные Apple Command Line Tools. Если их нет, установщик
@@ -263,7 +270,7 @@ GitHub Actions повторяет самотесты, собирает bundle, �
 ## Удаление
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.43/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.44/uninstall.sh | bash
 ```
 
 Приложение и фоновая служба удаляются. История, настройки и модель сохраняются,
