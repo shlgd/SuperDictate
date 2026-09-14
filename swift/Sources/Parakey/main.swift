@@ -22925,7 +22925,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(permissionsRecoveryRow())
-        root.addArrangedSubview(settingsActionsRow(draft: draft))
         root.addArrangedSubview(privacyInfoView())
 
         let background = NSVisualEffectView()
@@ -22949,11 +22948,31 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         scroll.documentView = document
         background.addSubview(scroll)
 
+        let footer = NSView()
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        let divider = separator()
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        let actions = settingsActionsRow(draft: draft)
+        actions.translatesAutoresizingMaskIntoConstraints = false
+        footer.addSubview(divider)
+        footer.addSubview(actions)
+        background.addSubview(footer)
+
         NSLayoutConstraint.activate([
             scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor),
             scroll.topAnchor.constraint(equalTo: background.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: footer.topAnchor),
+            footer.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            divider.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: footer.topAnchor),
+            actions.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 14),
+            actions.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 24),
+            actions.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -24),
+            actions.bottomAnchor.constraint(equalTo: footer.bottomAnchor, constant: -14),
             document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
             document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
@@ -24158,6 +24177,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             color: validation == nil ? .secondaryLabelColor : .systemRed
         )
         message.toolTip = validation
+        message.maximumNumberOfLines = 2
+        message.lineBreakMode = .byWordWrapping
+        message.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(message)
         row.addArrangedSubview(NSView())
 
