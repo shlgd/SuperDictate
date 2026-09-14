@@ -2649,6 +2649,7 @@ final class Settings: @unchecked Sendable {
     private static let keyMuteWhileRecording = "mute_while_recording"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
     private static let keyShowInDock = "show_in_dock"
+    private static let keyShowInMenuBar = "show_in_menu_bar"
     private static let keyInputDevice = "input_device"
     private static let keyAudioFileTranscriptionOutputDirectory = "audio_file_transcription_output_directory_v1"
     private static let keyCheckForUpdates = "check_for_updates"
@@ -3057,6 +3058,11 @@ final class Settings: @unchecked Sendable {
             return defaults.bool(forKey: Self.keyShowInDock)
         }
         set { defaults.set(newValue, forKey: Self.keyShowInDock) }
+    }
+
+    var showInMenuBar: Bool {
+        get { defaults.bool(forKey: Self.keyShowInMenuBar) }
+        set { defaults.set(newValue, forKey: Self.keyShowInMenuBar) }
     }
 
     var inputDevice: String {
@@ -10960,7 +10966,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         configureStatusItemImage()
-        concealMenuBarIcon()
+        updateMenuBarVisibility()
         setMenuBarState(.loading)
         startCorrectionSyncIfConfigured()
         rebuildMenu()
@@ -11853,10 +11859,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         button.toolTip = "Parakey"
     }
 
-    private func concealMenuBarIcon() {
-        statusItem.length = 0
-        statusItem.button?.isHidden = true
-        statusItem.button?.toolTip = nil
+    private func updateMenuBarVisibility() {
+        statusItem.menu = nil
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(menuBarIconClicked(_:))
+        statusItem.button?.setAccessibilityLabel("SuperDictate")
+        statusItem.button?.toolTip = settings.interfaceLanguage == .russian
+            ? "Открыть панель управления SuperDictate"
+            : "Open SuperDictate Control Panel"
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.isVisible = settings.showInMenuBar
+    }
+
+    @objc private func menuBarIconClicked(_ sender: NSStatusBarButton) {
+        openControlPanelFromAgent()
     }
 
     private func tintedCopy(of source: NSImage, with color: NSColor) -> NSImage {
@@ -14382,7 +14398,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func rebuildMenu() {
         publishAgentState()
-        statusItem.menu = buildMenu()
+        updateMenuBarVisibility()
     }
 
     private func publishAgentState(status explicitStatus: String? = nil,
@@ -22513,6 +22529,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var showInMenuBar: Bool
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -22532,6 +22549,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        showInMenuBar = settings.showInMenuBar
     }
 }
 
@@ -22837,6 +22855,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(settingsHeaderView())
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(menuBarVisibilityRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(hotkeyRow(
             title: t("Диктовка", "Dictation"),
@@ -23969,6 +23989,35 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func menuBarVisibilityRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Иконка в меню-баре", "Menu bar icon"),
+                                           size: 13, weight: .semibold))
+        text.addArrangedSubview(panelLabel(
+            t("Нажатие открывает панель управления.", "Click to open the control panel."),
+            size: 12, color: .secondaryLabelColor))
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleMenuBarVisibility(_:))
+        toggle.state = draft.showInMenuBar ? .on : .off
+        toggle.isEnabled = serviceOperation == nil
+        toggle.setAccessibilityLabel(t("Иконка в меню-баре", "Menu bar icon"))
+        toggle.toolTip = t("Показать иконку SuperDictate в верхней строке macOS.",
+                           "Show the SuperDictate icon in the macOS menu bar.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private func removeFinalPeriodRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -24867,6 +24916,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleMenuBarVisibility(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.showInMenuBar = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func discardSettingsClicked(_ sender: NSButton) {
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         pendingAIKey = ""
@@ -25031,6 +25087,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.showInMenuBar = draft.showInMenuBar
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
