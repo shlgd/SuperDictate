@@ -11838,25 +11838,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func configureStatusItemImage() {
         guard let button = statusItem.button else { return }
-        // The PNG lives in Contents/Resources/ of our .app bundle
-        // (the canonical macOS layout — same place release.sh /
-        // dev-run.sh copy it). NSImage(named:) on the main bundle
-        // finds it under that path automatically; Bundle.module is
-        // deliberately not used here so codesign --deep doesn't have
-        // to grapple with a SwiftPM resource bundle.
-        let image = NSImage(named: "parakey-menubar")
+        let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+        let image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "SuperDictate")?
+            .withSymbolConfiguration(configuration)
         image?.isTemplate = true
-        image?.size = NSSize(width: 18, height: 18)
         templateImage = image
         recordingImage = image.map { tintedCopy(of: $0, with: settings.recordingHUDRecordingColor.nsColor) }
         errorImage = image.map { tintedCopy(of: $0, with: .systemYellow) }
         button.image = image
         button.imagePosition = .imageOnly
         if image == nil {
-            button.title = "Parakey"
-            log("statusItem: parakey-menubar.png not in Bundle.main — text fallback")
+            button.title = "SD"
+            log("statusItem: waveform symbol unavailable — text fallback")
         }
-        button.toolTip = "Parakey"
+        button.toolTip = "SuperDictate"
     }
 
     private func updateMenuBarVisibility() {
