@@ -289,7 +289,12 @@ final class LocalModelDownloads {
     var onChange: (() -> Void)?
 
     func start(_ selection: SpeechModelProfile) {
-        guard task == nil else { return }
+        guard task == nil else {
+            log("local model download: existing operation shown instead of starting a duplicate")
+            onChange?()
+            return
+        }
+        log("local model download starting: \(selection.rawValue)")
         profile = selection
         let operation = UUID()
         operationID = operation
@@ -300,6 +305,7 @@ final class LocalModelDownloads {
         task = Task {
             defer { operationID = UUID(); task = nil; self.process = nil; onChange?() }
             do {
+                try Task.checkCancellation()
                 try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
                 let receive: @Sendable (LocalSpeechMessage) -> Void = { [weak self] update in
                     Task { @MainActor in
@@ -314,8 +320,13 @@ final class LocalModelDownloads {
                 try Task.checkCancellation()
                 message = LocalSpeechMessage(phase: "ready")
             } catch {
-                if Task.isCancelled { message = LocalSpeechMessage(phase: "cancelled") }
-                else { failure = error.localizedDescription }
+                if Task.isCancelled {
+                    message = LocalSpeechMessage(phase: "cancelled")
+                    log("local model download cancelled: \(selection.rawValue)")
+                } else {
+                    failure = error.localizedDescription
+                    log("local model download failed: \(selection.rawValue): \(error.localizedDescription)")
+                }
             }
         }
         onChange?()

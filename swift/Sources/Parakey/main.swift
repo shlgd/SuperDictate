@@ -17552,6 +17552,10 @@ private enum ParakeySelfTest {
             }
         case "local-model-protocol":
             return runSuite("local-model-protocol", testLocalModelProtocol)
+        case "local-model-ui":
+            return runSuite("local-model-ui") {
+                try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
+            }
         case "managed-runtime":
             return runSuite("managed-runtime") {
                 try asyncLocalModelTest {
@@ -17816,6 +17820,7 @@ private enum ParakeySelfTest {
     }
 
     private static func testAll() throws {
+        try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
         try testAgentInstanceLock()
         try testLocalSpeechStorage()
         try testHotkey()
@@ -24548,12 +24553,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             row.spacing = 10
             row.addArrangedSubview(panelLabel(detail, size: 11.5, color: .secondaryLabelColor))
             row.addArrangedSubview(NSView())
-            row.addArrangedSubview(panelButton(
+            let download = panelButton(
                 LocalSpeechPaths.isInstalled(profile) ? t("Скачать заново", "Download again") : t("Скачать", "Download"),
                 action: #selector(downloadLocalSpeechModel(_:)),
                 enabled: !localModelDownloads.isRunning && profile != settings.speechModelProfile,
                 toolTip: t("Скачать модель и отдельный Python-движок. Текущая диктовка продолжит работать.",
-                           "Download the model and a separate Python runtime. Current dictation keeps working.")))
+                           "Download the model and a separate Python runtime. Current dictation keeps working."))
+            download.identifier = NSUserInterfaceItemIdentifier(profile.rawValue)
+            row.addArrangedSubview(download)
             stack.addArrangedSubview(row)
             if LocalSpeechPaths.isInstalled(profile) {
                 stack.addArrangedSubview(panelButton(t("Удалить модель", "Delete model"),
@@ -24599,6 +24606,67 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return stack
     }
 
+    #if DEBUG
+    static func testLocalModelDownloadHitTarget() throws {
+        _ = NSApplication.shared
+        for profile in SpeechModelProfile.selectable where profile.isExperimental {
+            try testLocalModelDownloadHitTarget(profile)
+        }
+        try testLocalModelDownloadHitTarget(.whisperTurbo, clearDraft: true)
+    }
+
+    private static func testLocalModelDownloadHitTarget(_ profile: SpeechModelProfile, clearDraft: Bool = false) throws {
+        let controller = SuperDictateControlPanelApp()
+        var draft = ControlPanelSettingsDraft(settings: controller.settings)
+        draft.speechModelProfile = .productionDefault
+        controller.settingsDraft = draft
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 700),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        controller.settingsWindow = window
+        let content = controller.makeSettingsContentView()
+        window.contentView = content
+        content.layoutSubtreeIfNeeded()
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        guard let popup = descendants(content).compactMap({ $0 as? NSPopUpButton }).first(where: {
+            $0.action == #selector(localSpeechModelChanged(_:))
+        }), let item = popup.itemArray.first(where: { $0.representedObject as? String == profile.rawValue }) else {
+            throw localSpeechError("Model selector missing")
+        }
+        popup.select(item)
+        guard popup.sendAction(popup.action, to: popup.target),
+              controller.settingsDraft?.speechModelProfile == profile,
+              let currentContent = window.contentView else {
+            throw localSpeechError("Model selection did not update the settings draft")
+        }
+        currentContent.layoutSubtreeIfNeeded()
+        guard let button = descendants(currentContent).compactMap({ $0 as? NSButton }).first(where: {
+            $0.action == #selector(downloadLocalSpeechModel(_:))
+        }) else { throw localSpeechError("Download button missing") }
+        let center = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: currentContent)
+        let hit = currentContent.hitTest(center)
+        print("\(profile.rawValue): download bounds: \(button.bounds), center: \(center), hit: \(String(describing: hit))")
+        guard button.target === controller, button.isEnabled,
+              hit === button || hit?.isDescendant(of: button) == true else {
+            throw localSpeechError("Download button is not reachable by a click")
+        }
+        if clearDraft { controller.settingsDraft = nil }
+        button.performClick(nil)
+        defer { controller.localModelDownloads.cancel() }
+        guard controller.localModelDownloads.isRunning,
+              controller.localModelDownloads.profile == profile,
+              controller.localModelStatusLabel?.window === window,
+              controller.localModelProgress?.window === window,
+              let cancel = descendants(window.contentView!).compactMap({ $0 as? NSButton }).first(where: {
+                  $0.action == #selector(cancelLocalSpeechDownload(_:))
+              }), cancel.isEnabled else {
+            throw localSpeechError("Download click did not display progress and cancel controls")
+        }
+    }
+    #endif
+
     @objc private func localSpeechModelChanged(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let profile = SpeechModelProfile(rawValue: raw) else { return }
@@ -24609,7 +24677,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func downloadLocalSpeechModel(_ sender: NSButton) {
-        guard let profile = settingsDraft?.speechModelProfile, profile.isExperimental else { return }
+        guard let raw = sender.identifier?.rawValue,
+              let profile = SpeechModelProfile(rawValue: raw), profile.isExperimental else {
+            log("local model download: invalid button selection")
+            showError(title: t("Не удалось начать загрузку", "Could Not Start Download"),
+                      detail: t("Выберите модель заново и повторите попытку.", "Select the model again and retry."))
+            return
+        }
+        log("local model download clicked: \(profile.rawValue), running=\(localModelDownloads.isRunning)")
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.speechModelProfile = profile
+        settingsDraft = draft
         localModelDownloads.onChange = { [weak self] in self?.updateLocalModelDownloadStatus() }
         localModelDownloads.start(profile)
     }
@@ -24658,7 +24736,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func updateLocalModelDownloadStatus() {
         guard localModelDownloads.isRunning, let label = localModelStatusLabel,
-              let progress = localModelProgress else {
+              let progress = localModelProgress, let content = settingsWindow?.contentView,
+              label.isDescendant(of: content), progress.isDescendant(of: content) else {
             refreshSettingsWindow()
             return
         }
