@@ -1,0 +1,85 @@
+"""No model weights, microphone access or inference. Run with a numpy-enabled Python."""
+import hashlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SCRIPT = Path(__file__).resolve().parents[1] / "swift/Resources/local-asr.py"
+spec = importlib.util.spec_from_file_location("local_asr", SCRIPT)
+asr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(asr)
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_catalog_is_bounded_and_pinned(self):
+        self.assertEqual(len(asr.CATALOG), 5)
+        self.assertEqual(set(asr.REVISIONS), set(asr.CATALOG) - {"gigaam_v3"})
+        self.assertTrue(all(len(value) == 40 for value in asr.REVISIONS.values()))
+
+    def test_atomic_manifest_and_missing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "models/whisper_turbo"
+            model.mkdir(parents=True)
+            (model / "weights").write_bytes(b"1234")
+            manifest = dict(version="1", key="whisper_turbo", files=[dict(name="weights", size=4)])
+            asr.atomic_json(model / "ready.json", manifest)
+            self.assertEqual(asr.validate_install(root, "whisper_turbo"), model)
+            (model / "weights").write_bytes(b"12")
+            with self.assertRaisesRegex(RuntimeError, "Incomplete"):
+                asr.validate_install(root, "whisper_turbo")
+
+    def test_invalid_manifest_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "models/whisper_turbo"
+            model.mkdir(parents=True)
+            asr.atomic_json(model / "ready.json", dict(version="1", key="whisper_turbo",
+                            files=[dict(name="../escape", size=4)]))
+            with self.assertRaisesRegex(RuntimeError, "Invalid"):
+                asr.validate_install(root, "whisper_turbo")
+
+    def test_download_verifies_and_reuses_cache(self):
+        payload = b"small test model"
+        sha = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as directory, patch.object(asr, "emit"):
+            path = Path(directory) / "weights"
+            with patch.object(asr.urllib.request, "urlopen", return_value=io.BytesIO(payload)) as network:
+                self.assertEqual(asr.fetch("https://example.test/model", path, 0, len(payload), 0, len(payload), sha), len(payload))
+                network.assert_called_once()
+            with patch.object(asr.urllib.request, "urlopen") as network:
+                asr.fetch("https://example.test/model", path, 0, len(payload), 0, len(payload), sha)
+                network.assert_not_called()
+
+    def test_download_failure_never_creates_final_file(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(asr, "emit"), patch.object(asr.time, "sleep"):
+            path = Path(directory) / "weights"
+            with patch.object(asr.urllib.request, "urlopen", side_effect=lambda *a, **kw: io.BytesIO(b"bad")):
+                with self.assertRaisesRegex(RuntimeError, "checksum"):
+                    asr.fetch("https://example.test/model", path, 0, 3, 0, 3, "wrong")
+            self.assertFalse(path.exists())
+
+    def test_segmentation_preserves_every_sample(self):
+        import numpy as np
+        audio = np.arange(16000 * 63, dtype=np.float32)
+        segments = list(asr.chunks(audio))
+        self.assertGreater(len(segments), 1)
+        np.testing.assert_array_equal(np.concatenate([part for part, _ in segments]), audio)
+        self.assertTrue(all(len(part) <= 24 * 16000 for part, _ in segments))
+        self.assertEqual(segments[-1][1], 1)
+        self.assertEqual(list(asr.chunks(np.zeros(0, dtype=np.float32))), [])
+
+    def test_protocol_is_one_json_line(self):
+        output = io.StringIO()
+        with patch.object(asr, "PROTOCOL", output):
+            asr.emit(text="строка\nещё строка")
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(json.loads(output.getvalue())["text"], "строка\nещё строка")
+
+
+if __name__ == "__main__":
+    unittest.main()

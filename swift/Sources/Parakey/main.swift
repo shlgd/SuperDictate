@@ -455,8 +455,13 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
     .serbian: "Serbian",
 ]
 
-enum SpeechModelProfile: String, CaseIterable {
+enum SpeechModelProfile: String, CaseIterable, Sendable {
     case multilingualV3 = "multilingual_v3"
+    case whisperLargeV3 = "whisper_large_v3"
+    case whisperTurbo = "whisper_turbo"
+    case qwenSmall = "qwen_06"
+    case qwenLarge = "qwen_17"
+    case gigaAM = "gigaam_v3"
     // Deprecated production option. Kept only so old saved preferences
     // can be read and migrated back to the supported v3 model.
     case englishUnified = "english_unified"
@@ -464,7 +469,7 @@ enum SpeechModelProfile: String, CaseIterable {
     static let productionDefault: SpeechModelProfile = .multilingualV3
 
     var isProductionSupported: Bool {
-        self == .multilingualV3
+        self != .englishUnified
     }
 
     var productionProfile: SpeechModelProfile {
@@ -472,11 +477,13 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var displayName: String {
+        if isExperimental { return shortName + " (experimental)" }
         switch self {
         case .multilingualV3:
             return "Multilingual (Parakeet TDT v3)"
         case .englishUnified:
             return "English optimized (Parakeet Unified, deprecated)"
+        default: return shortName
         }
     }
 
@@ -486,15 +493,22 @@ enum SpeechModelProfile: String, CaseIterable {
             return "Parakeet TDT v3"
         case .englishUnified:
             return "Parakeet Unified"
+        case .whisperLargeV3: return "Whisper Large-v3"
+        case .whisperTurbo: return "Whisper Large-v3 Turbo"
+        case .qwenSmall: return "Qwen3-ASR 0.6B"
+        case .qwenLarge: return "Qwen3-ASR 1.7B"
+        case .gigaAM: return "GigaAM v3 E2E"
         }
     }
 
     var aboutModelText: String {
+        if isExperimental { return shortName + " · local experimental runtime" }
         switch self {
         case .multilingualV3:
             return "FluidAudio · Parakeet TDT v3 multilingual (CoreML / ANE)"
         case .englishUnified:
             return "FluidAudio · Parakeet Unified English (deprecated)"
+        default: return shortName
         }
     }
 
@@ -503,11 +517,13 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var cacheResetDetail: String {
+        if isExperimental { return "Switch to Parakeet before managing experimental model files." }
         switch self {
         case .multilingualV3:
             return "Parakey will delete the local Parakeet TDT v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
         case .englishUnified:
             return "Parakey will delete the local Parakeet TDT v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
+        default: return ""
         }
     }
 
@@ -521,12 +537,16 @@ enum SpeechModelProfile: String, CaseIterable {
         switch self {
         case .multilingualV3, .englishUnified:
             return 483_256_769
+        default: return 0
         }
     }
 
     var downloadSizeText: String {
         "about 500-700 MB"
     }
+
+    var isExperimental: Bool { self != .multilingualV3 && self != .englishUnified }
+    static var selectable: [Self] { allCases.filter(\.isProductionSupported) }
 }
 
 func productionSpeechModelProfile(rawValue: String?) -> SpeechModelProfile {
@@ -5569,6 +5589,7 @@ private final class AudioConverterInputProvider: @unchecked Sendable {
 
 private enum LoadedSpeechEngine {
     case parakeetV3(AsrManager)
+    case experimental(LocalSpeechWorker)
 }
 
 private struct TranscriptionWorkerResult: Sendable {
@@ -5617,6 +5638,14 @@ actor TranscriptionWorker {
             await unload()
         }
 
+        if profile.isExperimental {
+            let worker = LocalSpeechWorker(profile: profile)
+            try await worker.start()
+            engine = .experimental(worker)
+            loadedProfile = profile
+            ready = true
+            return
+        }
         if speechModelCacheExists(for: profile) {
             log("ASR: verifying + loading cached \(profile.shortName) CoreML weights…")
         } else {
@@ -5664,6 +5693,13 @@ actor TranscriptionWorker {
         inFlight = true
         defer { inFlight = false }
         switch engine {
+        case .experimental(let worker):
+            let started = ProcessInfo.processInfo.systemUptime
+            let text = try await worker.transcribe(samples: samples, language: language?.rawValue)
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            return TranscriptionWorkerResult(text: text, workerQueueSeconds: workerEnteredAt - requestedAt,
+                                             decoderPreparationSeconds: 0, fluidCallSeconds: elapsed,
+                                             fluidProcessingSeconds: elapsed)
         case .parakeetV3(let asr):
             let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
             var state = try TdtDecoderState()
@@ -5695,6 +5731,15 @@ actor TranscriptionWorker {
         defer { inFlight = false }
 
         switch engine {
+        case .experimental(let worker):
+            let started = ProcessInfo.processInfo.systemUptime
+            let samples = try AudioConverter().resampleAudioFile(fileURL)
+            let text = try await worker.transcribe(samples: samples, language: language?.rawValue,
+                                                   progress: progressHandler)
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            return TranscriptionWorkerResult(text: text, workerQueueSeconds: workerEnteredAt - requestedAt,
+                                             decoderPreparationSeconds: 0, fluidCallSeconds: elapsed,
+                                             fluidProcessingSeconds: elapsed)
         case .parakeetV3(let asr):
             let audioFile = try AVAudioFile(forReading: fileURL)
             let duration = audioFile.processingFormat.sampleRate > 0
@@ -5735,6 +5780,11 @@ actor TranscriptionWorker {
     }
 
     func warmUp() async throws -> ASRTimingBreakdown {
+        if case .experimental = engine {
+            return ASRTimingBreakdown(totalSeconds: 0, workerQueueSeconds: 0,
+                                     decoderPreparationSeconds: 0, fluidCallSeconds: 0,
+                                     fluidProcessingSeconds: 0)
+        }
         let samples = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4))
         let requestedAt = ProcessInfo.processInfo.systemUptime
         let transcription = try await transcribe(
@@ -5747,6 +5797,7 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
+        if case .experimental(let worker) = engine { await worker.stop() }
         engine = nil
         loadedProfile = nil
         ready = false
@@ -6541,9 +6592,10 @@ private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
                                     removeFinalPeriod: Bool = false,
-                                    language: DictationLanguage = .auto) -> DictationTextProcessingResult {
+                                    language: DictationLanguage = .auto,
+                                    modelProfile: SpeechModelProfile = .productionDefault) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-    let repaired = SpeechModelTextRepair.apply(to: trimmed, language: language)
+    let repaired = SpeechModelTextRepair.apply(to: trimmed, language: modelProfile.isExperimental ? .english : language)
     let corrected = TranscriptCorrector.apply(to: repaired, corrections: corrections)
 
     let textAfterFillers: String
@@ -10743,6 +10795,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var isTerminating = false
     private var isResettingSpeechModelCache = false
     private var isSwitchingSpeechModel = false
+    private var activeSpeechModelProfile: SpeechModelProfile = .productionDefault
     private var fallbackSpeechModelProfileAfterStartupFailure: SpeechModelProfile?
     private var startupTask: Task<Void, Never>?
     private var updateCheckLoopTask: Task<Void, Never>?
@@ -11167,6 +11220,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         _ = settings.refreshFromDisk()
         let nextInputPreference = settings.inputDevice
+        if settings.speechModelProfile != activeSpeechModelProfile {
+            guard startupTask == nil else { return }
+            fallbackSpeechModelProfileAfterStartupFailure = activeSpeechModelProfile
+            startStartup(reason: "settings speech model change")
+            return
+        }
         hotkey.setHotkey(settings.configuredHotkey)
         hotkey.setEnterHotkey(settings.configuredEnterHotkey)
         hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
@@ -11322,6 +11381,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         prepareForStartupAttempt()
         let speechModelProfile = settings.speechModelProfile
+        if speechModelProfile.isExperimental {
+            if fallbackSpeechModelProfileAfterStartupFailure == nil {
+                fallbackSpeechModelProfileAfterStartupFailure = .productionDefault
+            }
+            setStartupPhase("preparing", title: "Loading \(speechModelProfile.shortName)…")
+        }
 
         // Load ASR FIRST, then audio + hotkey. Reversing this order
         // makes the first-launch CoreML compile of the ANE Encoder
@@ -11360,6 +11425,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard !Task.isCancelled, !isTerminating else { return }
 
                 fallbackSpeechModelProfileAfterStartupFailure = nil
+                activeSpeechModelProfile = speechModelProfile
                 isSpeechModelReady = true
 
                 if !PendingDictationRecovery.pendingURLs().isEmpty {
@@ -11416,7 +11482,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords,
                                                        removeFinalPeriod: settings.removeFinalPeriod,
-                                                       language: settings.dictationLanguage)
+                                                       language: settings.dictationLanguage,
+                                                       modelProfile: settings.speechModelProfile)
                 if !processed.text.isEmpty {
                     addToHistory(
                         processed.text,
@@ -12844,7 +12911,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
                                                            removeFinalPeriod: settings.removeFinalPeriod,
-                                                           language: settings.dictationLanguage)
+                                                           language: settings.dictationLanguage,
+                                                           modelProfile: settings.speechModelProfile)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
                         log("transcript corrections applied: \(processed.appliedCorrectionCount)")
@@ -13041,7 +13109,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
                                                            removeFinalPeriod: settings.removeFinalPeriod,
-                                                           language: settings.dictationLanguage)
+                                                           language: settings.dictationLanguage,
+                                                           modelProfile: settings.speechModelProfile)
                     if !processed.text.isEmpty {
                         addToHistory(
                             processed.text,
@@ -13947,7 +14016,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         corrections: self.settings.transcriptCorrections,
                         removeFillerWords: self.settings.removeFillerWords,
                         removeFinalPeriod: self.settings.removeFinalPeriod,
-                        language: self.settings.dictationLanguage
+                        language: self.settings.dictationLanguage,
+                        modelProfile: self.settings.speechModelProfile
                     ).text
                     guard !processed.isEmpty else {
                         throw NSError(
@@ -16819,6 +16889,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func resetSpeechModelCacheClicked(_ sender: NSMenuItem) {
+        guard !settings.speechModelProfile.isExperimental else { return }
         guard !isRecording,
               !isBusy,
               startupTask == nil,
@@ -17479,6 +17550,8 @@ private enum ParakeySelfTest {
                 try UpdateSigning.validateUpgrade(from: URL(fileURLWithPath: installed),
                                                   to: URL(fileURLWithPath: candidate))
             }
+        case "local-model-protocol":
+            return runSuite("local-model-protocol", testLocalModelProtocol)
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":
@@ -17608,6 +17681,54 @@ private enum ParakeySelfTest {
     private static func fail(_ message: String) -> Int32 {
         print("FAIL self-test: \(message)")
         return EXIT_FAILURE
+    }
+
+    private static func testLocalModelProtocol() throws {
+        final class ResultBox: @unchecked Sendable {
+            let lock = NSLock()
+            var failure: String?
+        }
+        let box = ResultBox()
+        let done = DispatchSemaphore(value: 0)
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("scripts/local-asr-protocol-fixture.py")
+        let process = LocalSpeechProcess(script: fixture)
+        Task.detached {
+            do {
+                let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try Data("test".utf8).write(to: path)
+                defer { try? FileManager.default.removeItem(at: path) }
+                try await process.launch(python: URL(fileURLWithPath: "/usr/bin/python3"),
+                                         command: "serve", profile: .whisperTurbo)
+                let text = try await process.request(path: path, language: "ru", progress: { _ in })
+                guard text == "protocol ok" else { throw localSpeechError("Protocol text mismatch") }
+                do {
+                    _ = try await process.request(path: path, language: "error", progress: { _ in })
+                    throw localSpeechError("Expected fixture error")
+                } catch {
+                    guard error.localizedDescription == "fixture error" else { throw error }
+                }
+                let second = try await process.request(path: path, language: "ru", progress: { _ in })
+                guard second == text else { throw localSpeechError("Worker did not recover after request error") }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { process.cancel() }
+                do {
+                    _ = try await process.request(path: path, language: "hang", progress: { _ in })
+                    throw localSpeechError("Cancelled worker returned a result")
+                } catch {
+                    guard error.localizedDescription.contains("stopped") else { throw error }
+                }
+            } catch {
+                box.lock.withLock { box.failure = error.localizedDescription }
+            }
+            await process.stop()
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + 15) == .success else {
+            process.cancel()
+            throw localSpeechError("Protocol self-test timed out")
+        }
+        if let failure = box.lock.withLock({ box.failure }) { throw localSpeechError(failure) }
     }
 
     private static func testAll() throws {
@@ -18586,6 +18707,16 @@ private enum ParakeySelfTest {
             equals: .multilingualV3,
             "unknown speech model setting should migrate back to v3"
         )
+        for profile in SpeechModelProfile.selectable {
+            try expect(productionSpeechModelProfile(rawValue: profile.rawValue), equals: profile,
+                       "selectable local model must survive preference reload")
+        }
+        try expect(SpeechModelProfile.selectable.count, equals: 6, "six local model options")
+        try expect(LocalSpeechPaths.isInstalled(.multilingualV3), equals: true,
+                   "Parakeet must not require the optional Python runtime")
+        try expect(processedDictationText(rawTranscript: "test <unk>", corrections: [],
+                                         removeFillerWords: false, modelProfile: .whisperTurbo).text,
+                   equals: "test", "Parakeet yo-token repair must not modify another model's text")
 
         try expect(
             speechModelSetupRowState(profile: .multilingualV3,
@@ -22724,6 +22855,7 @@ private enum ControlPanelShortcutKind: Int {
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
+    var speechModelProfile: SpeechModelProfile
     var triggerMode: TriggerMode
     var dictationHotkey: HotkeyChoice
     var alternateCompletionHotkey: HotkeyChoice
@@ -22744,6 +22876,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var showInMenuBar: Bool
 
     init(settings: Settings) {
+        speechModelProfile = settings.speechModelProfile
         triggerMode = settings.triggerMode
         dictationHotkey = settings.configuredHotkey
         alternateCompletionHotkey = settings.configuredEnterHotkey
@@ -22817,6 +22950,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var aiModelField: NSTextField?
     private weak var settingsScrollView: NSScrollView?
     private var pendingAIKey = ""
+    private let localModelDownloads = LocalModelDownloads()
+    private weak var localModelStatusLabel: NSTextField?
+    private weak var localModelProgress: NSProgressIndicator?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -22840,9 +22976,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return true
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        !localModelDownloads.isRunning
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
+        localModelDownloads.cancel()
         hotkeyRecorder?.cancel()
         hotkeyRecorder = nil
         refreshTimer?.invalidate()
@@ -23069,6 +23208,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         root.addArrangedSubview(settingsHeaderView())
         root.addArrangedSubview(separator())
+        root.addArrangedSubview(localSpeechModelSection(draft))
+        root.addArrangedSubview(separator())
         root.addArrangedSubview(menuBarVisibilityRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(hotkeyRow(
@@ -23270,8 +23411,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.spacing = 2
         text.addArrangedSubview(panelLabel(t("Настройки", "Settings"), size: 20, weight: .semibold))
         text.addArrangedSubview(panelLabel(
-            t("Изменения применяются после сохранения — перезапуск модели не нужен.",
-              "Changes apply after saving; the speech model does not need to restart."),
+            t("Изменения применяются после сохранения.",
+              "Changes apply after saving."),
             size: 11.5,
             color: .secondaryLabelColor
         ))
@@ -24263,6 +24404,132 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func localSpeechModelSection(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.addArrangedSubview(popupRow(
+            title: t("Модель распознавания", "Speech recognition model"),
+            detail: t("Локальное распознавание", "Local speech recognition"),
+            selectedValue: draft.speechModelProfile.rawValue,
+            options: SpeechModelProfile.selectable.map { ($0.shortName, $0.rawValue) },
+            action: #selector(localSpeechModelChanged(_:))
+        ))
+        if draft.speechModelProfile.isExperimental {
+            let profile = draft.speechModelProfile
+            let detail: String
+            switch profile {
+            case .whisperLargeV3: detail = t("Около 3 ГБ · MLX / GPU · многоязычная", "About 3 GB · MLX / GPU · multilingual")
+            case .whisperTurbo: detail = t("Около 1,6 ГБ · MLX / GPU · многоязычная", "About 1.6 GB · MLX / GPU · multilingual")
+            case .qwenSmall: detail = t("Около 1 ГБ · MLX / GPU · русский и другие языки", "About 1 GB · MLX / GPU · Russian and other languages")
+            case .qwenLarge: detail = t("Около 2,5 ГБ · MLX / GPU · русский и другие языки", "About 2.5 GB · MLX / GPU · Russian and other languages")
+            default: detail = t("Около 1 ГБ · CPU · русский язык", "About 1 GB · CPU · Russian")
+            }
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.spacing = 10
+            row.addArrangedSubview(panelLabel(detail, size: 11.5, color: .secondaryLabelColor))
+            row.addArrangedSubview(NSView())
+            row.addArrangedSubview(panelButton(
+                LocalSpeechPaths.isInstalled(profile) ? t("Скачать заново", "Download again") : t("Скачать", "Download"),
+                action: #selector(downloadLocalSpeechModel(_:)),
+                enabled: !localModelDownloads.isRunning && profile != settings.speechModelProfile,
+                toolTip: t("Скачать модель и отдельный Python-движок. Текущая диктовка продолжит работать.",
+                           "Download the model and a separate Python runtime. Current dictation keeps working.")))
+            stack.addArrangedSubview(row)
+            let hint = panelLabel(
+                LocalSpeechPaths.isInstalled(profile)
+                    ? t("Скачана. Нажмите «Сохранить», чтобы переключиться. Первая загрузка в память может занять время.",
+                        "Downloaded. Save to switch. Loading into memory for the first time may take a while.")
+                    : t("Экспериментально · нужен Python 3.11+. Движок займёт дополнительное место. Аудио остаётся на Mac.",
+                        "Experimental · requires Python 3.11+. Runtime uses additional disk space. Audio stays on your Mac."),
+                size: 11.5, color: .secondaryLabelColor)
+            hint.maximumNumberOfLines = 3
+            hint.lineBreakMode = .byWordWrapping
+            stack.addArrangedSubview(hint)
+        }
+        if localModelDownloads.profile != nil {
+            let update = localModelDownloads.message
+            let label = panelLabel(localModelDownloadStatus(), size: 11.5,
+                                   color: localModelDownloads.failure == nil ? .secondaryLabelColor : .systemRed)
+            localModelStatusLabel = label
+            label.maximumNumberOfLines = 3
+            label.lineBreakMode = .byWordWrapping
+            stack.addArrangedSubview(label)
+            if localModelDownloads.isRunning {
+                let progress = NSProgressIndicator()
+                localModelProgress = progress
+                progress.style = .bar
+                progress.isIndeterminate = (update?.total ?? 0) == 0
+                progress.maxValue = Double(max(1, update?.total ?? 1))
+                progress.doubleValue = Double(update?.downloaded ?? 0)
+                if progress.isIndeterminate { progress.startAnimation(nil) }
+                progress.widthAnchor.constraint(equalToConstant: 590).isActive = true
+                stack.addArrangedSubview(progress)
+                stack.addArrangedSubview(panelButton(t("Отменить загрузку", "Cancel download"),
+                                                     action: #selector(cancelLocalSpeechDownload(_:)),
+                                                     enabled: true, toolTip: t("Текущая модель останется доступной.", "The current model remains available.")))
+            }
+        }
+        return stack
+    }
+
+    @objc private func localSpeechModelChanged(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let profile = SpeechModelProfile(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.speechModelProfile = profile
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func downloadLocalSpeechModel(_ sender: NSButton) {
+        guard let profile = settingsDraft?.speechModelProfile, profile.isExperimental else { return }
+        localModelDownloads.onChange = { [weak self] in self?.updateLocalModelDownloadStatus() }
+        localModelDownloads.start(profile)
+    }
+
+    private func localModelDownloadStatus() -> String {
+        let update = localModelDownloads.message
+        let status: String
+        if let failure = localModelDownloads.failure {
+            status = t("Ошибка: ", "Error: ") + failure
+        } else {
+            switch update?.phase {
+            case "runtime": status = t("Устанавливаю локальный движок…", "Installing local runtime…")
+            case "listing": status = t("Проверяю список файлов…", "Checking model files…")
+            case "verifying": status = t("Проверяю скачанные файлы…", "Verifying downloaded files…")
+            case "ready": status = t("Готова к выбору", "Ready to select")
+            default:
+                status = String(format: "%.0f / %.0f MB · %.1f MB/s",
+                                Double(update?.downloaded ?? 0) / 1_000_000,
+                                Double(update?.total ?? 0) / 1_000_000,
+                                (update?.speed ?? 0) / 1_000_000)
+            }
+        }
+        return (localModelDownloads.profile?.shortName ?? "") + ": " + status
+    }
+
+    private func updateLocalModelDownloadStatus() {
+        guard localModelDownloads.isRunning, let label = localModelStatusLabel,
+              let progress = localModelProgress else {
+            refreshSettingsWindow()
+            return
+        }
+        // Byte updates must not replace the settings form while the user is typing.
+        label.stringValue = localModelDownloadStatus()
+        let update = localModelDownloads.message
+        progress.isIndeterminate = (update?.total ?? 0) == 0
+        progress.maxValue = Double(max(1, update?.total ?? 1))
+        progress.doubleValue = Double(update?.downloaded ?? 0)
+        if progress.isIndeterminate { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
+    }
+
+    @objc private func cancelLocalSpeechDownload(_ sender: NSButton) {
+        localModelDownloads.cancel()
+    }
+
     private func menuBarVisibilityRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -24459,8 +24726,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: dictationInProgress
                 ? t("Сначала завершите текущую диктовку.",
                     "Finish the current dictation first.")
-                : t("Сохранить и применить настройки без перезапуска модели.",
-                    "Save and apply settings without restarting the speech model.")
+                : t("Сохранить настройки. При смене модели служба ненадолго перезапустится.",
+                    "Save settings. Changing the model briefly restarts the service.")
         )
         save.keyEquivalent = "\r"
         row.addArrangedSubview(save)
@@ -24468,6 +24735,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
+        if draft.speechModelProfile.isExperimental && !LocalSpeechPaths.isInstalled(draft.speechModelProfile) {
+            return t("Сначала скачайте выбранную модель.", "Download the selected model first.")
+        }
         let shortcuts = draft.alternateCompletionEnabled
             ? [draft.dictationHotkey, draft.alternateCompletionHotkey, draft.historyHotkey]
             : [draft.dictationHotkey, draft.historyHotkey]
@@ -25356,6 +25626,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         settings.setConfiguredHotkey(draft.dictationHotkey)
+        settings.speechModelProfile = draft.speechModelProfile
         settings.triggerMode = draft.triggerMode
         settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)

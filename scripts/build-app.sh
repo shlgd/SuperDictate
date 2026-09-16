@@ -62,6 +62,7 @@ cp "$BIN" "$STAGE_APP/Contents/MacOS/SuperDictate"
 cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
+cp "$ROOT_DIR/swift/Resources/local-asr.py" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
 chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
 
