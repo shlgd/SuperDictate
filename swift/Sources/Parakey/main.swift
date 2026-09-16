@@ -2225,6 +2225,37 @@ func superDictateApplicationSupportDirectory() throws -> URL {
     return url
 }
 
+private final class AgentInstanceLock {
+    private let descriptor: Int32
+
+    private init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    static func acquire(at url: URL) throws -> AgentInstanceLock? {
+        let fd = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw posixError(errno) }
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            close(fd)
+            if code == EWOULDBLOCK { return nil }
+            throw posixError(code)
+        }
+        return AgentInstanceLock(descriptor: fd)
+    }
+
+    private static func posixError(_ code: Int32) -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+    }
+
+    deinit {
+        // Never unlink the file: another process may already be waiting on its inode.
+        // Closing (or process death) releases the lock; exec children cannot inherit it.
+        close(descriptor)
+    }
+}
+
 struct AgentRuntimeState: Codable {
     var status: String
     var detail: String
@@ -4345,6 +4376,7 @@ private struct HotkeyShortcutState {
             guard event.keycode == shortcut.keycode else { return .pass }
             if event.typeRawValue == CGEventType.keyDown.rawValue {
                 guard !event.isAutoRepeat else { return shortcutDown ? .suppressOnly : .pass }
+                guard !shortcutDown else { return .suppressOnly }
                 let modifiers = event.flags.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
                 guard modifiers == shortcut.requiredModifiers else { return .pass }
                 shortcutDown = true
@@ -4505,9 +4537,7 @@ private struct HotkeyTransitionState {
         case .press:
             standardShortcutState.reset()
             enterShortcutState.reset()
-            if !isRecording {
-                toggleActive = false
-            }
+            // Opening history does not cancel recording, including a queued start.
             return HotkeyTransitionResult(suppress: shortcutResult.suppress,
                                           actions: [.showHistory])
         case .release, .suppress:
@@ -12704,6 +12734,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             recoveryJournal?.finish()
             PendingDictationRecovery.remove(recoveryJournal?.url)
             stopAudioEngineImmediately()
+            hotkey.resetToggleState()
             log("recording start failed: \(error.localizedDescription)")
             signalDictationFailure()
             return
@@ -17388,9 +17419,27 @@ private enum SelfTestFailure: Error, CustomStringConvertible {
 private enum ParakeySelfTest {
     static func run(arguments: [String]) -> Int32? {
         guard arguments.count >= 2, arguments[0] == "--self-test" else { return nil }
+        if arguments[1] == "agent-lock-probe", arguments.count == 4 {
+            do {
+                guard let lock = try AgentInstanceLock.acquire(at: URL(fileURLWithPath: arguments[2])) else {
+                    return 73
+                }
+                return withExtendedLifetime(lock) {
+                    if arguments[3] == "hold" {
+                        FileHandle.standardOutput.write(Data("locked\n".utf8))
+                        Thread.sleep(forTimeInterval: 30)
+                    }
+                    return EXIT_SUCCESS
+                }
+            } catch {
+                return EXIT_FAILURE
+            }
+        }
         guard arguments.count == 2 else { return fail("usage") }
 
         switch arguments[1] {
+        case "agent-lock":
+            return runSuite("agent-lock", testAgentInstanceLock)
         case "hotkey":
             return runSuite("hotkey", testHotkey)
         case "readiness":
@@ -17457,6 +17506,94 @@ private enum ParakeySelfTest {
         }
     }
 
+    private static func testAgentInstanceLock() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SuperDictate-lock-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let url = folder.appendingPathComponent("agent.lock")
+
+        func require(_ value: Bool, _ message: String) throws {
+            if !value {
+                throw NSError(domain: "SuperDictate.LockTest", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: message])
+            }
+        }
+        func child(_ mode: String = "probe") -> Process {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            process.arguments = ["--self-test", "agent-lock-probe", url.path, mode]
+            return process
+        }
+        func probe() throws -> Int32 {
+            let process = child()
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+
+        // Contention must be tested across processes, not just separate Swift objects.
+        var owner = try AgentInstanceLock.acquire(at: url)
+        try require(owner != nil, "first agent must acquire lock")
+        try withExtendedLifetime(owner) {
+            try require(try probe() == 73, "second agent must be refused")
+            try require(try probe() == 73, "refused agent must not release owner's lock")
+        }
+        owner = nil
+        try require(try probe() == 0, "normal exit must allow restart with the existing lock file")
+
+        let holder = child("hold")
+        let ready = Pipe()
+        holder.standardOutput = ready
+        try holder.run()
+        try ready.fileHandleForWriting.close()
+        defer {
+            if holder.isRunning { kill(holder.processIdentifier, SIGKILL) }
+            holder.waitUntilExit()
+        }
+        try require(ready.fileHandleForReading.availableData == Data("locked\n".utf8),
+                    "child must acquire lock before crash test")
+        try require(try probe() == 73, "live child must exclude other agents")
+        kill(holder.processIdentifier, SIGKILL)
+        holder.waitUntilExit()
+        try require(try probe() == 0, "SIGKILL must not leave a stale lock")
+
+        var contenders: [(Process, Pipe)] = []
+        defer {
+            for (process, _) in contenders {
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                process.waitUntilExit()
+            }
+        }
+        for _ in 0..<6 {
+            let process = child("hold")
+            let output = Pipe()
+            process.standardOutput = output
+            try process.run()
+            contenders.append((process, output))
+            try output.fileHandleForWriting.close()
+        }
+        var winners = 0
+        for (process, output) in contenders {
+            let data = output.fileHandleForReading.availableData
+            if data == Data("locked\n".utf8) {
+                winners += 1
+            } else {
+                process.waitUntilExit()
+                try require(process.terminationStatus == 73, "racing loser must exit as duplicate")
+            }
+        }
+        try require(winners == 1, "simultaneous launches must have exactly one owner")
+
+        let invalid = folder.appendingPathComponent("missing/agent.lock")
+        do {
+            _ = try AgentInstanceLock.acquire(at: invalid)
+            try require(false, "file errors must not silently allow startup")
+        } catch let error as NSError {
+            try require(error.domain == NSPOSIXErrorDomain, "expected POSIX open error")
+        }
+    }
+
     private static func runSuite(_ name: String, _ body: () throws -> Void) -> Int32 {
         do {
             try body()
@@ -17474,6 +17611,7 @@ private enum ParakeySelfTest {
     }
 
     private static func testAll() throws {
+        try testAgentInstanceLock()
         try testHotkey()
         try testReadiness()
         try testPasteSuffixFormatting()
@@ -18118,6 +18256,9 @@ private enum ParakeySelfTest {
         try testEnterShortcutModeSelection()
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
         try testToggleGatedPressDoesNotFlipToggleState()
+        try testDuplicateKeyDownDoesNotToggleTwice()
+        try testQueuedHistoryPreservesPendingToggle()
+        try testFailedStartCanRetryOnNextPress()
         try testEscapePassesThroughWhenNotRecording()
         try testEscapeSuppressesCancelRepeatAndKeyUpWhileRecording()
     }
@@ -22423,11 +22564,13 @@ private enum ParakeySelfTest {
             equals: HotkeyTransitionResult(suppress: true, actions: [.rejectedBusyPress]),
             "gated toggle press should suppress without flipping state but emit rejectedBusyPress for feedback"
         )
+        _ = state.transition(for: event(.keyUp, keycode: f5.keycode), hotkey: f5, triggerMode: .toggle, isRecording: false)
         try expect(
             state.transition(for: event(.keyDown, keycode: f5.keycode), hotkey: f5, triggerMode: .toggle, isRecording: false, canStartRecording: true),
             equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
             "press after a gated press should start immediately"
         )
+        _ = state.transition(for: event(.keyUp, keycode: f5.keycode), hotkey: f5, triggerMode: .toggle, isRecording: true)
         // The stop-side press must NOT be gated: once a recording is
         // active (canStartRecording is false by definition), the
         // press still has to stop it.
@@ -22436,6 +22579,7 @@ private enum ParakeySelfTest {
             equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
             "gate must not block the toggle press that stops a recording"
         )
+        _ = state.transition(for: event(.keyUp, keycode: f5.keycode), hotkey: f5, triggerMode: .toggle, isRecording: false)
         // Hold mode ignores the gate entirely — handlePress discarding
         // the press leaves no state behind in hold mode.
         try expect(
@@ -22443,6 +22587,51 @@ private enum ParakeySelfTest {
             equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
             "hold-mode press should be unaffected by the gate"
         )
+    }
+
+    private static func testDuplicateKeyDownDoesNotToggleTwice() throws {
+        for keycode: CGKeyCode in [96, 179] {
+            var state = HotkeyTransitionState()
+            let key = hotkeyChoice(forKeycode: keycode)
+            let down = event(.keyDown, keycode: keycode)
+            try expect(state.transition(for: down, hotkey: key, triggerMode: .toggle, isRecording: false).actions,
+                       equals: [.press], "first keyDown starts recording")
+            try expect(state.transition(for: down, hotkey: key, triggerMode: .toggle, isRecording: true).actions,
+                       equals: [], "duplicate non-autorepeat keyDown must not stop recording")
+            _ = state.transition(for: event(.keyUp, keycode: keycode), hotkey: key, triggerMode: .toggle, isRecording: true)
+            try expect(state.transition(for: down, hotkey: key, triggerMode: .toggle, isRecording: true).actions,
+                       equals: [.release], "a new physical press must still stop immediately")
+        }
+    }
+
+    private static func testQueuedHistoryPreservesPendingToggle() throws {
+        var state = HotkeyTransitionState()
+        let key = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        let events = [
+            event(.flagsChanged, keycode: RIGHT_COMMAND_KEYCODE, flags: CGEventFlags.maskCommand.rawValue),
+            event(.flagsChanged, keycode: 60, flags: CGEventFlags([.maskCommand, .maskShift]).rawValue),
+            event(.flagsChanged, keycode: RIGHT_COMMAND_KEYCODE, flags: CGEventFlags.maskShift.rawValue),
+            event(.flagsChanged, keycode: 60, flags: 0),
+        ]
+        var actions: [HotkeyTransitionAction] = []
+        // Event-tap callbacks can precede execution of the queued MainActor actions.
+        for item in events {
+            actions += state.transition(for: item, hotkey: key, triggerMode: .toggle, isRecording: false).actions
+        }
+        try expect(actions, equals: [.press, .showHistory], "history must preserve the queued recording action")
+        let stop = state.transition(for: events[0], hotkey: key, triggerMode: .toggle,
+                                    isRecording: true, canStartRecording: false)
+        try expect(stop.actions, equals: [.release], "Command must stop recording after queued history actions")
+    }
+
+    private static func testFailedStartCanRetryOnNextPress() throws {
+        var state = HotkeyTransitionState()
+        let key = hotkeyChoice(forKeycode: 179)
+        _ = state.transition(for: event(.keyDown, keycode: 179), hotkey: key, triggerMode: .toggle, isRecording: false)
+        state.resetToggleState()
+        _ = state.transition(for: event(.keyUp, keycode: 179), hotkey: key, triggerMode: .toggle, isRecording: false)
+        try expect(state.transition(for: event(.keyDown, keycode: 179), hotkey: key, triggerMode: .toggle, isRecording: false).actions,
+                   equals: [.press], "failed recording start must allow retry on the very next press")
     }
 
     private static func testEscapePassesThroughWhenNotRecording() throws {
@@ -25374,6 +25563,18 @@ if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) 
     app.delegate = delegate
     app.run()
 } else if launchArguments.contains(AGENT_ARGUMENT) {
+    let instanceLock: AgentInstanceLock
+    do {
+        let url = try superDictateApplicationSupportDirectory().appendingPathComponent("Agent.lock")
+        guard let acquired = try AgentInstanceLock.acquire(at: url) else {
+            log("agent startup skipped: another agent holds the instance lock")
+            exit(EXIT_SUCCESS)
+        }
+        instanceLock = acquired
+    } catch {
+        log("agent startup refused: cannot acquire instance lock: \(error.localizedDescription)")
+        exit(EXIT_FAILURE)
+    }
     app.setActivationPolicy(.accessory)
     let delegate = ParakeyApp()
     app.delegate = delegate
@@ -25382,7 +25583,9 @@ if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) 
     // Runs after NSApplication.shared is initialised so NSAlert.runModal
     // has its event loop.
     refuseHostileRegistryEnvironmentAndExit()
-    app.run()
+    withExtendedLifetime(instanceLock) {
+        app.run()
+    }
 } else {
     let delegate = SuperDictateControlPanelApp()
     app.delegate = delegate
