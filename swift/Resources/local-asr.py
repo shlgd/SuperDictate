@@ -1,6 +1,8 @@
 """Optional local ASR runtime. No audio leaves this process or this computer."""
 import argparse
 import contextlib
+import fcntl
+import gc
 import hashlib
 import json
 import os
@@ -29,6 +31,7 @@ REVISIONS = {
 }
 GIGA_REVISION = "7447938d791c4f3e643386ee22c33777004293a5"
 RUNTIME_VERSION = "1"
+ENVIRONMENT_VERSION = "2"
 PROTOCOL = sys.stdout
 child = None
 
@@ -44,14 +47,11 @@ def atomic_json(path, values):
     temporary.replace(path)
 
 
-def watch_parent():
-    parent = os.getppid()
+def watch_parent(parent):
     while True:
         time.sleep(1)
         if os.getppid() != parent:
-            if child is not None and child.poll() is None:
-                child.kill()
-            os._exit(1)
+            os.killpg(os.getpgrp(), signal.SIGKILL)
 
 
 def checked_run(arguments):
@@ -60,7 +60,7 @@ def checked_run(arguments):
     try:
         code = child.wait(timeout=1200)
         if code:
-            raise RuntimeError(f"Runtime setup failed (exit {code}). See local-models.log.")
+            raise RuntimeError(f"Runtime setup failed (exit {code}). See installation.log.")
     finally:
         if child.poll() is None:
             child.kill()
@@ -69,22 +69,32 @@ def checked_run(arguments):
 
 
 def bootstrap(root, key):
-    if sys.version_info < (3, 11):
-        raise RuntimeError("Experimental models require Python 3.11 or newer.")
-    engine, _ = CATALOG[key]
-    environment = root / ("runtime-giga" if engine == "gigaam" else "runtime-mlx")
+    environment = root / "runtime-v2"
     marker = environment / "runtime-version"
-    if marker.exists() and marker.read_text() == RUNTIME_VERSION:
+    if marker.exists() and marker.read_text() == ENVIRONMENT_VERSION:
         return environment / "bin/python3"
     emit(phase="runtime")
-    venv.EnvBuilder(with_pip=True).create(environment)
-    python = environment / "bin/python3"
-    packages = (["mlx-audio[stt]==0.5.4", "mlx-whisper==0.4.3"] if engine != "gigaam" else [
+    staging = root / ".runtime-stage"
+    shutil.rmtree(staging, ignore_errors=True)
+    packages = ["mlx-audio[stt]==0.5.4", "mlx-whisper==0.4.3",
         f"gigaam[torch] @ https://github.com/salute-developers/GigaAM/archive/{GIGA_REVISION}.zip",
-        "torch==2.14.0", "torchaudio==2.14.0",
-    ])
-    checked_run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", *packages])
-    marker.write_text(RUNTIME_VERSION)
+        "torch==2.10.0", "torchaudio==2.10.0",
+    ]
+    try:
+        venv.EnvBuilder(with_pip=True).create(staging)
+        python = staging / "bin/python3"
+        checked_run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--no-compile", *packages])
+        checked_run([str(python), "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"])
+        (staging / "runtime-version").write_text(ENVIRONMENT_VERSION)
+        if environment.exists():
+            shutil.rmtree(environment)
+        staging.replace(environment)
+        # Version-one environments are not used by any worker in this build.
+        for old in ("runtime-mlx", "runtime-giga"):
+            shutil.rmtree(root / old, ignore_errors=True)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    python = environment / "bin/python3"
     return python
 
 
@@ -129,7 +139,10 @@ def fetch(url, path, completed, total, started, expected_size=None, sha=None, tr
                 raise RuntimeError("Model checksum mismatch")
             partial.replace(path)
             return downloaded
-        except Exception:
+        except BaseException as error:
+            partial.unlink(missing_ok=True)
+            if not isinstance(error, Exception):
+                raise
             if attempt == 2:
                 raise
             time.sleep(attempt + 1)
@@ -140,7 +153,6 @@ def download(root, key):
     destination = root / "models" / key
     destination.mkdir(parents=True, exist_ok=True)
     ready = destination / "ready.json"
-    ready.unlink(missing_ok=True)
     emit(phase="listing")
     if engine == "gigaam":
         base = "https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM"
@@ -231,11 +243,14 @@ def serve(root, key):
         import mlx_whisper
         import mlx.core as mx
         from mlx_whisper.transcribe import ModelHolder
+        mx.set_cache_limit(128 * 1024 * 1024)
         ModelHolder.get_model(str(directory), mx.float16)
         def transcribe(audio, language):
             return mlx_whisper.transcribe(audio, path_or_hf_repo=str(directory), language=language,
                                           temperature=0, verbose=None)["text"]
     elif engine == "qwen":
+        import mlx.core as mx
+        mx.set_cache_limit(128 * 1024 * 1024)
         from mlx_audio.stt import load
         model = load(str(directory))
         languages = {"ru": "Russian", "en": "English", "fr": "French", "de": "German",
@@ -258,27 +273,42 @@ def serve(root, key):
                 return model._decode(encoded, encoded_lengths, lengths)[0][0]
     emit(ready=True)
     for line in sys.stdin:
+        audio = segment = pieces = None
+        response = None
         try:
             request = json.loads(line)
-            audio = np.fromfile(request["path"], dtype="<f4")
-            if not len(audio):
-                emit(text="")
+            if Path(request["path"]).stat().st_size == 0:
+                response = dict(text="")
                 continue
+            audio = np.memmap(request["path"], dtype="<f4", mode="r")
             pieces = []
             for segment, fraction in chunks(audio):
                 pieces.append(transcribe(segment, request.get("language")))
                 emit(progress=fraction)
-            emit(text=" ".join(p.strip() for p in pieces if p.strip()))
+            response = dict(text=" ".join(p.strip() for p in pieces if p.strip()))
         except Exception as error:
-            emit(error=str(error))
+            response = dict(error=str(error))
+        finally:
+            # A slice keeps its parent mapping alive: release slices before the mapping.
+            segment = pieces = None
+            if audio is not None:
+                audio._mmap.close()
+            audio = None
+            gc.collect()
+            if engine != "gigaam":
+                mx.clear_cache()
+            if response is not None:
+                emit(**response)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["install", "download", "serve"])
+    parser.add_argument("command", choices=["prepare", "install", "download", "serve"])
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--model", choices=CATALOG, required=True)
     args = parser.parse_args()
+    if os.getpgrp() != os.getpid():
+        os.setpgid(0, 0)
     args.root.mkdir(parents=True, exist_ok=True)
     def cancel(signum, frame):
         if child is not None and child.poll() is None:
@@ -286,15 +316,35 @@ def main():
             child.wait()
         sys.exit(1)
     signal.signal(signal.SIGTERM, cancel)
-    threading.Thread(target=watch_parent, daemon=True).start()
+    threading.Thread(target=watch_parent, args=(os.getppid(),), daemon=True).start()
     with contextlib.redirect_stdout(sys.stderr):
-        if args.command == "install":
-            python = bootstrap(args.root, args.model)
-            os.execv(str(python), [str(python), "-u", __file__, "download", "--root", str(args.root), "--model", args.model])
-        elif args.command == "download":
-            download(args.root, args.model)
-        else:
+        if args.command == "serve":
             serve(args.root, args.model)
+            return
+        inherited = os.environ.pop("SUPERDICTATE_INSTALL_LOCK_FD", None)
+        lock = os.fdopen(int(inherited), "w") if inherited else (args.root / ".install.lock").open("w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if args.command in ("install", "prepare"):
+                python = bootstrap(args.root, args.model)
+                if args.command == "prepare":
+                    checked_run([str(python), "-c", "import ssl, mlx.core, mlx_audio.stt, mlx_whisper, gigaam; print('Relocated runtime OK')"])
+                    emit(phase="runtime-ready")
+                    return
+                # Keep the lock across exec so cleanup cannot erase this installation.
+                os.set_inheritable(lock.fileno(), True)
+                os.environ["SUPERDICTATE_INSTALL_LOCK_FD"] = str(lock.fileno())
+                os.execv(str(python), [str(python), "-u", __file__, "download", "--root", str(args.root), "--model", args.model])
+            else:
+                download(args.root, args.model)
+        finally:
+            lock.close()
+            destination = args.root / "models" / args.model
+            for partial in destination.glob("*.part"):
+                partial.unlink(missing_ok=True)
+            # Failed first downloads should not keep complete-but-unusable gigabytes.
+            if destination.exists() and not (destination / "ready.json").exists():
+                shutil.rmtree(destination)
 
 
 if __name__ == "__main__":

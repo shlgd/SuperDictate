@@ -477,7 +477,7 @@ enum SpeechModelProfile: String, CaseIterable, Sendable {
     }
 
     var displayName: String {
-        if isExperimental { return shortName + " (experimental)" }
+        if isExperimental { return shortName }
         switch self {
         case .multilingualV3:
             return "Multilingual (Parakeet TDT v3)"
@@ -502,7 +502,7 @@ enum SpeechModelProfile: String, CaseIterable, Sendable {
     }
 
     var aboutModelText: String {
-        if isExperimental { return shortName + " · local experimental runtime" }
+        if isExperimental { return shortName + " · local managed runtime" }
         switch self {
         case .multilingualV3:
             return "FluidAudio · Parakeet TDT v3 multilingual (CoreML / ANE)"
@@ -17552,6 +17552,77 @@ private enum ParakeySelfTest {
             }
         case "local-model-protocol":
             return runSuite("local-model-protocol", testLocalModelProtocol)
+        case "managed-runtime":
+            return runSuite("managed-runtime") {
+                try asyncLocalModelTest {
+                    let python = try await ManagedSpeechRuntime.ensure { update in
+                        print("Runtime: \(update.phase ?? "") \(update.downloaded ?? 0)/\(update.total ?? 0)")
+                    }
+                    let process = LocalSpeechProcess()
+                    try await process.launch(python: python, command: "prepare", profile: .qwenSmall)
+                    await process.stop()
+                    print("Managed interpreter and all engine imports verified without system Python")
+                }
+            }
+        case "managed-bootstrap":
+            return runSuite("managed-bootstrap") {
+                try asyncLocalModelTest {
+                    let root = FileManager.default.temporaryDirectory.appendingPathComponent("runtime-check-\(UUID().uuidString)")
+                    defer { try? FileManager.default.removeItem(at: root) }
+                    let python = try await ManagedSpeechRuntime.ensure(root: root) { update in
+                        print("Bootstrap: \(update.downloaded ?? 0)/\(update.total ?? 0)")
+                    }
+                    let cached = try await ManagedSpeechRuntime.ensure(root: root) { _ in
+                        assertionFailure("Cached runtime must not download again")
+                    }
+                    guard cached == python else { throw localSpeechError("Runtime cache was not reused") }
+                    let process = Process()
+                    process.executableURL = python
+                    process.arguments = ["-I", "-c", "import sys,ssl; print(sys.executable); print(ssl.OPENSSL_VERSION)"]
+                    process.environment = ["PATH": "/usr/bin:/bin", "HOME": root.path]
+                    try process.run()
+                    process.waitUntilExit()
+                    guard process.terminationStatus == 0 else { throw localSpeechError("Standalone Python failed without user environment") }
+                    let entries = try FileManager.default.contentsOfDirectory(atPath: root.path)
+                    guard !entries.contains(where: { $0.hasPrefix(".python-stage-") }) else {
+                        throw localSpeechError("Bootstrap left staging files")
+                    }
+                }
+            }
+        case "local-model-smoke":
+            return runSuite("local-model-smoke") {
+                try asyncLocalModelTest {
+                    let python = try await ManagedSpeechRuntime.ensure { _ in }
+                    let download = LocalSpeechProcess()
+                    try await download.launch(python: python, command: "install", profile: .qwenSmall) { update in
+                        print("Model: \(update.phase ?? "") \(update.downloaded ?? 0)/\(update.total ?? 0)")
+                    }
+                    await download.stop()
+                    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("local-asr-smoke-\(UUID().uuidString)")
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    defer { try? FileManager.default.removeItem(at: directory) }
+                    let audio = directory.appendingPathComponent("test.aiff")
+                    let say = Process()
+                    say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+                    say.arguments = ["-v", "Milena", "-o", audio.path, "Проверяем локальное распознавание речи. Всё работает без отправки звука на сервер."]
+                    try say.run()
+                    say.waitUntilExit()
+                    guard say.terminationStatus == 0 else { throw localSpeechError("Could not generate the smoke fixture") }
+                    let samples = try AudioConverter().resampleAudioFile(audio)
+                    let worker = LocalSpeechWorker(profile: .qwenSmall)
+                    do {
+                        try await worker.start()
+                        for iteration in 0..<6 {
+                            let text = try await worker.transcribe(samples: samples, language: "ru")
+                            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                                throw localSpeechError("Smoke test returned no speech")
+                            }
+                            print("Inference \(iteration): \(text)")
+                        }
+                        await worker.stop()
+                    } catch { await worker.stop(); throw error }
+                }
+            }
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":
@@ -17731,8 +17802,22 @@ private enum ParakeySelfTest {
         if let failure = box.lock.withLock({ box.failure }) { throw localSpeechError(failure) }
     }
 
+    private static func asyncLocalModelTest(_ body: @escaping @Sendable () async throws -> Void) throws {
+        final class ResultBox: @unchecked Sendable { let lock = NSLock(); var failure: String? }
+        let box = ResultBox()
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            do { try await body() }
+            catch { box.lock.withLock { box.failure = error.localizedDescription } }
+            done.signal()
+        }
+        done.wait()
+        if let failure = box.lock.withLock({ box.failure }) { throw localSpeechError(failure) }
+    }
+
     private static func testAll() throws {
         try testAgentInstanceLock()
+        try testLocalSpeechStorage()
         try testHotkey()
         try testReadiness()
         try testPasteSuffixFormatting()
@@ -17755,6 +17840,38 @@ private enum ParakeySelfTest {
         try testPrivateLogAppend()
         try testDiagnostics()
         try testInsertionTargetTracking()
+    }
+
+    private static func testLocalSpeechStorage() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("speech-storage-test-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let model = root.appendingPathComponent("models/qwen_06")
+        try fm.createDirectory(at: model, withIntermediateDirectories: true)
+        try Data().write(to: model.appendingPathComponent("ready.json"))
+        try Data().write(to: model.appendingPathComponent("weights.part"))
+        let incomplete = root.appendingPathComponent("models/qwen_17")
+        try fm.createDirectory(at: incomplete, withIntermediateDirectories: true)
+        let activeSession = root.appendingPathComponent("tmp/session-\(getpid())-keep")
+        let staleSession = root.appendingPathComponent("tmp/session-2147483647-delete")
+        for path in [activeSession, staleSession, root.appendingPathComponent("runtime-v2")] {
+            try fm.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        try LocalSpeechStorage.cleanupAbandonedFiles(root: root)
+        try expect(fm.fileExists(atPath: incomplete.path), equals: false, "incomplete model must be reclaimed")
+        try expect(fm.fileExists(atPath: model.path), equals: true, "completed model must be kept")
+        try expect(fm.fileExists(atPath: model.appendingPathComponent("weights.part").path), equals: false, "partial download must be removed")
+        try expect(fm.fileExists(atPath: activeSession.path), equals: true, "live process temp directory must be kept")
+        try expect(fm.fileExists(atPath: staleSession.path), equals: false, "dead process temp directory must be removed")
+        do {
+            try LocalSpeechStorage.remove(.qwenSmall, active: .qwenSmall, root: root)
+            throw SelfTestFailure.failed("active model deletion must fail")
+        } catch let error as NSError where error.domain == "SuperDictate.LocalASR" {}
+        try LocalSpeechStorage.remove(.qwenSmall, active: .multilingualV3, root: root)
+        try expect(fm.fileExists(atPath: model.path), equals: false, "selected model must be removed")
+        try expect(fm.fileExists(atPath: root.appendingPathComponent("runtime-v2").path), equals: false,
+                   "last model deletion must reclaim shared runtime")
+        try expect(fm.fileExists(atPath: activeSession.path), equals: true, "model deletion must leave active temporary files alone")
     }
 
     private static func testAICleanup() throws {
@@ -24438,12 +24555,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 toolTip: t("Скачать модель и отдельный Python-движок. Текущая диктовка продолжит работать.",
                            "Download the model and a separate Python runtime. Current dictation keeps working.")))
             stack.addArrangedSubview(row)
+            if LocalSpeechPaths.isInstalled(profile) {
+                stack.addArrangedSubview(panelButton(t("Удалить модель", "Delete model"),
+                    action: #selector(removeLocalSpeechModel(_:)),
+                    enabled: !localModelDownloads.isRunning && profile != settings.speechModelProfile,
+                    toolTip: t("Удалить скачанные файлы. Активную модель сначала нужно переключить.",
+                               "Delete downloaded files. Switch away from an active model first.")))
+            }
             let hint = panelLabel(
                 LocalSpeechPaths.isInstalled(profile)
                     ? t("Скачана. Нажмите «Сохранить», чтобы переключиться. Первая загрузка в память может занять время.",
                         "Downloaded. Save to switch. Loading into memory for the first time may take a while.")
-                    : t("Экспериментально · нужен Python 3.11+. Движок займёт дополнительное место. Аудио остаётся на Mac.",
-                        "Experimental · requires Python 3.11+. Runtime uses additional disk space. Audio stays on your Mac."),
+                    : t("Всё необходимое установится автоматически. Общий движок скачивается один раз. Аудио остаётся на Mac.",
+                        "Everything is installed automatically. The shared runtime downloads once. Audio stays on your Mac."),
                 size: 11.5, color: .secondaryLabelColor)
             hint.maximumNumberOfLines = 3
             hint.lineBreakMode = .byWordWrapping
@@ -24490,6 +24614,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         localModelDownloads.start(profile)
     }
 
+    @objc private func removeLocalSpeechModel(_ sender: NSButton) {
+        guard let profile = settingsDraft?.speechModelProfile, profile != settings.speechModelProfile else { return }
+        let alert = NSAlert()
+        alert.messageText = t("Удалить \(profile.shortName)?", "Delete \(profile.shortName)?")
+        alert.informativeText = t("Записи и история сохранятся. Модель можно скачать заново. При удалении последней дополнительной модели удаляется и её общий движок.",
+                                 "Recordings and history are kept. You can download the model again. Removing the last additional model also removes its shared runtime.")
+        alert.addButton(withTitle: t("Удалить", "Delete"))
+        alert.addButton(withTitle: t("Отмена", "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        localModelDownloads.onChange = { [weak self] in self?.updateLocalModelDownloadStatus() }
+        localModelDownloads.remove(profile, active: settings.speechModelProfile)
+    }
+
     private func localModelDownloadStatus() -> String {
         let update = localModelDownloads.message
         let status: String
@@ -24497,7 +24634,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             status = t("Ошибка: ", "Error: ") + failure
         } else {
             switch update?.phase {
+            case "interpreter":
+                status = t("Загружаю компоненты… ", "Downloading components… ")
+                    + String(format: "%.1f / %.1f MB", Double(update?.downloaded ?? 0) / 1_000_000,
+                             Double(update?.total ?? 0) / 1_000_000)
+            case "runtime-verifying": status = t("Проверяю компоненты…", "Verifying components…")
             case "runtime": status = t("Устанавливаю локальный движок…", "Installing local runtime…")
+            case "cancelled": status = t("Загрузка отменена", "Download cancelled")
+            case "removing": status = t("Удаляю файлы…", "Removing files…")
+            case "removed": status = t("Файлы удалены", "Files removed")
             case "listing": status = t("Проверяю список файлов…", "Checking model files…")
             case "verifying": status = t("Проверяю скачанные файлы…", "Verifying downloaded files…")
             case "ready": status = t("Готова к выбору", "Ready to select")
@@ -24735,6 +24880,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
+        if localModelDownloads.removing { return t("Дождитесь удаления модели.", "Wait for model removal to finish.") }
         if draft.speechModelProfile.isExperimental && !LocalSpeechPaths.isInstalled(draft.speechModelProfile) {
             return t("Сначала скачайте выбранную модель.", "Download the selected model first.")
         }

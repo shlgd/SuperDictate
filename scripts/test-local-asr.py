@@ -62,6 +62,31 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "checksum"):
                     asr.fetch("https://example.test/model", path, 0, 3, 0, 3, "wrong")
             self.assertFalse(path.exists())
+            self.assertFalse(path.with_suffix(".part").exists())
+
+    def test_runtime_failure_removes_staging(self):
+        def fake_environment(path):
+            path.mkdir()
+            (path / "partial").write_bytes(b"unfinished")
+        with tempfile.TemporaryDirectory() as directory, patch.object(asr, "emit"):
+            root = Path(directory)
+            with patch.object(asr.venv.EnvBuilder, "create", side_effect=fake_environment), \
+                 patch.object(asr, "checked_run", side_effect=RuntimeError("network error")):
+                with self.assertRaisesRegex(RuntimeError, "network error"):
+                    asr.bootstrap(root, "qwen_06")
+            self.assertFalse((root / ".runtime-stage").exists())
+            self.assertFalse((root / "runtime-v2").exists())
+
+    def test_runtime_is_shared_and_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = root / "runtime-v2"
+            environment.mkdir()
+            (environment / "runtime-version").write_text("2")
+            with patch.object(asr, "checked_run") as install:
+                for key in asr.CATALOG:
+                    self.assertEqual(asr.bootstrap(root, key), environment / "bin/python3")
+                install.assert_not_called()
 
     def test_segmentation_preserves_every_sample(self):
         import numpy as np
