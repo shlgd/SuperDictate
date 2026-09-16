@@ -8482,6 +8482,7 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
     case extractionFailed(String)
     case invalidBundle(String)
     case appNotWritable
+    case signingIdentityChanged
 
     var errorDescription: String? { message(language: .russian) }
 
@@ -8506,6 +8507,8 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
                 return "The new application failed verification: \(detail)"
             case .appNotWritable:
                 return "SuperDictate cannot replace the application in Applications. Run the regular installer once."
+            case .signingIdentityChanged:
+                return "The update changes the app's signing identity and may invalidate macOS permissions. The installed app was kept."
             }
         }
         switch self {
@@ -8527,6 +8530,8 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
             return "Проверка нового приложения не пройдена: \(detail)"
         case .appNotWritable:
             return "SuperDictate не может заменить приложение в папке Applications. Запустите обычный установщик один раз."
+        case .signingIdentityChanged:
+            return "Обновление меняет подпись приложения и может сбросить разрешения macOS. Текущая версия сохранена."
         }
     }
 }
@@ -8612,6 +8617,7 @@ enum SuperDictateUpdateInstaller {
                                                                       isDirectory: true)
         do {
             try validateApp(at: stagedAppURL, expectedVersion: manifest.version)
+            try UpdateSigning.validateUpgrade(from: Bundle.main.bundleURL, to: stagedAppURL)
         } catch let error as SuperDictateUpdateInstallerError {
             try? FileManager.default.removeItem(at: workDirectory)
             throw error
@@ -9020,6 +9026,14 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     [ -d "$APP_PATH" ] || rollback
     [ ! -e "$BACKUP_APP" ] || rollback
     [ -w "$APP_PATH" ] && [ -w "$APP_PARENT" ] || rollback
+    # Recheck immediately before replacement, not just at download time.
+    /usr/bin/codesign --verify --deep --strict "$APP_PATH" || rollback
+    SIGNING_DETAILS="$(/usr/bin/codesign -dv "$APP_PATH" 2>&1)" || rollback
+    if ! printf '%s\n' "$SIGNING_DETAILS" | /usr/bin/grep -q '^Signature=adhoc$'; then
+        REQUIREMENT="$(/usr/bin/codesign -d -r- "$APP_PATH" 2>&1 | /usr/bin/sed -n 's/^designated => //p')"
+        [ -n "$REQUIREMENT" ] || rollback
+        /usr/bin/codesign --verify --deep --strict "-R=$REQUIREMENT" "$STAGED_APP" || rollback
+    fi
     wait_for_panel_exit || rollback
 
     /bin/launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
@@ -17403,6 +17417,17 @@ private enum ParakeySelfTest {
             return runSuite("audio-input-live", testLiveAudioInputEnumeration)
         case "model-status":
             return runSuite("model-status", testSpeechModelStartupStatus)
+        case "update-signing":
+            return runSuite("update-signing") {
+                let environment = ProcessInfo.processInfo.environment
+                guard let installed = environment["SUPERDICTATE_TEST_INSTALLED"],
+                      let candidate = environment["SUPERDICTATE_TEST_CANDIDATE"] else {
+                    throw NSError(domain: "SuperDictate.SigningTest", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Signing fixtures are required; run scripts/test-release-signing.sh"])
+                }
+                try UpdateSigning.validateUpgrade(from: URL(fileURLWithPath: installed),
+                                                  to: URL(fileURLWithPath: candidate))
+            }
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":

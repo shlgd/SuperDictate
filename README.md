@@ -215,6 +215,12 @@ open ./dist/SuperDictate.app
 SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./scripts/build-app.sh ./dist/SuperDictate.app
 ```
 
+Для следующих публичных релизов используется `bash scripts/package-release.sh`
+с постоянной подписью издателя, без автоматического отката к ad-hoc.
+[Подпись, сохранение разрешений и проверка обновлений](docs/release-signing.md).
+Разовая повторная выдача прав при переходе со старой подписи может потребоваться;
+сама подпись не заменяет разрешение macOS на первый запуск.
+
 Не перемещайте и не удаляйте `dist/SuperDictate.app`, пока фоновая служба
 запущена из этой сборки. Для обычного использования предпочтительнее команда
 с `SUPERDICTATE_BUILD_FROM_SOURCE=1`, которая ставит приложение в

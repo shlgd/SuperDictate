@@ -74,7 +74,15 @@ else
 fi
 
 say "Signing the app..."
-codesign "${SIGN_ARGS[@]}" "$STAGE_APP"
+if [[ "${SUPERDICTATE_RELEASE_BUILD:-0}" == "1" ]]; then
+    bash "$ROOT_DIR/scripts/release-signing.sh" sign "$STAGE_APP" "$ROOT_DIR/entitlements.plist"
+    codesign --verify --strict "-R=certificate leaf = H\"$(cat "$ROOT_DIR/release-signing.sha1")\"" "$STAGE_APP"
+else
+    if [[ "$SIGN_IDENTITY" == "-" ]]; then
+        say "Development ad-hoc build: use scripts/package-release.sh for a public release with a stable identity."
+    fi
+    codesign "${SIGN_ARGS[@]}" "$STAGE_APP"
+fi
 codesign --verify --deep --strict "$STAGE_APP"
 
 mkdir -p "$(dirname "$OUTPUT_APP")"

@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/package-model.sh
+bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/package-model.sh scripts/release-signing.sh scripts/package-release.sh scripts/test-release-signing.sh scripts/test-signed-installer.sh
 plutil -lint swift/Info.plist entitlements.plist
 
 app_version="$(plutil -extract CFBundleShortVersionString raw -o - swift/Info.plist)"

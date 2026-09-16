@@ -3,4 +3,6 @@
 swift/.build/
 dist/
 *.xcuserstate
-
+*.p12
+*.pfx
+*.keychain-db

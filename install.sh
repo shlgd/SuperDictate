@@ -295,6 +295,18 @@ else
 fi
 
 verify_app "$WORK_DIR/SuperDictate.app"
+if [[ -d "$APP_PATH" ]]; then
+    codesign --verify --deep --strict "$APP_PATH" || fail "Подпись установленного приложения повреждена. Обновление остановлено."
+    signing_details="$(codesign -dv "$APP_PATH" 2>&1)" || fail "Не удалось проверить прежнюю подпись."
+    if ! printf '%s\n' "$signing_details" | grep -q '^Signature=adhoc$'; then
+        requirement="$(codesign -d -r- "$APP_PATH" 2>&1 | sed -n 's/^designated => //p')"
+        [[ -n "$requirement" ]] || fail "Не удалось определить прежнюю подпись."
+        codesign --verify --deep --strict "-R=$requirement" "$WORK_DIR/SuperDictate.app" \
+            || fail "Подпись обновления отличается. Чтобы не потерять разрешения macOS, текущая версия сохранена."
+    else
+        say "Установлена старая ad-hoc-сборка. При переходе на постоянную подпись macOS может один раз запросить права заново."
+    fi
+fi
 ensure_speech_model "$WORK_DIR"
 say "Устанавливаю приложение в $APP_PATH..."
 
