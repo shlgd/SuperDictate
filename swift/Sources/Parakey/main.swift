@@ -17556,6 +17556,10 @@ private enum ParakeySelfTest {
             return runSuite("local-model-ui") {
                 try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
             }
+        case "permissions-ui":
+            return runSuite("permissions-ui") {
+                try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testPermissionRecoveryUI() }
+            }
         case "managed-runtime":
             return runSuite("managed-runtime") {
                 try asyncLocalModelTest {
@@ -17821,6 +17825,7 @@ private enum ParakeySelfTest {
 
     private static func testAll() throws {
         try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
+        try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testPermissionRecoveryUI() }
         try testAgentInstanceLock()
         try testLocalSpeechStorage()
         try testHotkey()
@@ -23065,6 +23070,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var lastRenderFingerprint = ""
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
+    private var resettingPermissions = false
     private var settingsDraft: ControlPanelSettingsDraft?
     private var hotkeyRecorder: HotkeyRecorderController?
     private weak var aiKeyField: NSSecureTextField?
@@ -23100,6 +23106,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         !localModelDownloads.isRunning
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        resettingPermissions ? .terminateCancel : .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -23196,7 +23206,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             && state?.status == "starting"
             && state?.modelDownloadPhase != nil
         let modelProgressHeight = showsModelProgress ? 26 : 0
-        let height = CGFloat(310 + max(0, missingCount - 1) * 28 + modelProgressHeight)
+        let resetNoticeHeight = missingCount > 0 && CommandLine.arguments.contains("--permissions-reset-result") ? 36 : 0
+        let height = CGFloat(342 + max(0, missingCount - 1) * 28 + modelProgressHeight + resetNoticeHeight)
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
@@ -23248,6 +23259,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
         }
         return [language.rawValue,
+                state?.isRecording == true ? "recording" : "not-recording",
+                state?.isTranscribing == true ? "transcribing" : "not-transcribing",
+                localModelDownloads.isRunning ? "downloading-model" : "not-downloading-model",
                 serviceOperation?.rawValue ?? "idle",
                 updateStateFingerprint(),
                 SuperDictateAgentService.isAgentRunning() ? "running" : "stopped",
@@ -23409,7 +23423,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                        "Choose the floating dictation indicator background.")
         ))
         root.addArrangedSubview(separator())
-        root.addArrangedSubview(permissionsRecoveryRow())
         root.addArrangedSubview(privacyInfoView())
 
         let background = NSVisualEffectView()
@@ -23689,6 +23702,30 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             color: color
         ))
         content.addArrangedSubview(header)
+
+        let runtime = AgentRuntimeStateStore.read()
+        let reset = panelButton(
+            resettingPermissions ? t("Сбрасываю…", "Resetting…") : t("Сбросить разрешения…", "Reset permissions…"),
+            action: #selector(resetPermissionsClicked(_:)),
+            enabled: serviceOperation == nil && !resettingPermissions && !localModelDownloads.isRunning
+                && runtime?.isRecording != true && runtime?.isTranscribing != true,
+            toolTip: t("Если выдали доступ, но приложение его не видит: сбросьте разрешения и выдайте заново. Панель и служба перезапустятся.",
+                       "If access is granted but not detected, reset permissions and grant them again. The panel and service will restart.")
+        )
+        reset.controlSize = .small
+        content.addArrangedSubview(reset)
+        if !missing.isEmpty, let index = CommandLine.arguments.firstIndex(of: "--permissions-reset-result"),
+           CommandLine.arguments.indices.contains(index + 1) {
+            let result = CommandLine.arguments[index + 1]
+            let notice = panelLabel(
+                result == "ok"
+                    ? t("Разрешения сброшены. Выдайте доступ заново.", "Permissions reset. Grant access again.")
+                    : t("Сброс выполнен не полностью: \(result).", "Reset incomplete: \(result)."),
+                size: 11, color: .secondaryLabelColor
+            )
+            notice.maximumNumberOfLines = 2
+            content.addArrangedSubview(notice)
+        }
 
         if missing.isEmpty {
             let ready = panelLabel(
@@ -24607,6 +24644,48 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     #if DEBUG
+    static func testPermissionRecoveryUI() throws {
+        _ = NSApplication.shared
+        let controller = SuperDictateControlPanelApp()
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        func resetButtons(_ view: NSView) -> [NSButton] {
+            descendants(view).compactMap { $0 as? NSButton }.filter {
+                $0.action == #selector(resetPermissionsClicked(_:))
+            }
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 450),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        controller.window = window
+        controller.refresh(force: true)
+        guard let content = window.contentView, let button = resetButtons(content).first,
+              resetButtons(content).count == 1, button.target === controller else {
+            throw localSpeechError("Permission reset must be on the main panel")
+        }
+        content.layoutSubtreeIfNeeded()
+        let center = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: content)
+        let hit = content.hitTest(center)
+        guard hit === button || hit?.isDescendant(of: button) == true else {
+            throw localSpeechError("Permission reset button is not reachable")
+        }
+        controller.settingsDraft = ControlPanelSettingsDraft(settings: controller.settings)
+        guard resetButtons(controller.makeSettingsContentView()).isEmpty else {
+            throw localSpeechError("Duplicate reset button in settings")
+        }
+        controller.resettingPermissions = true
+        controller.serviceOperation = .restarting
+        guard resetButtons(controller.compactPermissionsCard()).first?.isEnabled == false,
+              controller.applicationShouldTerminate(NSApp) == .terminateCancel else {
+            throw localSpeechError("Reset must prevent concurrent recovery and premature exit")
+        }
+        controller.resettingPermissions = false
+        guard controller.applicationShouldTerminate(NSApp) == .terminateNow else {
+            throw localSpeechError("Panel must allow exit after reset")
+        }
+    }
+
     static func testLocalModelDownloadHitTarget() throws {
         _ = NSApplication.shared
         for profile in SpeechModelProfile.selectable where profile.isExperimental {
@@ -24819,51 +24898,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(toggle)
-        return row
-    }
-
-    private func permissionsRecoveryRow() -> NSView {
-        let runtime = AgentRuntimeStateStore.read()
-        let dictationInProgress = runtime?.isRecording == true
-            || runtime?.isTranscribing == true
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 14
-
-        let text = NSStackView()
-        text.orientation = .vertical
-        text.alignment = .leading
-        text.spacing = 3
-        text.addArrangedSubview(panelLabel(
-            t("Восстановление разрешений", "Permission recovery"),
-            size: 13,
-            weight: .semibold
-        ))
-        let detail = panelLabel(
-            t("Только если доступы macOS сломались после переустановки. Все три разрешения придётся выдать заново.",
-              "Use only when macOS permissions became stuck after reinstalling. All three permissions must be granted again."),
-            size: 12,
-            color: .secondaryLabelColor
-        )
-        detail.maximumNumberOfLines = 2
-        detail.preferredMaxLayoutWidth = 470
-        text.addArrangedSubview(detail)
-
-        let reset = panelButton(
-            t("Сбросить…", "Reset…"),
-            action: #selector(resetPermissionsClicked(_:)),
-            enabled: serviceOperation == nil && !dictationInProgress,
-            toolTip: dictationInProgress
-                ? t("Сначала завершите текущую диктовку.", "Finish the current dictation first.")
-                : t("Отозвать разрешения SuperDictate после дополнительного подтверждения.",
-                    "Revoke SuperDictate permissions after an additional confirmation.")
-        )
-        reset.setContentHuggingPriority(.required, for: .horizontal)
-
-        row.addArrangedSubview(text)
-        row.addArrangedSubview(NSView())
-        row.addArrangedSubview(reset)
         return row
     }
 
@@ -25916,7 +25950,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func resetPermissionsClicked(_ sender: NSButton) {
-        guard serviceOperation == nil else { return }
+        guard serviceOperation == nil, !resettingPermissions, !localModelDownloads.isRunning else { return }
         let runtime = AgentRuntimeStateStore.read()
         guard runtime?.isRecording != true,
               runtime?.isTranscribing != true else {
@@ -25933,38 +25967,58 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         confirmation.messageText = t("Сбросить разрешения SuperDictate?",
                                      "Reset SuperDictate Permissions?")
         confirmation.informativeText = t(
-            "Микрофон, Универсальный доступ и Мониторинг ввода будут отозваны. Используйте это только для восстановления сломанных разрешений; затем их нужно выдать заново.",
-            "Microphone, Accessibility, and Input Monitoring access will be revoked. Use this only to recover stuck permissions; all three must then be granted again."
+            "Микрофон, Универсальный доступ и Мониторинг ввода будут отозваны. Панель и служба перезапустятся, затем выдайте доступ заново. Используйте сброс только если разрешения не работают.",
+            "Microphone, Accessibility, and Input Monitoring access will be revoked. The panel and service will restart; then grant access again. Use reset only to recover stuck permissions."
         )
         confirmation.addButton(withTitle: t("Отмена", "Cancel"))
         confirmation.addButton(withTitle: t("Сбросить", "Reset"))
         guard confirmation.runModal() == .alertSecondButtonReturn else { return }
 
-        sender.isEnabled = false
+        let confirmedRuntime = AgentRuntimeStateStore.read()
+        guard confirmedRuntime?.isRecording != true, confirmedRuntime?.isTranscribing != true else {
+            showError(title: t("Сначала завершите диктовку", "Finish Dictation First"),
+                      detail: t("Запись началась, пока было открыто подтверждение. Сброс отменён.",
+                                "Dictation started while confirmation was open. Reset cancelled."))
+            return
+        }
+
+        resettingPermissions = true
+        serviceOperation = .restarting
+        refresh(force: true)
         Task { @MainActor [weak self, weak sender] in
             let failures = await Task.detached(priority: .userInitiated) {
-                Permissions.resetAll()
+                SuperDictateAgentService.stop()
+                return Permissions.resetAll()
             }.value
             guard let self else { return }
             sender?.isEnabled = true
             self.permissionClickCount = [:]
-            self.refresh(force: true)
-
-            if failures.isEmpty {
-                let result = NSAlert()
-                result.alertStyle = .informational
-                result.messageText = self.t("Разрешения сброшены", "Permissions Reset")
-                result.informativeText = self.t(
-                    "Вернитесь в панель управления и выдайте три разрешения заново.",
-                    "Return to the control panel and grant all three permissions again."
-                )
-                result.addButton(withTitle: self.t("ОК", "OK"))
-                result.runModal()
-            } else {
+            // TCC checks can retain process-local state after a reset. Wait for
+            // this panel to exit before launching the sole installed app again.
+            let relaunch = Process()
+            relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+            relaunch.arguments = ["-c", """
+                count=0
+                while kill -0 "$1" 2>/dev/null; do
+                    count=$((count + 1))
+                    [ "$count" -lt 100 ] || exit 1
+                    sleep 0.1
+                done
+                exec /usr/bin/open -a "$2" --args --permissions-reset-result "$3"
+                """, "permission-recovery", String(getpid()), INSTALLED_APP_BUNDLE_PATH,
+                failures.isEmpty ? "ok" : failures.joined(separator: ", ")]
+            do {
+                try relaunch.run()
+                self.resettingPermissions = false
+                NSApp.terminate(nil)
+            } catch {
+                self.resettingPermissions = false
+                self.serviceOperation = nil
+                self.refresh(force: true)
                 self.showError(
-                    title: self.t("Сброс выполнен не полностью", "Reset Was Incomplete"),
-                    detail: self.t("Не удалось сбросить: \(failures.joined(separator: ", ")).",
-                                   "Could not reset: \(failures.joined(separator: ", ")).")
+                    title: self.t("Перезапустите SuperDictate", "Restart SuperDictate"),
+                    detail: self.t("Сброс завершён, но панель не удалось перезапустить: \(error.localizedDescription). Не сброшены: \(failures.joined(separator: ", ")).",
+                                   "Reset finished, but the panel could not restart: \(error.localizedDescription). Failed resets: \(failures.joined(separator: ", ")).")
                 )
             }
         }
