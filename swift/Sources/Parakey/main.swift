@@ -10969,6 +10969,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
         }
 
+        log("SuperDictate agent started: version=\(currentBundleVersion()), build=\(currentBundleBuild())")
+
         _ = previousExitNoticeAction(previousRunWasActive: settings.hasActiveRunMarker)
         recoverStaleSystemAudioMuteIfNeeded()
         settings.hasActiveRunMarker = true

@@ -16,23 +16,32 @@ cleanup() {
 trap cleanup EXIT
 
 identity="${SUPERDICTATE_SIGN_IDENTITY:-}"
+release_identity=0
+if [[ -z "$identity" && -d "$APP_PATH" ]] && \
+    codesign --verify --strict "-R=certificate leaf = H\"$(cat "$ROOT_DIR/release-signing.sha1")\"" "$APP_PATH" 2>/dev/null; then
+    release_identity=1
+fi
 if [[ -z "$identity" && -d "$APP_PATH" ]]; then
     identity="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 \
         | sed -n 's/^Authority=\(Apple Development:.*\)$/\1/p' \
         | head -n 1)"
 fi
-if [[ -z "$identity" ]]; then
+if [[ -z "$identity" && "$release_identity" == "0" ]]; then
     identity="$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' \
         | head -n 1)"
 fi
-if [[ -z "$identity" ]]; then
+if [[ -z "$identity" && "$release_identity" == "0" ]]; then
     printf 'SuperDictate: no Apple Development signing identity was found.\n' >&2
     printf 'Set SUPERDICTATE_SIGN_IDENTITY explicitly; ad-hoc local installs are disabled because they reset macOS permissions.\n' >&2
     exit 1
 fi
 
-SIGN_IDENTITY="$identity" "$ROOT_DIR/scripts/build-app.sh" "$STAGED_APP"
+if [[ "$release_identity" == "1" ]]; then
+    SUPERDICTATE_RELEASE_BUILD=1 "$ROOT_DIR/scripts/build-app.sh" "$STAGED_APP"
+else
+    SIGN_IDENTITY="$identity" "$ROOT_DIR/scripts/build-app.sh" "$STAGED_APP"
+fi
 
 codesign --verify --deep --strict "$STAGED_APP"
 identifier="$(codesign -d --verbose=4 "$STAGED_APP" 2>&1 \
