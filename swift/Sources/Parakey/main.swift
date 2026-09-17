@@ -23264,7 +23264,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let modelProgressHeight = showsModelProgress ? 26 : 0
         let resetNoticeHeight = missingCount > 0 && CommandLine.arguments.contains("--permissions-reset-result") ? 36 : 0
         let runtimeHeight = showsPackagedRuntimeProgress ? 140 : 0
-        let height = CGFloat(452 + max(0, missingCount - 1) * 28 + modelProgressHeight + resetNoticeHeight + runtimeHeight)
+        let permissionRowsHeight: Int = max(0, missingCount - 1) * 28
+        let supplementaryHeight: Int = modelProgressHeight + resetNoticeHeight + runtimeHeight
+        let height = CGFloat(452 + permissionRowsHeight + supplementaryHeight)
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
