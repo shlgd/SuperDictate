@@ -23610,6 +23610,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             }
             self?.exportingDownloadDiagnostics = false
             self?.refresh(force: true)
+            if let stack = self?.localModelStatusContainer { self?.rebuildLocalModelStatus(stack) }
         }
     }
 
@@ -24672,12 +24673,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             row.addArrangedSubview(panelLabel(detail, size: 11.5, color: .secondaryLabelColor))
             row.addArrangedSubview(NSView())
             let download = panelButton(
-                LocalSpeechPaths.isInstalled(profile) ? t("Скачать заново", "Download again") : t("Скачать", "Download"),
+                localModelDownloadTitle(profile),
                 action: #selector(downloadLocalSpeechModel(_:)),
                 enabled: !localModelDownloads.isRunning && profile != settings.speechModelProfile,
                 toolTip: t("Скачать модель и отдельный Python-движок. Текущая диктовка продолжит работать.",
                            "Download the model and a separate Python runtime. Current dictation keeps working."))
             download.identifier = NSUserInterfaceItemIdentifier(profile.rawValue)
+            download.widthAnchor.constraint(equalToConstant: 140).isActive = true
             localModelDownloadButton = download
             row.addArrangedSubview(download)
             stack.addArrangedSubview(row)
@@ -24720,9 +24722,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             let label = panelLabel(localModelDownloadStatus(), size: 11.5,
                                    color: localModelDownloads.failure == nil ? .secondaryLabelColor : .systemRed)
             localModelStatusLabel = label
-            label.maximumNumberOfLines = 3
+            label.maximumNumberOfLines = 0
             label.lineBreakMode = .byWordWrapping
+            label.preferredMaxLayoutWidth = 590
+            label.widthAnchor.constraint(equalToConstant: 590).isActive = true
+            label.toolTip = localModelDownloads.failure
             stack.addArrangedSubview(label)
+            if localModelDownloads.failure != nil {
+                stack.addArrangedSubview(panelButton(t("Скачать обезличенные логи", "Export anonymous logs"),
+                    action: #selector(exportDownloadDiagnosticsClicked(_:)), enabled: !exportingDownloadDiagnostics,
+                    toolTip: t("Только технические события. Без аудио и диктовок. Файл откроется в Finder; ничего не отправляется.",
+                               "Technical events only. No audio or transcripts. Reveals a local file in Finder; nothing is sent.")))
+            }
             if localModelDownloads.isRunning {
                 let progress = NSProgressIndicator()
                 localModelProgress = progress
@@ -24802,6 +24813,50 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
         try testLocalModelDownloadHitTarget(.whisperTurbo, clearDraft: true)
         try testDownloadWindowLifecycle()
+        try testDownloadFailureFeedback()
+    }
+
+    private static func testDownloadFailureFeedback() throws {
+        for category in [DownloadFailure.diskSpace, .filesystem, .network, .timeout, .dependencies, .unknown] {
+            let downloads = LocalModelDownloads { _, _, receive in
+                receive(LocalSpeechMessage(phase: "storage"))
+                try await Task.sleep(for: .milliseconds(20))
+                throw localSpeechError("fixture technical details", category: category)
+            }
+            let controller = SuperDictateControlPanelApp(downloads: downloads)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 700),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            controller.settingsWindow = window
+            var draft = ControlPanelSettingsDraft(settings: controller.settings)
+            draft.speechModelProfile = .whisperTurbo
+            controller.settingsDraft = draft
+            window.contentView = controller.makeSettingsContentView()
+            guard let button = controller.localModelDownloadButton else { throw localSpeechError("Missing download button") }
+            button.performClick(nil)
+            guard button.title == controller.t("Подготовка…", "Preparing…"), !button.isEnabled,
+                  controller.localModelStatusLabel?.stringValue.contains(controller.t("Проверяю папку", "Checking storage")) == true else {
+                throw localSpeechError("Click must immediately show preparation and storage stage")
+            }
+            let deadline = Date().addingTimeInterval(3)
+            while downloads.isRunning, Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            }
+            guard !downloads.isRunning, downloads.failureCategory == category,
+                  controller.localModelDownloadButton?.title == controller.t("Повторить", "Retry"),
+                  controller.localModelDownloadButton?.isEnabled == true,
+                  let label = controller.localModelStatusLabel,
+                  label.stringValue.contains(controller.localModelDownloadFailure()),
+                  !label.stringValue.contains("fixture technical details"),
+                  let status = controller.localModelStatusContainer else {
+                throw localSpeechError("Failure did not show actionable feedback and restore Retry")
+            }
+            guard status.arrangedSubviews.compactMap({ $0 as? NSButton }).contains(where: {
+                $0.action == #selector(exportDownloadDiagnosticsClicked(_:)) && $0.target === controller
+            }) else { throw localSpeechError("Failure must offer anonymous logs in place") }
+            window.contentView?.layoutSubtreeIfNeeded()
+            guard label.bounds.width > 0, label.bounds.height > 0 else { throw localSpeechError("Failure label is clipped") }
+        }
     }
 
     private static func testDownloadWindowLifecycle() throws {
@@ -24899,6 +24954,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         defer { controller.localModelDownloads.cancel() }
         guard controller.localModelDownloads.isRunning,
               window.contentView === currentContent, !button.isEnabled,
+              button.title == controller.t("Подготовка…", "Preparing…"),
               controller.localModelDownloads.profile == profile,
               controller.localModelStatusLabel?.window === window,
               controller.localModelProgress?.window === window,
@@ -24963,13 +25019,53 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         localModelDownloads.remove(profile, active: settings.speechModelProfile)
     }
 
+    private func localModelDownloadTitle(_ profile: SpeechModelProfile) -> String {
+        if localModelDownloads.isRunning {
+            if localModelDownloads.isCancelling { return t("Отменяю…", "Cancelling…") }
+            if localModelDownloads.removing { return t("Удаляю…", "Removing…") }
+            switch localModelDownloads.message?.phase {
+            case "downloading", "interpreter": return t("Скачиваю…", "Downloading…")
+            case "listing", "verifying", "runtime-imports", "runtime-verifying": return t("Проверяю…", "Checking…")
+            default: return t("Подготовка…", "Preparing…")
+            }
+        }
+        if localModelDownloads.profile == profile, localModelDownloads.failure != nil {
+            return t("Повторить", "Retry")
+        }
+        return LocalSpeechPaths.isInstalled(profile) ? t("Скачать заново", "Download again") : t("Скачать", "Download")
+    }
+
+    private func localModelDownloadFailure() -> String {
+        switch localModelDownloads.failureCategory {
+        case .diskSpace:
+            return t("Недостаточно места на диске. Освободите место и повторите загрузку.", "Not enough disk space. Free up space and retry.")
+        case .filesystem:
+            return t("Не удалось прочитать или записать файлы. Проверьте доступность диска и повторите попытку.", "Could not read or write files. Check that the disk is accessible and retry.")
+        case .network, .http:
+            return t("Не удалось скачать данные с сервера. Проверьте интернет, попробуйте другую сеть или включить/выключить VPN.", "Could not download data from the server. Check your connection, try another network or toggle your VPN.")
+        case .tls:
+            return t("Не удалось установить защищённое соединение. Проверьте дату на Mac и попробуйте другую сеть или VPN.", "Could not establish a secure connection. Check your Mac's date and try another network or VPN.")
+        case .timeout:
+            return t("Превышено время ожидания. Повторите попытку; если ошибка повторится, сохраните обезличенные логи.", "The operation timed out. Retry; if it fails again, export anonymous logs.")
+        case .checksum:
+            return t("Скачанный файл повреждён. Повторите загрузку.", "A downloaded file is damaged. Download it again.")
+        case .dependencies, .imports:
+            return t("Не удалось подготовить движок. Повторите попытку; если ошибка повторится, сохраните обезличенные логи.", "Could not prepare the runtime. Retry; if it fails again, export anonymous logs.")
+        default:
+            return t("Операция не завершилась. Повторите попытку или сохраните обезличенные логи для диагностики.", "The operation did not finish. Retry or export anonymous logs for diagnosis.")
+        }
+    }
+
     private func localModelDownloadStatus() -> String {
         let update = localModelDownloads.message
         let status: String
-        if let failure = localModelDownloads.failure {
-            status = t("Ошибка: ", "Error: ") + failure
+        if localModelDownloads.failure != nil {
+            status = localModelDownloadFailure()
         } else {
             switch update?.phase {
+            case "storage": status = t("Проверяю папку и очищаю временные файлы…", "Checking storage and cleaning temporary files…")
+            case "interpreter-prepare": status = t("Проверяю Python и свободное место…", "Checking Python and available disk space…")
+            case "installer-launch": status = t("Запускаю установщик движка…", "Starting runtime installer…")
             case "interpreter":
                 status = t("Загружаю компоненты… ", "Downloading components… ")
                     + String(format: "%.1f / %.1f MB", Double(update?.downloaded ?? 0) / 1_000_000,
@@ -24994,10 +25090,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                 (update?.speed ?? 0) / 1_000_000)
             }
         }
-        let elapsed = localModelDownloads.isRunning ? " · \(localModelDownloads.elapsedSeconds) s" : ""
-        let waiting = localModelDownloads.waitingForProgress
-            ? t("\nНет нового прогресса. Возможна задержка сети или установки. При необходимости отмените и попробуйте другую сеть или VPN.",
-                "\nNo new progress. Network or installation may be slow. You can cancel and retry with another network or VPN.") : ""
+        let elapsed = localModelDownloads.isRunning ? t(" · \(localModelDownloads.elapsedSeconds) с", " · \(localModelDownloads.elapsedSeconds) s") : ""
+        let waiting: String
+        if localModelDownloads.waitingForProgress && !localModelDownloads.isCancelling && !localModelDownloads.removing {
+            let seconds = localModelDownloads.secondsWithoutProgress
+            waiting = t("\nНет нового прогресса \(seconds) с на этом этапе. Это ещё не означает сбой. Можно отменить операцию и повторить попытку.",
+                        "\nNo new progress for \(seconds) s at this stage. This does not necessarily mean a failure. You can cancel and retry.")
+        } else { waiting = "" }
         return (localModelDownloads.profile?.shortName ?? "") + ": " + status + elapsed + waiting
     }
 
@@ -25010,6 +25109,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let selected = settingsDraft?.speechModelProfile
         let enabled = !localModelDownloads.isRunning && selected != settings.speechModelProfile
         localModelDownloadButton?.isEnabled = enabled
+        if let selected { localModelDownloadButton?.title = localModelDownloadTitle(selected) }
         localModelRemoveButton?.isEnabled = enabled
         if localModelDownloads.isCancelling, let stack = localModelStatusContainer {
             rebuildLocalModelStatus(stack)

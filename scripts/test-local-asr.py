@@ -1,5 +1,6 @@
 """No model weights, microphone access or inference. Run with a numpy-enabled Python."""
 import hashlib
+import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
@@ -216,6 +217,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(asr.failure_details(RuntimeError(secret)), ("unknown", 1))
         self.assertEqual(asr.failure_details(urllib.error.HTTPError(secret, 403, secret, {}, None)), ("http", 403))
         self.assertEqual(asr.failure_details(urllib.error.URLError(ssl.SSLError(secret))), ("tls", 1))
+        self.assertEqual(asr.failure_details(OSError(errno.ENOSPC, secret)), ("disk-space", errno.ENOSPC))
 
     def test_segmentation_preserves_every_sample(self):
         import numpy as np

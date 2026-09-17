@@ -66,6 +66,13 @@ extension LocalModelDownloads {
             guard condition() else { throw localSpeechError("Download lifecycle test timed out") }
         }
         downloads.start(.whisperTurbo)
+        guard downloads.message?.phase == "storage", !downloads.waitingForProgress else {
+            throw localSpeechError("Initial storage status must be immediate")
+        }
+        downloads.lastProgressAt = Date().addingTimeInterval(-35)
+        guard downloads.waitingForProgress, downloads.secondsWithoutProgress >= 35 else {
+            throw localSpeechError("Missing stalled-stage feedback")
+        }
         downloads.start(.qwenSmall)
         try wait { !downloads.isRunning }
         guard downloads.profile == .whisperTurbo, downloads.failure == "fixture offline",
@@ -73,7 +80,9 @@ extension LocalModelDownloads {
             throw localSpeechError("Duplicate click or failure recovery is broken")
         }
         downloads.start(.whisperTurbo)
-        guard downloads.failure == nil else { throw localSpeechError("Retry retained old error") }
+        guard downloads.failure == nil, downloads.failureCategory == nil, !downloads.waitingForProgress else {
+            throw localSpeechError("Retry retained old error or stalled state")
+        }
         try wait { !downloads.isRunning }
         guard downloads.message?.phase == "ready" else { throw localSpeechError("Retry did not complete") }
         downloads.start(.whisperTurbo)
@@ -341,6 +350,7 @@ final class LocalModelDownloads {
     private(set) var profile: SpeechModelProfile?
     private(set) var message: LocalSpeechMessage?
     private(set) var failure: String?
+    private(set) var failureCategory: DownloadFailure?
     private(set) var removing = false
     private(set) var isCancelling = false
     private let install: LocalModelInstallation
@@ -351,6 +361,7 @@ final class LocalModelDownloads {
     private var lastProgressAt = Date()
     var elapsedSeconds: Int { Int(max(0, Date().timeIntervalSince(startedAt ?? Date()))) }
     var waitingForProgress: Bool { isRunning && Date().timeIntervalSince(lastProgressAt) >= 30 }
+    var secondsWithoutProgress: Int { Int(max(0, Date().timeIntervalSince(lastProgressAt))) }
     var onChange: (() -> Void)?
 
     init(install: @escaping LocalModelInstallation = LocalModelDownloads.installModel) {
@@ -361,14 +372,17 @@ final class LocalModelDownloads {
                                                  _ receive: @escaping @Sendable (LocalSpeechMessage) -> Void) async throws {
         log("local model download stage: storage-cleanup")
         DownloadDiagnostics.shared.record(.stage, model: selection, stage: .storage)
+        receive(LocalSpeechMessage(phase: "storage"))
         try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
         try Task.checkCancellation()
         log("local model download stage: interpreter-prepare")
         DownloadDiagnostics.shared.record(.stage, model: selection, stage: .interpreterPrepare)
+        receive(LocalSpeechMessage(phase: "interpreter-prepare"))
         let python = try await ManagedSpeechRuntime.ensure(progress: receive)
         try Task.checkCancellation()
         log("local model download stage: installer-launch")
         DownloadDiagnostics.shared.record(.stage, model: selection, stage: .installerLaunch)
+        receive(LocalSpeechMessage(phase: "installer-launch"))
         try await process.launch(python: python, command: "install", profile: selection, onMessage: receive)
     }
 
@@ -385,9 +399,10 @@ final class LocalModelDownloads {
         let operation = UUID()
         operationID = operation
         failure = nil
+        failureCategory = nil
         startedAt = Date()
         lastProgressAt = Date()
-        message = LocalSpeechMessage(phase: "runtime")
+        message = LocalSpeechMessage(phase: "storage")
         let process = LocalSpeechProcess()
         self.process = process
         task = Task {
@@ -438,6 +453,7 @@ final class LocalModelDownloads {
                     DownloadDiagnostics.shared.record(.cancelled, model: selection, elapsed: elapsedSeconds)
                 } else {
                     failure = error.localizedDescription
+                    failureCategory = DownloadFailure.classify(error)
                     log("local model download failed: \(selection.rawValue): \(error.localizedDescription)")
                     DownloadDiagnostics.shared.record(.failed, model: selection,
                         stage: message?.phase.flatMap(DownloadStage.init(rawValue:)) ?? .unknown,
@@ -455,6 +471,7 @@ final class LocalModelDownloads {
         profile = selection
         operationID = UUID()
         failure = nil
+        failureCategory = nil
         removing = true
         message = LocalSpeechMessage(phase: "removing")
         task = Task {
@@ -464,7 +481,10 @@ final class LocalModelDownloads {
                     try LocalSpeechStorage.remove(selection, active: active)
                 }.value
                 message = LocalSpeechMessage(phase: "removed")
-            } catch { failure = error.localizedDescription }
+            } catch {
+                failure = error.localizedDescription
+                failureCategory = DownloadFailure.classify(error)
+            }
         }
         onChange?()
     }

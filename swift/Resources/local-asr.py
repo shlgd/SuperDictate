@@ -1,6 +1,7 @@
 """Optional local ASR runtime. No audio leaves this process or this computer."""
 import argparse
 import contextlib
+import errno
 import fcntl
 import gc
 import hashlib
@@ -59,7 +60,7 @@ def failure_details(error):
     if isinstance(error, ImportError):
         return "imports", 1
     if isinstance(error, OSError):
-        return "filesystem", error.errno or 1
+        return ("disk-space" if error.errno == errno.ENOSPC else "filesystem"), error.errno or 1
     return "unknown", 1
 
 

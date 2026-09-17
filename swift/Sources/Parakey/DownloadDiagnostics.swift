@@ -20,6 +20,10 @@ enum DownloadFailure: String, Codable, Sendable {
         let error = error as NSError
         if let value = error.userInfo["downloadFailure"] as? String,
            let category = Self(rawValue: value) { return category }
+        if (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOSPC))
+            || (error.domain == NSCocoaErrorDomain && error.code == NSFileWriteOutOfSpaceError) {
+            return .diskSpace
+        }
         if error.domain == NSURLErrorDomain {
             switch error.code {
             case NSURLErrorTimedOut: return .timeout
@@ -163,6 +167,10 @@ enum LocalSpeechEnvironment {
 #if DEBUG
 extension DownloadDiagnostics {
     static func testPrivacy() throws {
+        guard DownloadFailure.classify(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))) == .diskSpace,
+              DownloadFailure.classify(NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)) == .diskSpace else {
+            throw localSpeechError("Disk-full errors must have an actionable category")
+        }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
