@@ -17564,6 +17564,8 @@ private enum ParakeySelfTest {
             return runSuite("runtime-network") {
                 try asyncLocalModelTest { try await ManagedSpeechRuntime.testNetworkLifecycle() }
             }
+        case "download-diagnostics":
+            return runSuite("download-diagnostics", DownloadDiagnostics.testPrivacy)
         case "permissions-ui":
             return runSuite("permissions-ui") {
                 try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testPermissionRecoveryUI() }
@@ -17839,6 +17841,7 @@ private enum ParakeySelfTest {
     }
 
     private static func testAll() throws {
+        try DownloadDiagnostics.testPrivacy()
         try MainActor.assumeIsolated { try LocalModelDownloads.testLifecycle() }
         try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
         try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testPermissionRecoveryUI() }
@@ -23100,6 +23103,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var localModelStatusContainer: NSStackView?
     private weak var localModelDownloadButton: NSButton?
     private weak var localModelRemoveButton: NSButton?
+    private var exportingDownloadDiagnostics = false
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -23230,7 +23234,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             && state?.modelDownloadPhase != nil
         let modelProgressHeight = showsModelProgress ? 26 : 0
         let resetNoticeHeight = missingCount > 0 && CommandLine.arguments.contains("--permissions-reset-result") ? 36 : 0
-        let height = CGFloat(342 + max(0, missingCount - 1) * 28 + modelProgressHeight + resetNoticeHeight)
+        let height = CGFloat(452 + max(0, missingCount - 1) * 28 + modelProgressHeight + resetNoticeHeight)
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
@@ -23333,6 +23337,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(compactServiceCard())
         root.addArrangedSubview(compactPermissionsCard())
         root.addArrangedSubview(compactUpdateCard())
+        root.addArrangedSubview(downloadDiagnosticsRow())
         root.addArrangedSubview(compactPrivacyFooter())
 
         let background = NSVisualEffectView()
@@ -23555,6 +23560,57 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(languageControl)
         row.addArrangedSubview(settingsButton)
         return row
+    }
+
+    private func downloadDiagnosticsRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .vertical
+        row.alignment = .leading
+        row.spacing = 5
+        row.addArrangedSubview(panelButton(
+            exportingDownloadDiagnostics ? t("Создаю файл…", "Creating file…")
+                : t("Скачать обезличенные логи", "Export anonymous logs"),
+            action: #selector(exportDownloadDiagnosticsClicked(_:)),
+            enabled: !exportingDownloadDiagnostics,
+            toolTip: t("Создать файл диагностики загрузки моделей и показать в Finder. Ничего не отправляется автоматически.",
+                       "Create a model download diagnostics file and reveal it in Finder. Nothing is uploaded automatically.")))
+        let note = panelLabel(t(
+            "Только версии, модель, этапы, время, объём загрузки и коды ошибок. Без аудио, диктовок, буфера обмена, имён, путей, адресов и ключей. Файл остаётся на Mac — отправляете его только вы.",
+            "Only versions, model, stages, duration, download size and error codes. No audio, transcripts, clipboard, names, paths, addresses or keys. The file stays on your Mac; only you choose to share it."),
+            size: 11, color: .secondaryLabelColor)
+        note.maximumNumberOfLines = 5
+        note.lineBreakMode = .byWordWrapping
+        note.preferredMaxLayoutWidth = 480
+        row.addArrangedSubview(note)
+        return row
+    }
+
+    @objc private func exportDownloadDiagnosticsClicked(_ sender: NSButton) {
+        guard !exportingDownloadDiagnostics else { return }
+        exportingDownloadDiagnostics = true
+        sender.isEnabled = false
+        sender.title = t("Создаю файл…", "Creating file…")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        DownloadDiagnostics.shared.record(.export)
+        Task { @MainActor [weak self] in
+            do {
+                let url = try await Task.detached(priority: .utility) {
+                    let directory = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+                                                                 appropriateFor: nil, create: true)
+                        .appendingPathComponent("SuperDictate/Diagnostics", isDirectory: true)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                           attributes: [.posixPermissions: 0o700])
+                    return try DownloadDiagnostics.shared.export(to: directory, version: version, build: build)
+                }.value
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } catch {
+                self?.showError(title: self?.t("Не удалось создать файл", "Could Not Export Logs") ?? "Export failed",
+                                detail: error.localizedDescription)
+            }
+            self?.exportingDownloadDiagnostics = false
+            self?.refresh(force: true)
+        }
     }
 
     private func settingsHeaderView() -> NSView {
@@ -24713,6 +24769,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard hit === button || hit?.isDescendant(of: button) == true else {
             throw localSpeechError("Permission reset button is not reachable")
         }
+        guard let export = descendants(content).compactMap({ $0 as? NSButton }).first(where: {
+            $0.action == #selector(exportDownloadDiagnosticsClicked(_:))
+        }), export.isEnabled, export.target === controller else {
+            throw localSpeechError("Anonymous diagnostic export is missing from main panel")
+        }
+        let exportCenter = export.convert(NSPoint(x: export.bounds.midX, y: export.bounds.midY), to: content)
+        let exportHit = content.hitTest(exportCenter)
+        guard content.bounds.contains(exportCenter), exportHit === export || exportHit?.isDescendant(of: export) == true else {
+            throw localSpeechError("Anonymous export button is clipped or not clickable")
+        }
         controller.settingsDraft = ControlPanelSettingsDraft(settings: controller.settings)
         guard resetButtons(controller.makeSettingsContentView()).isEmpty else {
             throw localSpeechError("Duplicate reset button in settings")
@@ -24873,12 +24939,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         log("local model download clicked: \(profile.rawValue), running=\(localModelDownloads.isRunning)")
+        DownloadDiagnostics.shared.record(.click, model: profile)
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.speechModelProfile = profile
         settingsDraft = draft
         localModelDownloads.onChange = { [weak self] in self?.updateLocalModelDownloadStatus() }
         localModelDownloads.start(profile)
         log("local model download UI: running=\(localModelDownloads.isRunning) buttonEnabled=\(sender.isEnabled) progressAttached=\(localModelProgress?.window != nil) statusAttached=\(localModelStatusLabel?.window != nil)")
+        DownloadDiagnostics.shared.record(.ui, model: profile,
+            visible: localModelProgress?.window != nil && localModelStatusLabel?.window != nil, enabled: sender.isEnabled)
     }
 
     @objc private func removeLocalSpeechModel(_ sender: NSButton) {
@@ -24910,6 +24979,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             case "runtime-environment": status = t("Создаю окружение движка…", "Creating runtime environment…")
             case "runtime-packages": status = t("Скачиваю и устанавливаю зависимости движка…", "Downloading and installing runtime dependencies…")
             case "runtime-imports": status = t("Проверяю запуск движка…", "Checking runtime imports…")
+            case "runtime-repair": status = t("Восстанавливаю повреждённый движок…", "Repairing the local runtime…")
             case "cancelled": status = t("Загрузка отменена", "Download cancelled")
             case "cancelling": status = t("Отменяю загрузку…", "Cancelling download…")
             case "removing": status = t("Удаляю файлы…", "Removing files…")

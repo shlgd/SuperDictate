@@ -4,6 +4,11 @@ from pathlib import Path
 import sys
 import time
 import signal
+import os
+
+assert sys.flags.isolated == 1
+assert os.environ.get("PIP_CONFIG_FILE") == "/dev/null"
+assert not any(name in os.environ for name in ("PYTHONHOME", "PYTHONPATH", "PIP_INDEX_URL", "HF_ENDPOINT", "HF_TOKEN"))
 
 print(json.dumps({"ready": True}), flush=True)
 for line in sys.stdin:

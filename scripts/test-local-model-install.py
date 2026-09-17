@@ -15,13 +15,14 @@ args = parser.parse_args()
 script = Path(__file__).resolve().parents[1] / "swift/Resources/local-asr.py"
 with tempfile.TemporaryDirectory(prefix="superdictate-clean-install-") as directory:
     root = Path(directory)
-    env = dict(os.environ, PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1",
+    env = dict(PATH="/usr/bin:/bin:/usr/sbin:/sbin", HOME=str(root), LANG="en_US.UTF-8",
+               PIP_CONFIG_FILE="/dev/null", PIP_NO_INPUT="1", PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1",
                HF_HUB_DISABLE_IMPLICIT_TOKEN="1", PIP_NO_CACHE_DIR="1",
                HF_HOME=str(root / "hf"), XDG_CACHE_HOME=str(root / "cache"), TMPDIR=directory)
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
     started = time.monotonic()
-    process = subprocess.Popen([args.python, "-u", str(script), "install", "--root", directory,
+    process = subprocess.Popen([args.python, "-I", "-B", "-u", str(script), "install", "--root", directory,
                                 "--model", "whisper_turbo"], env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:

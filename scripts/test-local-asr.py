@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import tempfile
 import sys
+import ssl
+import urllib.error
 import unittest
 from unittest.mock import patch
 
@@ -108,7 +110,33 @@ class RuntimeTests(unittest.TestCase):
             with patch.object(asr, "checked_run") as install:
                 for key in asr.CATALOG:
                     self.assertEqual(asr.bootstrap(root, key), environment / "bin/python3")
-                install.assert_not_called()
+                self.assertEqual(install.call_count, len(asr.CATALOG))
+                self.assertTrue(all(call.kwargs["phase"] == "runtime-imports" for call in install.call_args_list))
+                self.assertTrue(all("-I" in call.args[0] for call in install.call_args_list))
+
+    def test_broken_runtime_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(asr, "emit") as progress:
+            root = Path(directory)
+            old = root / "runtime-v2"
+            old.mkdir()
+            (old / "runtime-version").write_text("2")
+            (old / "broken").touch()
+            def setup(arguments, **kwargs):
+                if str(old / "bin/python3") == arguments[0]:
+                    raise asr.SetupFailure("missing module", "imports")
+                if "venv" in arguments:
+                    Path(arguments[-1]).mkdir()
+            with patch.object(asr, "checked_run", side_effect=setup):
+                asr.bootstrap(root, "whisper_turbo")
+            self.assertFalse((old / "broken").exists())
+            self.assertEqual((old / "runtime-version").read_text(), "2")
+            self.assertIn(unittest.mock.call(phase="runtime-repair"), progress.call_args_list)
+
+    def test_failure_categories_do_not_include_private_details(self):
+        secret = "private transcript /Users/private/person hf_secret https://private.example/key"
+        self.assertEqual(asr.failure_details(RuntimeError(secret)), ("unknown", 1))
+        self.assertEqual(asr.failure_details(urllib.error.HTTPError(secret, 403, secret, {}, None)), ("http", 403))
+        self.assertEqual(asr.failure_details(urllib.error.URLError(ssl.SSLError(secret))), ("tls", 1))
 
     def test_segmentation_preserves_every_sample(self):
         import numpy as np

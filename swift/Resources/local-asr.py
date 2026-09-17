@@ -9,11 +9,13 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
+import urllib.error
 
 CATALOG = {
     "whisper_large_v3": ("whisper", "mlx-community/whisper-large-v3-mlx"),
@@ -33,6 +35,32 @@ RUNTIME_VERSION = "1"
 ENVIRONMENT_VERSION = "2"
 PROTOCOL = sys.stdout
 child = None
+
+
+class SetupFailure(RuntimeError):
+    def __init__(self, message, category, code=1):
+        super().__init__(message)
+        self.category = category
+        self.code = code
+
+
+def failure_details(error):
+    if isinstance(error, SetupFailure):
+        return error.category, error.code
+    if isinstance(error, urllib.error.HTTPError):
+        return "http", error.code
+    if isinstance(error, urllib.error.URLError):
+        category, code = failure_details(error.reason)
+        return (category if category in ("tls", "timeout") else "network"), code
+    if isinstance(error, ssl.SSLError):
+        return "tls", 1
+    if isinstance(error, TimeoutError):
+        return "timeout", 1
+    if isinstance(error, ImportError):
+        return "imports", 1
+    if isinstance(error, OSError):
+        return "filesystem", error.errno or 1
+    return "unknown", 1
 
 
 def emit(**values):
@@ -61,7 +89,7 @@ def checked_run(arguments, phase="runtime-packages", timeout=1200):
         while True:
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
-                raise RuntimeError(f"Runtime setup timed out during {phase}. Check the network or VPN and retry.")
+                raise SetupFailure(f"Runtime setup timed out during {phase}. Check the network or VPN and retry.", "timeout")
             emit(phase=phase)
             try:
                 code = child.wait(timeout=min(5, remaining))
@@ -69,7 +97,8 @@ def checked_run(arguments, phase="runtime-packages", timeout=1200):
             except subprocess.TimeoutExpired:
                 continue
         if code:
-            raise RuntimeError(f"Runtime setup failed (exit {code}). See installation.log.")
+            raise SetupFailure(f"Runtime setup failed (exit {code}). See installation.log.",
+                               "imports" if phase == "runtime-imports" else "dependencies", code)
     finally:
         if child.poll() is None:
             child.kill()
@@ -81,7 +110,13 @@ def bootstrap(root, key):
     environment = root / "runtime-v2"
     marker = environment / "runtime-version"
     if marker.exists() and marker.read_text() == ENVIRONMENT_VERSION:
-        return environment / "bin/python3"
+        try:
+            checked_run([str(environment / "bin/python3"), "-I", "-B", "-c",
+                         "import ssl, mlx.core, mlx_whisper, mlx_audio.stt, gigaam"],
+                        phase="runtime-imports", timeout=120)
+            return environment / "bin/python3"
+        except (RuntimeError, OSError):
+            emit(phase="runtime-repair")
     emit(phase="runtime")
     staging = root / ".runtime-stage"
     shutil.rmtree(staging, ignore_errors=True)
@@ -91,10 +126,10 @@ def bootstrap(root, key):
     ]
     try:
         emit(phase="runtime-environment")
-        checked_run([sys.executable, "-m", "venv", str(staging)], phase="runtime-environment", timeout=120)
+        checked_run([sys.executable, "-I", "-B", "-m", "venv", str(staging)], phase="runtime-environment", timeout=120)
         python = staging / "bin/python3"
-        checked_run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--timeout", "20", "--retries", "2", "--no-cache-dir", "--no-compile", *packages])
-        checked_run([str(python), "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"], phase="runtime-imports", timeout=120)
+        checked_run([str(python), "-I", "-B", "-m", "pip", "install", "--index-url", "https://pypi.org/simple", "--disable-pip-version-check", "--no-input", "--timeout", "20", "--retries", "2", "--no-cache-dir", "--no-compile", *packages])
+        checked_run([str(python), "-I", "-B", "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"], phase="runtime-imports", timeout=120)
         (staging / "runtime-version").write_text(ENVIRONMENT_VERSION)
         if environment.exists():
             shutil.rmtree(environment)
@@ -147,7 +182,7 @@ def fetch(url, path, completed, total, started, expected_size=None, sha=None, tr
             if expected_size is not None and downloaded != expected_size:
                 raise RuntimeError("Incomplete model download")
             if sha and file_digest(partial) != sha:
-                raise RuntimeError("Model checksum mismatch")
+                raise SetupFailure("Model checksum mismatch", "checksum")
             partial.replace(path)
             return downloaded
         except BaseException as error:
@@ -156,6 +191,8 @@ def fetch(url, path, completed, total, started, expected_size=None, sha=None, tr
                 raise
             if attempt == 2:
                 raise
+            category, code = failure_details(error)
+            emit(phase="downloading", retry=attempt + 1, failure_code=category, code=code)
             time.sleep(attempt + 1)
 
 
@@ -192,7 +229,7 @@ def download(root, key):
         raise RuntimeError("Model manifest is empty")
     total = sum(entry[1] for entry in files)
     if shutil.disk_usage(root).free < total + 2 * 1024 ** 3:
-        raise RuntimeError("Not enough free disk space: model size plus 2 GB required.")
+        raise SetupFailure("Not enough free disk space: model size plus 2 GB required.", "disk-space")
     completed = 0
     started = time.monotonic()
     transfer = {"bytes": 0, "started": started}
@@ -339,13 +376,13 @@ def main():
             if args.command in ("install", "prepare"):
                 python = bootstrap(args.root, args.model)
                 if args.command == "prepare":
-                    checked_run([str(python), "-c", "import ssl, mlx.core, mlx_audio.stt, mlx_whisper, gigaam; print('Relocated runtime OK')"], phase="runtime-imports", timeout=120)
+                    checked_run([str(python), "-I", "-B", "-c", "import ssl, mlx.core, mlx_audio.stt, mlx_whisper, gigaam; print('Relocated runtime OK')"], phase="runtime-imports", timeout=120)
                     emit(phase="runtime-ready")
                     return
                 # Keep the lock across exec so cleanup cannot erase this installation.
                 os.set_inheritable(lock.fileno(), True)
                 os.environ["SUPERDICTATE_INSTALL_LOCK_FD"] = str(lock.fileno())
-                os.execv(str(python), [str(python), "-u", __file__, "download", "--root", str(args.root), "--model", args.model])
+                os.execv(str(python), [str(python), "-I", "-B", "-u", __file__, "download", "--root", str(args.root), "--model", args.model])
             else:
                 download(args.root, args.model)
         finally:
@@ -362,5 +399,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        emit(error=str(error))
+        category, code = failure_details(error)
+        emit(error=str(error), failure_code=category, code=code)
         sys.exit(1)

@@ -105,8 +105,9 @@ private struct LocalModelManifest: Decodable {
     let files: [File]
 }
 
-func localSpeechError(_ message: String) -> NSError {
-    NSError(domain: "SuperDictate.LocalASR", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+func localSpeechError(_ message: String, category: DownloadFailure = .unknown, code: Int = 1) -> NSError {
+    NSError(domain: "SuperDictate.LocalASR", code: code,
+            userInfo: [NSLocalizedDescriptionKey: message, "downloadFailure": category.rawValue])
 }
 
 struct LocalSpeechMessage: Decodable, Sendable {
@@ -118,6 +119,9 @@ struct LocalSpeechMessage: Decodable, Sendable {
     var downloaded: Int64?
     var total: Int64?
     var speed: Double?
+    var failure_code: String?
+    var code: Int?
+    var retry: Int?
 }
 
 // Pipe IO and process state are confined to a dedicated serial queue, never the main actor.
@@ -158,25 +162,12 @@ final class LocalSpeechProcess: @unchecked Sendable {
                     try log.truncate(atOffset: 0)
                     defer { try? log.close() }
                     p.executableURL = python
-                    p.arguments = ["-u", self.script.path, command,
+                    p.arguments = ["-I", "-B", "-u", self.script.path, command,
                                    "--root", LocalSpeechPaths.root.path, "--model", profile.rawValue]
                     p.standardInput = stdin
                     p.standardOutput = stdout
                     p.standardError = log
-                    var environment = ProcessInfo.processInfo.environment
-                    environment["TOKENIZERS_PARALLELISM"] = "false"
-                    environment["PYTHONUNBUFFERED"] = "1"
-                    environment["PYTHONNOUSERSITE"] = "1"
-                    environment["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
-                    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-                    environment["TMPDIR"] = temporaryDirectory.path
-                    environment["HF_HOME"] = temporaryDirectory.appendingPathComponent("huggingface").path
-                    environment["XDG_CACHE_HOME"] = temporaryDirectory.appendingPathComponent("cache").path
-                    environment["NUMBA_CACHE_DIR"] = temporaryDirectory.appendingPathComponent("numba").path
-                    environment["PIP_NO_CACHE_DIR"] = "1"
-                    environment.removeValue(forKey: "PYTHONHOME")
-                    environment.removeValue(forKey: "PYTHONPATH")
-                    p.environment = environment
+                    p.environment = LocalSpeechEnvironment.make(temporaryDirectory: temporaryDirectory)
                     try p.run()
                     self.cancellationLock.lock()
                     self.cancellableProcess = p
@@ -189,7 +180,10 @@ final class LocalSpeechProcess: @unchecked Sendable {
                     let timeout = Self.deadline(p, seconds: command == "serve" ? 180 : 3600)
                     defer { timeout.cancel() }
                     while let message = try self.readMessage() {
-                        if let error = message.error { throw localSpeechError(error) }
+                        if let error = message.error {
+                            throw localSpeechError(error, category: message.failure_code.flatMap(DownloadFailure.init(rawValue:)) ?? .unknown,
+                                                   code: message.code ?? 1)
+                        }
                         onMessage(message)
                         if command == "serve", message.ready == true {
                             continuation.resume()
@@ -199,7 +193,8 @@ final class LocalSpeechProcess: @unchecked Sendable {
                     p.waitUntilExit()
                     guard command != "serve", p.terminationStatus == 0,
                           (command == "prepare" || LocalSpeechPaths.isInstalled(profile)) else {
-                        throw localSpeechError("Local model process stopped. See LocalModels/worker.log or installation.log.")
+                        throw localSpeechError("Local model process stopped. See LocalModels/worker.log or installation.log.",
+                                               category: .process, code: Int(p.terminationStatus))
                     }
                     self.close()
                     continuation.resume()
@@ -365,22 +360,27 @@ final class LocalModelDownloads {
     nonisolated private static func installModel(_ selection: SpeechModelProfile, _ process: LocalSpeechProcess,
                                                  _ receive: @escaping @Sendable (LocalSpeechMessage) -> Void) async throws {
         log("local model download stage: storage-cleanup")
+        DownloadDiagnostics.shared.record(.stage, model: selection, stage: .storage)
         try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
         try Task.checkCancellation()
         log("local model download stage: interpreter-prepare")
+        DownloadDiagnostics.shared.record(.stage, model: selection, stage: .interpreterPrepare)
         let python = try await ManagedSpeechRuntime.ensure(progress: receive)
         try Task.checkCancellation()
         log("local model download stage: installer-launch")
+        DownloadDiagnostics.shared.record(.stage, model: selection, stage: .installerLaunch)
         try await process.launch(python: python, command: "install", profile: selection, onMessage: receive)
     }
 
     func start(_ selection: SpeechModelProfile) {
         guard task == nil else {
             log("local model download: existing operation shown instead of starting a duplicate")
+            DownloadDiagnostics.shared.record(.duplicate, model: selection)
             onChange?()
             return
         }
         log("local model download starting: \(selection.rawValue)")
+        DownloadDiagnostics.shared.record(.start, model: selection)
         profile = selection
         let operation = UUID()
         operationID = operation
@@ -396,6 +396,9 @@ final class LocalModelDownloads {
                     do { try await Task.sleep(for: .seconds(10)) } catch { return }
                     guard let self, self.operationID == operation else { return }
                     log("local model download waiting: model=\(selection.rawValue) phase=\(self.message?.phase ?? "unknown") elapsed=\(self.elapsedSeconds)s bytes=\(self.message?.downloaded ?? 0)/\(self.message?.total ?? 0)")
+                    DownloadDiagnostics.shared.record(.progress, model: selection,
+                        stage: self.message?.phase.flatMap(DownloadStage.init(rawValue:)) ?? .unknown,
+                        elapsed: self.elapsedSeconds, bytes: self.message?.downloaded, total: self.message?.total)
                     self.onChange?()
                 }
             }
@@ -407,6 +410,13 @@ final class LocalModelDownloads {
                         guard let self, self.operationID == operation, !self.isCancelling else { return }
                         if self.message?.phase != update.phase {
                             log("local model download stage: \(update.phase ?? "unknown")")
+                            DownloadDiagnostics.shared.record(.stage, model: selection,
+                                stage: update.phase.flatMap(DownloadStage.init(rawValue:)) ?? .unknown, elapsed: self.elapsedSeconds)
+                        }
+                        if let retry = update.retry {
+                            DownloadDiagnostics.shared.record(.retry, model: selection, stage: .downloading,
+                                elapsed: self.elapsedSeconds, failure: update.failure_code.flatMap(DownloadFailure.init(rawValue:)) ?? .unknown,
+                                code: update.code ?? retry)
                         }
                         if self.message?.phase != update.phase || self.message?.downloaded != update.downloaded {
                             self.lastProgressAt = Date()
@@ -419,13 +429,18 @@ final class LocalModelDownloads {
                 try Task.checkCancellation()
                 message = LocalSpeechMessage(phase: "ready")
                 log("local model download completed: \(selection.rawValue) elapsed=\(elapsedSeconds)s")
+                DownloadDiagnostics.shared.record(.completed, model: selection, elapsed: elapsedSeconds)
             } catch {
                 if Task.isCancelled {
                     message = LocalSpeechMessage(phase: "cancelled")
                     log("local model download cancelled: \(selection.rawValue)")
+                    DownloadDiagnostics.shared.record(.cancelled, model: selection, elapsed: elapsedSeconds)
                 } else {
                     failure = error.localizedDescription
                     log("local model download failed: \(selection.rawValue): \(error.localizedDescription)")
+                    DownloadDiagnostics.shared.record(.failed, model: selection,
+                        stage: message?.phase.flatMap(DownloadStage.init(rawValue:)) ?? .unknown,
+                        elapsed: elapsedSeconds, failure: DownloadFailure.classify(error), code: (error as NSError).code)
                 }
             }
         }
@@ -456,6 +471,7 @@ final class LocalModelDownloads {
     func cancel() {
         guard isRunning, !removing, !isCancelling else { return }
         isCancelling = true
+        DownloadDiagnostics.shared.record(.cancel, model: profile, elapsed: elapsedSeconds)
         message = LocalSpeechMessage(phase: "cancelling")
         process?.cancel()
         task?.cancel()

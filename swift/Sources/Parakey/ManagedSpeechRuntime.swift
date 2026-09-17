@@ -25,7 +25,7 @@ enum ManagedSpeechRuntime {
         }
         let values = try root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         guard (values.volumeAvailableCapacityForImportantUsage ?? 0) > 2_000_000_000 else {
-            throw localSpeechError("At least 2 GB of free disk space is needed to prepare the speech runtime")
+            throw localSpeechError("At least 2 GB of free disk space is needed to prepare the speech runtime", category: .diskSpace)
         }
         // Only incomplete staging directories are removed, under the cross-process lock.
         for entry in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
@@ -47,7 +47,7 @@ enum ManagedSpeechRuntime {
             var hash = SHA256()
             while let data = try file.read(upToCount: 1_048_576), !data.isEmpty { hash.update(data: data) }
             guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == archiveSHA256 else {
-                throw localSpeechError("Speech runtime checksum mismatch")
+                throw localSpeechError("Speech runtime checksum mismatch", category: .checksum)
             }
         }.value
         try Task.checkCancellation()
@@ -223,9 +223,11 @@ private final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegat
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
         do {
+            DownloadDiagnostics.shared.record(.response, stage: .interpreter,
+                code: (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0)
             guard let response = downloadTask.response as? HTTPURLResponse, response.statusCode == 200 else {
                 let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
-                throw localSpeechError("Speech runtime download failed: HTTP \(status). Check the network or VPN and retry.")
+                throw localSpeechError("Speech runtime download failed: HTTP \(status). Check the network or VPN and retry.", category: .http, code: status)
             }
             try FileManager.default.moveItem(at: location, to: destination)
             finish(nil)
