@@ -17556,6 +17556,14 @@ private enum ParakeySelfTest {
             return runSuite("local-model-ui") {
                 try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
             }
+        case "local-model-lifecycle":
+            return runSuite("local-model-lifecycle") {
+                try MainActor.assumeIsolated { try LocalModelDownloads.testLifecycle() }
+            }
+        case "runtime-network":
+            return runSuite("runtime-network") {
+                try asyncLocalModelTest { try await ManagedSpeechRuntime.testNetworkLifecycle() }
+            }
         case "permissions-ui":
             return runSuite("permissions-ui") {
                 try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testPermissionRecoveryUI() }
@@ -17778,6 +17786,13 @@ private enum ParakeySelfTest {
                 let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                 try Data("test".utf8).write(to: path)
                 defer { try? FileManager.default.removeItem(at: path) }
+                let cancelled = LocalSpeechProcess(script: fixture)
+                cancelled.cancel()
+                do {
+                    try await cancelled.launch(python: URL(fileURLWithPath: "/usr/bin/python3"),
+                                               command: "serve", profile: .whisperTurbo)
+                    throw localSpeechError("Pre-cancelled process was launched")
+                } catch is CancellationError { }
                 try await process.launch(python: URL(fileURLWithPath: "/usr/bin/python3"),
                                          command: "serve", profile: .whisperTurbo)
                 let text = try await process.request(path: path, language: "ru", progress: { _ in })
@@ -17824,6 +17839,7 @@ private enum ParakeySelfTest {
     }
 
     private static func testAll() throws {
+        try MainActor.assumeIsolated { try LocalModelDownloads.testLifecycle() }
         try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testLocalModelDownloadHitTarget() }
         try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testPermissionRecoveryUI() }
         try testAgentInstanceLock()
@@ -23078,7 +23094,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var aiModelField: NSTextField?
     private weak var settingsScrollView: NSScrollView?
     private var pendingAIKey = ""
-    private let localModelDownloads = LocalModelDownloads()
+    private let localModelDownloads: LocalModelDownloads
     private weak var localModelStatusLabel: NSTextField?
     private weak var localModelProgress: NSProgressIndicator?
     private weak var localModelStatusContainer: NSStackView?
@@ -23086,6 +23102,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private weak var localModelRemoveButton: NSButton?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
+
+    init(downloads: LocalModelDownloads = LocalModelDownloads()) {
+        localModelDownloads = downloads
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard SuperDictateControlPanelRegistry.claimCurrentPanel() else {
@@ -23141,9 +23162,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         if closingWindow === window {
-            settingsWindow?.orderOut(nil)
-            settingsWindow = nil
-            NSApp.terminate(nil)
+            settingsWindow?.close()
+            if !localModelDownloads.isRunning { NSApp.terminate(nil) }
         }
     }
 
@@ -24657,9 +24677,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 if progress.isIndeterminate { progress.startAnimation(nil) }
                 progress.widthAnchor.constraint(equalToConstant: 590).isActive = true
                 stack.addArrangedSubview(progress)
-                stack.addArrangedSubview(panelButton(t("Отменить загрузку", "Cancel download"),
-                                                     action: #selector(cancelLocalSpeechDownload(_:)),
-                                                     enabled: true, toolTip: t("Текущая модель останется доступной.", "The current model remains available.")))
+                if !localModelDownloads.removing {
+                    stack.addArrangedSubview(panelButton(localModelDownloads.isCancelling ? t("Отменяю…", "Cancelling…") : t("Отменить загрузку", "Cancel download"),
+                                                         action: #selector(cancelLocalSpeechDownload(_:)),
+                                                         enabled: !localModelDownloads.isCancelling, toolTip: t("Текущая модель останется доступной.", "The current model remains available.")))
+                }
             }
         }
     }
@@ -24713,6 +24735,60 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             try testLocalModelDownloadHitTarget(profile)
         }
         try testLocalModelDownloadHitTarget(.whisperTurbo, clearDraft: true)
+        try testDownloadWindowLifecycle()
+    }
+
+    private static func testDownloadWindowLifecycle() throws {
+        let downloads = LocalModelDownloads { _, _, receive in
+            receive(LocalSpeechMessage(phase: "runtime-packages"))
+            try await Task.sleep(for: .seconds(30))
+        }
+        let controller = SuperDictateControlPanelApp(downloads: downloads)
+        func makeWindow() -> NSWindow {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 600),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            controller.settingsWindow = window
+            var draft = ControlPanelSettingsDraft(settings: controller.settings)
+            draft.speechModelProfile = .whisperTurbo
+            controller.settingsDraft = draft
+            window.contentView = controller.makeSettingsContentView()
+            window.contentView?.layoutSubtreeIfNeeded()
+            return window
+        }
+        let first = makeWindow()
+        guard let button = controller.localModelDownloadButton else { throw localSpeechError("No download button") }
+        button.performClick(nil)
+        defer { downloads.cancel() }
+        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: first))
+        guard downloads.isRunning, controller.settingsWindow == nil else {
+            throw localSpeechError("Closing settings cancelled download")
+        }
+        let main = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 400),
+                            styleMask: [.titled], backing: .buffered, defer: false)
+        main.isReleasedWhenClosed = false
+        controller.window = main
+        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: main))
+        guard downloads.isRunning, !controller.applicationShouldTerminateAfterLastWindowClosed(NSApp) else {
+            throw localSpeechError("Closing main panel interrupted download")
+        }
+        let second = makeWindow()
+        let beforeCompletion = second.contentView
+        guard controller.localModelProgress?.window === second,
+              controller.localModelDownloadButton?.isEnabled == false else {
+            throw localSpeechError("Reopened settings lost active download")
+        }
+        downloads.cancel()
+        let deadline = Date().addingTimeInterval(3)
+        while downloads.isRunning, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard !downloads.isRunning, downloads.message?.phase == "cancelled",
+              second.contentView !== beforeCompletion,
+              controller.localModelProgress == nil,
+              controller.localModelDownloadButton?.isEnabled == true else {
+            throw localSpeechError("Cancellation did not restore controls and settings validation")
+        }
     }
 
     private static func testLocalModelDownloadHitTarget(_ profile: SpeechModelProfile, clearDraft: Bool = false) throws {
@@ -24764,6 +24840,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                   $0.action == #selector(cancelLocalSpeechDownload(_:))
               }), cancel.isEnabled else {
             throw localSpeechError("Download click did not display progress and cancel controls")
+        }
+        currentContent.layoutSubtreeIfNeeded()
+        let cancelCenter = cancel.convert(NSPoint(x: cancel.bounds.midX, y: cancel.bounds.midY), to: currentContent)
+        let cancelHit = currentContent.hitTest(cancelCenter)
+        guard currentContent.bounds.contains(cancelCenter),
+              cancelHit === cancel || cancelHit?.isDescendant(of: cancel) == true else {
+            throw localSpeechError("Cancel control is clipped or not clickable")
+        }
+        cancel.performClick(nil)
+        guard controller.localModelDownloads.isCancelling else {
+            throw localSpeechError("Cancel click did not reach active download")
         }
     }
     #endif
@@ -24824,6 +24911,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             case "runtime-packages": status = t("Скачиваю и устанавливаю зависимости движка…", "Downloading and installing runtime dependencies…")
             case "runtime-imports": status = t("Проверяю запуск движка…", "Checking runtime imports…")
             case "cancelled": status = t("Загрузка отменена", "Download cancelled")
+            case "cancelling": status = t("Отменяю загрузку…", "Cancelling download…")
             case "removing": status = t("Удаляю файлы…", "Removing files…")
             case "removed": status = t("Файлы удалены", "Files removed")
             case "listing": status = t("Проверяю список файлов…", "Checking model files…")
@@ -24844,10 +24932,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func updateLocalModelDownloadStatus() {
+        // Terminal transitions also update model availability and Save validation.
+        if !localModelDownloads.isRunning {
+            refreshSettingsWindow()
+            return
+        }
         let selected = settingsDraft?.speechModelProfile
         let enabled = !localModelDownloads.isRunning && selected != settings.speechModelProfile
         localModelDownloadButton?.isEnabled = enabled
         localModelRemoveButton?.isEnabled = enabled
+        if localModelDownloads.isCancelling, let stack = localModelStatusContainer {
+            rebuildLocalModelStatus(stack)
+            return
+        }
         guard localModelDownloads.isRunning, let label = localModelStatusLabel,
               let progress = localModelProgress, let content = settingsWindow?.contentView,
               label.isDescendant(of: content), progress.isDescendant(of: content) else {

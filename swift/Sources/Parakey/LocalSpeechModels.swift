@@ -38,6 +38,66 @@ enum LocalSpeechPaths {
 
 }
 
+#if DEBUG
+extension LocalModelDownloads {
+    static func testLifecycle() throws {
+        final class Probe: @unchecked Sendable {
+            let lock = NSLock()
+            var attempts = 0
+            var late: (@Sendable (LocalSpeechMessage) -> Void)?
+        }
+        let probe = Probe()
+        let downloads = LocalModelDownloads { _, _, receive in
+            let attempt = probe.lock.withLock { probe.attempts += 1; return probe.attempts }
+            receive(LocalSpeechMessage(phase: "runtime-packages"))
+            if attempt == 3 {
+                probe.lock.withLock { probe.late = receive }
+                try await Task.sleep(for: .seconds(30))
+            } else {
+                try await Task.sleep(for: .milliseconds(30))
+            }
+            if attempt == 1 { throw localSpeechError("fixture offline") }
+        }
+        func wait(_ condition: () -> Bool) throws {
+            let deadline = Date().addingTimeInterval(3)
+            while !condition(), Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            }
+            guard condition() else { throw localSpeechError("Download lifecycle test timed out") }
+        }
+        downloads.start(.whisperTurbo)
+        downloads.start(.qwenSmall)
+        try wait { !downloads.isRunning }
+        guard downloads.profile == .whisperTurbo, downloads.failure == "fixture offline",
+              probe.lock.withLock({ probe.attempts }) == 1 else {
+            throw localSpeechError("Duplicate click or failure recovery is broken")
+        }
+        downloads.start(.whisperTurbo)
+        guard downloads.failure == nil else { throw localSpeechError("Retry retained old error") }
+        try wait { !downloads.isRunning }
+        guard downloads.message?.phase == "ready" else { throw localSpeechError("Retry did not complete") }
+        downloads.start(.whisperTurbo)
+        try wait { probe.lock.withLock { probe.late != nil } }
+        downloads.cancel()
+        downloads.cancel()
+        guard downloads.isCancelling, downloads.message?.phase == "cancelling" else {
+            throw localSpeechError("Cancellation was not immediately visible")
+        }
+        let late = probe.lock.withLock { probe.late }
+        late?(LocalSpeechMessage(phase: "downloading", downloaded: 99))
+        try wait { !downloads.isRunning }
+        guard downloads.message?.phase == "cancelled", !downloads.isCancelling else {
+            throw localSpeechError("Cancelled download remained busy")
+        }
+        downloads.start(.qwenSmall)
+        late?(LocalSpeechMessage(phase: "obsolete", downloaded: 123))
+        try wait { !downloads.isRunning }
+        guard downloads.profile == .qwenSmall, downloads.message?.phase == "ready",
+              downloads.failure == nil else { throw localSpeechError("Late callback corrupted retry") }
+    }
+}
+#endif
+
 private struct LocalModelManifest: Decodable {
     struct File: Decodable { let name: String; let size: Int64 }
     let version: String
@@ -81,6 +141,7 @@ final class LocalSpeechProcess: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
                 do {
+                    guard !self.cancellationLock.withLock({ self.cancelled }) else { throw CancellationError() }
                     let p = Process()
                     let stdin = Pipe(), stdout = Pipe()
                     try FileManager.default.createDirectory(at: LocalSpeechPaths.root, withIntermediateDirectories: true)
@@ -121,7 +182,7 @@ final class LocalSpeechProcess: @unchecked Sendable {
                     self.cancellableProcess = p
                     let cancelled = self.cancelled
                     self.cancellationLock.unlock()
-                    if cancelled { p.terminate() }
+                    if cancelled { Self.terminate(p) }
                     self.process = p
                     self.input = stdin.fileHandleForWriting
                     self.output = stdout.fileHandleForReading
@@ -277,12 +338,17 @@ final class LocalSpeechWorker: Sendable {
     func stop() async { await process.stop() }
 }
 
+typealias LocalModelInstallation = @Sendable (SpeechModelProfile, LocalSpeechProcess,
+    @escaping @Sendable (LocalSpeechMessage) -> Void) async throws -> Void
+
 @MainActor
 final class LocalModelDownloads {
     private(set) var profile: SpeechModelProfile?
     private(set) var message: LocalSpeechMessage?
     private(set) var failure: String?
     private(set) var removing = false
+    private(set) var isCancelling = false
+    private let install: LocalModelInstallation
     private var task: Task<Void, Never>?
     private var process: LocalSpeechProcess?
     private var operationID = UUID()
@@ -291,6 +357,22 @@ final class LocalModelDownloads {
     var elapsedSeconds: Int { Int(max(0, Date().timeIntervalSince(startedAt ?? Date()))) }
     var waitingForProgress: Bool { isRunning && Date().timeIntervalSince(lastProgressAt) >= 30 }
     var onChange: (() -> Void)?
+
+    init(install: @escaping LocalModelInstallation = LocalModelDownloads.installModel) {
+        self.install = install
+    }
+
+    nonisolated private static func installModel(_ selection: SpeechModelProfile, _ process: LocalSpeechProcess,
+                                                 _ receive: @escaping @Sendable (LocalSpeechMessage) -> Void) async throws {
+        log("local model download stage: storage-cleanup")
+        try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
+        try Task.checkCancellation()
+        log("local model download stage: interpreter-prepare")
+        let python = try await ManagedSpeechRuntime.ensure(progress: receive)
+        try Task.checkCancellation()
+        log("local model download stage: installer-launch")
+        try await process.launch(python: python, command: "install", profile: selection, onMessage: receive)
+    }
 
     func start(_ selection: SpeechModelProfile) {
         guard task == nil else {
@@ -317,15 +399,12 @@ final class LocalModelDownloads {
                     self.onChange?()
                 }
             }
-            defer { heartbeat.cancel(); operationID = UUID(); task = nil; self.process = nil; onChange?() }
+            defer { heartbeat.cancel(); operationID = UUID(); task = nil; self.process = nil; isCancelling = false; onChange?() }
             do {
                 try Task.checkCancellation()
-                log("local model download stage: storage-cleanup")
-                try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
-                log("local model download stage: interpreter-prepare")
                 let receive: @Sendable (LocalSpeechMessage) -> Void = { [weak self] update in
                     Task { @MainActor in
-                        guard let self, self.operationID == operation else { return }
+                        guard let self, self.operationID == operation, !self.isCancelling else { return }
                         if self.message?.phase != update.phase {
                             log("local model download stage: \(update.phase ?? "unknown")")
                         }
@@ -336,10 +415,7 @@ final class LocalModelDownloads {
                         self.onChange?()
                     }
                 }
-                let python = try await ManagedSpeechRuntime.ensure(progress: receive)
-                try Task.checkCancellation()
-                log("local model download stage: installer-launch")
-                try await process.launch(python: python, command: "install", profile: selection, onMessage: receive)
+                try await install(selection, process, receive)
                 try Task.checkCancellation()
                 message = LocalSpeechMessage(phase: "ready")
                 log("local model download completed: \(selection.rawValue) elapsed=\(elapsedSeconds)s")
@@ -378,7 +454,11 @@ final class LocalModelDownloads {
     }
 
     func cancel() {
+        guard isRunning, !removing, !isCancelling else { return }
+        isCancelling = true
+        message = LocalSpeechMessage(phase: "cancelling")
         process?.cancel()
         task?.cancel()
+        onChange?()
     }
 }

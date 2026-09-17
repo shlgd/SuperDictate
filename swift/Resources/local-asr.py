@@ -14,7 +14,6 @@ import sys
 import threading
 import time
 import urllib.request
-import venv
 
 CATALOG = {
     "whisper_large_v3": ("whisper", "mlx-community/whisper-large-v3-mlx"),
@@ -92,7 +91,7 @@ def bootstrap(root, key):
     ]
     try:
         emit(phase="runtime-environment")
-        venv.EnvBuilder(with_pip=True).create(staging)
+        checked_run([sys.executable, "-m", "venv", str(staging)], phase="runtime-environment", timeout=120)
         python = staging / "bin/python3"
         checked_run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--timeout", "20", "--retries", "2", "--no-cache-dir", "--no-compile", *packages])
         checked_run([str(python), "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"], phase="runtime-imports", timeout=120)
@@ -132,7 +131,8 @@ def fetch(url, path, completed, total, started, expected_size=None, sha=None, tr
             with urllib.request.urlopen(url, timeout=30) as response, partial.open("wb") as output:
                 last = 0.0
                 while True:
-                    data = response.read(1024 * 1024)
+                    # Report slow connections without waiting to fill a 1 MB buffer.
+                    data = response.read1(64 * 1024)
                     if not data:
                         break
                     output.write(data)
@@ -339,7 +339,7 @@ def main():
             if args.command in ("install", "prepare"):
                 python = bootstrap(args.root, args.model)
                 if args.command == "prepare":
-                    checked_run([str(python), "-c", "import ssl, mlx.core, mlx_audio.stt, mlx_whisper, gigaam; print('Relocated runtime OK')"])
+                    checked_run([str(python), "-c", "import ssl, mlx.core, mlx_audio.stt, mlx_whisper, gigaam; print('Relocated runtime OK')"], phase="runtime-imports", timeout=120)
                     emit(phase="runtime-ready")
                     return
                 # Keep the lock across exec so cleanup cannot erase this installation.

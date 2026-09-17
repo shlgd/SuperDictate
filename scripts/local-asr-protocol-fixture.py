@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import time
+import signal
 
 print(json.dumps({"ready": True}), flush=True)
 for line in sys.stdin:
@@ -10,6 +11,7 @@ for line in sys.stdin:
     if request.get("language") == "error":
         print(json.dumps({"error": "fixture error"}), flush=True)
     elif request.get("language") == "hang":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(60)
     else:
         assert Path(request["path"]).read_bytes() == b"test"

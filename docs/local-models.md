@@ -66,6 +66,36 @@ Parakeet остаётся выбранным по умолчанию. Его у�
 
 ## Проверки без загрузки моделей
 
+Для проверки состояния кнопки и отказов загрузки (debug-сборка):
+
+```bash
+swift run --package-path swift Parakey --self-test local-model-ui
+swift run --package-path swift Parakey --self-test local-model-lifecycle
+swift run --package-path swift Parakey --self-test runtime-network
+```
+
+`runtime-network` запускает HTTP-сервер только на loopback: успешная передача,
+HTTP 503, отсутствие ответа, обрыв тела, отмена и повторная попытка. Он также
+проверяет тайм-аут и отмену процесса распаковки. Модели и разрешения не меняются.
+UI-тесты проверяют AppKit-кнопку, статус, отмену, закрытие/повторное открытие формы
+и обновление формы после завершения; это не тест реальной сети другого Mac.
+
+Полная установка Whisper Turbo в пустую временную папку (несколько ГБ трафика):
+
+```bash
+python3 -B scripts/test-local-model-install.py --python "$HOME/Library/Application Support/SuperDictate/LocalModels/cpython-3.11.16-20260901/bin/python3"
+```
+
+Тест ограничен 600 секундами, проверяет файлы по манифесту и удаляет временный
+каталог. Рабочие модели не меняются. 17 сентября 2026 чистая установка прошла
+за 128,5 с, размер проверенных файлов модели: 1 613 977 880 байт. Это проверка
+установки, а не качества распознавания. Скорость на другой сети не гарантируется.
+
+В журнале приложения строки `local model download` содержат этап и счётчик времени.
+Подробности установки зависимостей находятся отдельно в
+`~/Library/Application Support/SuperDictate/LocalModels/installation.log`;
+перед передачей такого файла следует удалить личные пути и возможные секреты.
+
 ```bash
 swift run --package-path swift Parakey --self-test all
 swift run --package-path swift Parakey --self-test local-model-protocol

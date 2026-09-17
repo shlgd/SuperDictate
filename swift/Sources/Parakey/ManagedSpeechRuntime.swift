@@ -49,15 +49,10 @@ enum ManagedSpeechRuntime {
             guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == archiveSHA256 else {
                 throw localSpeechError("Speech runtime checksum mismatch")
             }
-            let extract = Process()
-            extract.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-            extract.arguments = ["-xzf", archive.path, "-C", stage.path]
-            extract.standardOutput = FileHandle.nullDevice
-            extract.standardError = FileHandle.nullDevice
-            try extract.run()
-            extract.waitUntilExit()
-            guard extract.terminationStatus == 0 else { throw localSpeechError("Could not unpack the speech runtime") }
         }.value
+        try Task.checkCancellation()
+        try await RuntimeExtraction().run(executable: "/usr/bin/tar",
+                                          arguments: ["-xzf", archive.path, "-C", stage.path])
         try Task.checkCancellation()
         let unpacked = stage.appendingPathComponent("python")
         guard fm.isExecutableFile(atPath: unpacked.appendingPathComponent("bin/python3").path) else {
@@ -70,6 +65,108 @@ enum ManagedSpeechRuntime {
     }
 }
 
+private final class RuntimeExtraction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let process = Process()
+    private var cancelled = false
+
+    func run(executable: String, arguments: [String], timeout: TimeInterval = 60) async throws {
+        try await withTaskCancellationHandler {
+            try await Task.detached(priority: .utility) { [self] in
+                try lock.withLock {
+                    guard !cancelled else { throw CancellationError() }
+                    process.executableURL = URL(fileURLWithPath: executable)
+                    process.arguments = arguments
+                    process.standardOutput = FileHandle.nullDevice
+                    process.standardError = FileHandle.nullDevice
+                    try process.run()
+                }
+                let deadline = DispatchWorkItem { [self] in stop() }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+                defer { deadline.cancel() }
+                process.waitUntilExit()
+                if lock.withLock({ cancelled }) { throw CancellationError() }
+                guard process.terminationStatus == 0 else {
+                    throw localSpeechError("Runtime extraction failed or timed out. Retry installation.")
+                }
+            }.value
+        } onCancel: {
+            self.lock.withLock { self.cancelled = true }
+            self.stop()
+        }
+    }
+
+    private func stop() {
+        lock.withLock {
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+    }
+}
+
+#if DEBUG
+extension ManagedSpeechRuntime {
+    static func testNetworkLifecycle() async throws {
+        try await RuntimeExtraction().run(executable: "/usr/bin/true", arguments: [])
+        do {
+            try await RuntimeExtraction().run(executable: "/bin/sleep", arguments: ["30"], timeout: 0.1)
+            throw localSpeechError("Extraction deadline did not fire")
+        } catch {
+            guard error.localizedDescription.contains("extraction failed") else { throw error }
+        }
+        let extraction = Task { try await RuntimeExtraction().run(executable: "/bin/sleep", arguments: ["30"]) }
+        try await Task.sleep(for: .milliseconds(50))
+        extraction.cancel()
+        do { try await extraction.value; throw localSpeechError("Extraction cancellation failed") }
+        catch is CancellationError { }
+        print("PASS extraction success, deadline, cancellation")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("scripts/runtime-download-fixture.py")
+        let server = Process()
+        let output = Pipe()
+        server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        server.arguments = ["-u", fixture.path]
+        server.standardOutput = output
+        server.standardError = FileHandle.nullDevice
+        try server.run()
+        defer { server.terminate(); server.waitUntilExit() }
+        guard let line = String(data: output.fileHandleForReading.availableData, encoding: .utf8),
+              let port = Int(line.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw localSpeechError("HTTP fixture failed to start")
+        }
+        for route in ["ok", "error", "hang", "partial", "cancel", "ok"] {
+            let destination = directory.appendingPathComponent(UUID().uuidString)
+            let download = RuntimeDownloadProgress(destination: destination, requestTimeout: 0.5,
+                                                   resourceTimeout: 2, progress: { _ in })
+            let url = URL(string: "http://127.0.0.1:\(port)/\(route == "cancel" ? "hang" : route)")!
+            let task = Task { try await download.download(url) }
+            if route == "cancel" {
+                try await Task.sleep(for: .milliseconds(100))
+                task.cancel()
+            }
+            var failure: Error?
+            do { try await task.value } catch { failure = error }
+            if route == "ok" {
+                guard failure == nil, try Data(contentsOf: destination).count == 65536 else {
+                    throw localSpeechError("Successful HTTP download failed: \(String(describing: failure))")
+                }
+            } else {
+                guard failure != nil, !FileManager.default.fileExists(atPath: destination.path) else {
+                    throw localSpeechError("Failed HTTP transfer published a file: \(route)")
+                }
+                if route == "error", failure?.localizedDescription.contains("503") != true {
+                    throw localSpeechError("HTTP status was lost")
+                }
+            }
+            print("PASS runtime HTTP \(route)")
+        }
+    }
+}
+#endif
+
 private final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let progress: @Sendable (LocalSpeechMessage) -> Void
     private let destination: URL
@@ -80,9 +177,14 @@ private final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegat
     private var cancelled = false
     private let started = Date()
     private var lastUpdate = Date.distantPast
-    init(destination: URL, progress: @escaping @Sendable (LocalSpeechMessage) -> Void) {
+    private let requestTimeout: TimeInterval
+    private let resourceTimeout: TimeInterval
+    init(destination: URL, requestTimeout: TimeInterval = 30, resourceTimeout: TimeInterval = 600,
+         progress: @escaping @Sendable (LocalSpeechMessage) -> Void) {
         self.destination = destination
         self.progress = progress
+        self.requestTimeout = requestTimeout
+        self.resourceTimeout = resourceTimeout
     }
     func download(_ url: URL) async throws {
         try await withTaskCancellationHandler {
@@ -91,8 +193,8 @@ private final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegat
                 guard !cancelled else { lock.unlock(); continuation.resume(throwing: CancellationError()); return }
                 self.continuation = continuation
                 let configuration = URLSessionConfiguration.ephemeral
-                configuration.timeoutIntervalForRequest = 30
-                configuration.timeoutIntervalForResource = 600
+                configuration.timeoutIntervalForRequest = requestTimeout
+                configuration.timeoutIntervalForResource = resourceTimeout
                 let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
                 self.session = session
                 let task = session.downloadTask(with: url)

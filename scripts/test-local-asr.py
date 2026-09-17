@@ -84,13 +84,16 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(path.with_suffix(".part").exists())
 
     def test_runtime_failure_removes_staging(self):
-        def fake_environment(path):
-            path.mkdir()
-            (path / "partial").write_bytes(b"unfinished")
+        def fake_setup(arguments, **kwargs):
+            if "venv" in arguments:
+                path = Path(arguments[-1])
+                path.mkdir()
+                (path / "partial").write_bytes(b"unfinished")
+                return
+            raise RuntimeError("network error")
         with tempfile.TemporaryDirectory() as directory, patch.object(asr, "emit"):
             root = Path(directory)
-            with patch.object(asr.venv.EnvBuilder, "create", side_effect=fake_environment), \
-                 patch.object(asr, "checked_run", side_effect=RuntimeError("network error")):
+            with patch.object(asr, "checked_run", side_effect=fake_setup):
                 with self.assertRaisesRegex(RuntimeError, "network error"):
                     asr.bootstrap(root, "qwen_06")
             self.assertFalse((root / ".runtime-stage").exists())
