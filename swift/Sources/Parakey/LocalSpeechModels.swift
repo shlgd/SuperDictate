@@ -286,6 +286,10 @@ final class LocalModelDownloads {
     private var task: Task<Void, Never>?
     private var process: LocalSpeechProcess?
     private var operationID = UUID()
+    private var startedAt: Date?
+    private var lastProgressAt = Date()
+    var elapsedSeconds: Int { Int(max(0, Date().timeIntervalSince(startedAt ?? Date()))) }
+    var waitingForProgress: Bool { isRunning && Date().timeIntervalSince(lastProgressAt) >= 30 }
     var onChange: (() -> Void)?
 
     func start(_ selection: SpeechModelProfile) {
@@ -299,26 +303,46 @@ final class LocalModelDownloads {
         let operation = UUID()
         operationID = operation
         failure = nil
+        startedAt = Date()
+        lastProgressAt = Date()
         message = LocalSpeechMessage(phase: "runtime")
         let process = LocalSpeechProcess()
         self.process = process
         task = Task {
-            defer { operationID = UUID(); task = nil; self.process = nil; onChange?() }
+            let heartbeat = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(10)) } catch { return }
+                    guard let self, self.operationID == operation else { return }
+                    log("local model download waiting: model=\(selection.rawValue) phase=\(self.message?.phase ?? "unknown") elapsed=\(self.elapsedSeconds)s bytes=\(self.message?.downloaded ?? 0)/\(self.message?.total ?? 0)")
+                    self.onChange?()
+                }
+            }
+            defer { heartbeat.cancel(); operationID = UUID(); task = nil; self.process = nil; onChange?() }
             do {
                 try Task.checkCancellation()
+                log("local model download stage: storage-cleanup")
                 try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
+                log("local model download stage: interpreter-prepare")
                 let receive: @Sendable (LocalSpeechMessage) -> Void = { [weak self] update in
                     Task { @MainActor in
                         guard let self, self.operationID == operation else { return }
+                        if self.message?.phase != update.phase {
+                            log("local model download stage: \(update.phase ?? "unknown")")
+                        }
+                        if self.message?.phase != update.phase || self.message?.downloaded != update.downloaded {
+                            self.lastProgressAt = Date()
+                        }
                         self.message = update
                         self.onChange?()
                     }
                 }
                 let python = try await ManagedSpeechRuntime.ensure(progress: receive)
                 try Task.checkCancellation()
+                log("local model download stage: installer-launch")
                 try await process.launch(python: python, command: "install", profile: selection, onMessage: receive)
                 try Task.checkCancellation()
                 message = LocalSpeechMessage(phase: "ready")
+                log("local model download completed: \(selection.rawValue) elapsed=\(elapsedSeconds)s")
             } catch {
                 if Task.isCancelled {
                     message = LocalSpeechMessage(phase: "cancelled")

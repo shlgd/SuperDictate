@@ -23081,6 +23081,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private let localModelDownloads = LocalModelDownloads()
     private weak var localModelStatusLabel: NSTextField?
     private weak var localModelProgress: NSProgressIndicator?
+    private weak var localModelStatusContainer: NSStackView?
+    private weak var localModelDownloadButton: NSButton?
+    private weak var localModelRemoveButton: NSButton?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -24564,6 +24567,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func localSpeechModelSection(_ draft: ControlPanelSettingsDraft) -> NSView {
+        localModelDownloadButton = nil
+        localModelRemoveButton = nil
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -24597,14 +24602,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 toolTip: t("Скачать модель и отдельный Python-движок. Текущая диктовка продолжит работать.",
                            "Download the model and a separate Python runtime. Current dictation keeps working."))
             download.identifier = NSUserInterfaceItemIdentifier(profile.rawValue)
+            localModelDownloadButton = download
             row.addArrangedSubview(download)
             stack.addArrangedSubview(row)
             if LocalSpeechPaths.isInstalled(profile) {
-                stack.addArrangedSubview(panelButton(t("Удалить модель", "Delete model"),
+                let remove = panelButton(t("Удалить модель", "Delete model"),
                     action: #selector(removeLocalSpeechModel(_:)),
                     enabled: !localModelDownloads.isRunning && profile != settings.speechModelProfile,
                     toolTip: t("Удалить скачанные файлы. Активную модель сначала нужно переключить.",
-                               "Delete downloaded files. Switch away from an active model first.")))
+                               "Delete downloaded files. Switch away from an active model first."))
+                localModelRemoveButton = remove
+                stack.addArrangedSubview(remove)
             }
             let hint = panelLabel(
                 LocalSpeechPaths.isInstalled(profile)
@@ -24617,6 +24625,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             hint.lineBreakMode = .byWordWrapping
             stack.addArrangedSubview(hint)
         }
+        let status = NSStackView()
+        status.orientation = .vertical
+        status.alignment = .leading
+        status.spacing = 8
+        localModelStatusContainer = status
+        stack.addArrangedSubview(status)
+        rebuildLocalModelStatus(status)
+        return stack
+    }
+
+    private func rebuildLocalModelStatus(_ stack: NSStackView) {
+        for view in stack.arrangedSubviews { stack.removeArrangedSubview(view); view.removeFromSuperview() }
+        localModelStatusLabel = nil
+        localModelProgress = nil
         if localModelDownloads.profile != nil {
             let update = localModelDownloads.message
             let label = panelLabel(localModelDownloadStatus(), size: 11.5,
@@ -24640,7 +24662,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                      enabled: true, toolTip: t("Текущая модель останется доступной.", "The current model remains available.")))
             }
         }
-        return stack
     }
 
     #if DEBUG
@@ -24735,6 +24756,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         button.performClick(nil)
         defer { controller.localModelDownloads.cancel() }
         guard controller.localModelDownloads.isRunning,
+              window.contentView === currentContent, !button.isEnabled,
               controller.localModelDownloads.profile == profile,
               controller.localModelStatusLabel?.window === window,
               controller.localModelProgress?.window === window,
@@ -24769,6 +24791,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = draft
         localModelDownloads.onChange = { [weak self] in self?.updateLocalModelDownloadStatus() }
         localModelDownloads.start(profile)
+        log("local model download UI: running=\(localModelDownloads.isRunning) buttonEnabled=\(sender.isEnabled) progressAttached=\(localModelProgress?.window != nil) statusAttached=\(localModelStatusLabel?.window != nil)")
     }
 
     @objc private func removeLocalSpeechModel(_ sender: NSButton) {
@@ -24797,6 +24820,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                              Double(update?.total ?? 0) / 1_000_000)
             case "runtime-verifying": status = t("Проверяю компоненты…", "Verifying components…")
             case "runtime": status = t("Устанавливаю локальный движок…", "Installing local runtime…")
+            case "runtime-environment": status = t("Создаю окружение движка…", "Creating runtime environment…")
+            case "runtime-packages": status = t("Скачиваю и устанавливаю зависимости движка…", "Downloading and installing runtime dependencies…")
+            case "runtime-imports": status = t("Проверяю запуск движка…", "Checking runtime imports…")
             case "cancelled": status = t("Загрузка отменена", "Download cancelled")
             case "removing": status = t("Удаляю файлы…", "Removing files…")
             case "removed": status = t("Файлы удалены", "Files removed")
@@ -24810,14 +24836,28 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                 (update?.speed ?? 0) / 1_000_000)
             }
         }
-        return (localModelDownloads.profile?.shortName ?? "") + ": " + status
+        let elapsed = localModelDownloads.isRunning ? " · \(localModelDownloads.elapsedSeconds) s" : ""
+        let waiting = localModelDownloads.waitingForProgress
+            ? t("\nНет нового прогресса. Возможна задержка сети или установки. При необходимости отмените и попробуйте другую сеть или VPN.",
+                "\nNo new progress. Network or installation may be slow. You can cancel and retry with another network or VPN.") : ""
+        return (localModelDownloads.profile?.shortName ?? "") + ": " + status + elapsed + waiting
     }
 
     private func updateLocalModelDownloadStatus() {
+        let selected = settingsDraft?.speechModelProfile
+        let enabled = !localModelDownloads.isRunning && selected != settings.speechModelProfile
+        localModelDownloadButton?.isEnabled = enabled
+        localModelRemoveButton?.isEnabled = enabled
         guard localModelDownloads.isRunning, let label = localModelStatusLabel,
               let progress = localModelProgress, let content = settingsWindow?.contentView,
               label.isDescendant(of: content), progress.isDescendant(of: content) else {
-            refreshSettingsWindow()
+            if let stack = localModelStatusContainer, let content = settingsWindow?.contentView,
+               stack.isDescendant(of: content) {
+                rebuildLocalModelStatus(stack)
+                content.layoutSubtreeIfNeeded()
+            } else {
+                refreshSettingsWindow()
+            }
             return
         }
         // Byte updates must not replace the settings form while the user is typing.

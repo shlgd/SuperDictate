@@ -122,7 +122,8 @@ private final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegat
                     didFinishDownloadingTo location: URL) {
         do {
             guard let response = downloadTask.response as? HTTPURLResponse, response.statusCode == 200 else {
-                throw localSpeechError("Could not download the bundled speech runtime")
+                let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
+                throw localSpeechError("Speech runtime download failed: HTTP \(status). Check the network or VPN and retry.")
             }
             try FileManager.default.moveItem(at: location, to: destination)
             finish(nil)

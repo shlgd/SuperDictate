@@ -54,11 +54,21 @@ def watch_parent(parent):
             os.killpg(os.getpgrp(), signal.SIGKILL)
 
 
-def checked_run(arguments):
+def checked_run(arguments, phase="runtime-packages", timeout=1200):
     global child
     child = subprocess.Popen(arguments, stdout=sys.stderr, stderr=sys.stderr)
     try:
-        code = child.wait(timeout=1200)
+        started = time.monotonic()
+        while True:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise RuntimeError(f"Runtime setup timed out during {phase}. Check the network or VPN and retry.")
+            emit(phase=phase)
+            try:
+                code = child.wait(timeout=min(5, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
         if code:
             raise RuntimeError(f"Runtime setup failed (exit {code}). See installation.log.")
     finally:
@@ -81,10 +91,11 @@ def bootstrap(root, key):
         "torch==2.10.0", "torchaudio==2.10.0",
     ]
     try:
+        emit(phase="runtime-environment")
         venv.EnvBuilder(with_pip=True).create(staging)
         python = staging / "bin/python3"
-        checked_run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--no-compile", *packages])
-        checked_run([str(python), "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"])
+        checked_run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--timeout", "20", "--retries", "2", "--no-cache-dir", "--no-compile", *packages])
+        checked_run([str(python), "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"], phase="runtime-imports", timeout=120)
         (staging / "runtime-version").write_text(ENVIRONMENT_VERSION)
         if environment.exists():
             shutil.rmtree(environment)

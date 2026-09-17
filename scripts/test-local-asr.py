@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,24 @@ spec.loader.exec_module(asr)
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_setup_process_reports_stage(self):
+        with patch.object(asr, "emit") as progress:
+            asr.checked_run([sys.executable, "-c", "pass"], phase="runtime-imports", timeout=5)
+        progress.assert_called_with(phase="runtime-imports")
+        self.assertIsNone(asr.child)
+
+    def test_setup_timeout_kills_child(self):
+        with patch.object(asr, "emit"):
+            with self.assertRaisesRegex(RuntimeError, "timed out during runtime-packages"):
+                asr.checked_run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=.05)
+        self.assertIsNone(asr.child)
+
+    def test_setup_failure_is_reported(self):
+        with patch.object(asr, "emit"):
+            with self.assertRaisesRegex(RuntimeError, "exit 7"):
+                asr.checked_run([sys.executable, "-c", "raise SystemExit(7)"], timeout=5)
+        self.assertIsNone(asr.child)
+
     def test_catalog_is_bounded_and_pinned(self):
         self.assertEqual(len(asr.CATALOG), 5)
         self.assertEqual(set(asr.REVISIONS), set(asr.CATALOG) - {"gigaam_v3"})
