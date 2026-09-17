@@ -10,6 +10,9 @@ enum DownloadStage: String, Codable, Sendable {
     case runtimeImports = "runtime-imports"
     case installerLaunch = "installer-launch"
     case runtimeRepair = "runtime-repair"
+    case runtimeDownload = "runtime-download"
+    case runtimeUnpacking = "runtime-unpacking"
+    case runtimeWaiting = "runtime-waiting"
 }
 
 enum DownloadFailure: String, Codable, Sendable {

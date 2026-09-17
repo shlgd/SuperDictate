@@ -8,12 +8,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import tarfile
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--python", required=True)
+parser.add_argument("--python")
+parser.add_argument("--packaged-archive", type=Path)
 parser.add_argument("--timeout", type=float, default=600)
 parser.add_argument("--prepare-only", action="store_true", help="Check dependencies without downloading model weights")
 args = parser.parse_args()
+if not args.python and not args.packaged_archive:
+    parser.error("Provide --python or --packaged-archive")
 script = Path(__file__).resolve().parents[1] / "swift/Resources/local-asr.py"
 with tempfile.TemporaryDirectory(prefix="superdictate-clean-install-") as directory:
     root = Path(directory)
@@ -35,6 +39,12 @@ with tempfile.TemporaryDirectory(prefix="superdictate-clean-install-") as direct
     env.pop("PYTHONPATH", None)
     started = time.monotonic()
     command = "prepare" if args.prepare_only else "install"
+    if args.packaged_archive:
+        assert not args.prepare_only
+        with tarfile.open(args.packaged_archive) as archive:
+            archive.extractall(root, filter="data")
+        args.python = str(root / "runtime/bin/python3")
+        command = "download"
     process = subprocess.Popen([args.python, "-I", "-B", "-u", str(script), command, "--root", directory,
                                 "--model", "whisper_turbo"], env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -61,6 +71,9 @@ with tempfile.TemporaryDirectory(prefix="superdictate-clean-install-") as direct
         assert not unexpected, f"Installation attempted to use development tools: {unexpected}"
     assert not any(message.get("error") for message in messages)
     phases = list(dict.fromkeys(message.get("phase") for message in messages))
+    if args.packaged_archive:
+        assert not any(phase and phase.startswith("runtime") for phase in phases), phases
+        assert not (root / "runtime-v2").exists(), "Download unexpectedly bootstrapped another runtime"
     assert ("runtime-ready" if args.prepare_only else "ready") in phases, phases
     if args.prepare_only:
         print(f"PASS clean dependencies without development tools in {time.monotonic() - started:.1f}s")

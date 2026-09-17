@@ -15,14 +15,13 @@ enum LocalSpeechPaths {
     }
 
     static func python(_ profile: SpeechModelProfile) -> URL {
-        root.appendingPathComponent("runtime-v2/bin/python3")
+        PackagedSpeechRuntime.python() ?? root.appendingPathComponent("runtime-not-ready/bin/python3")
     }
 
     static func isInstalled(_ profile: SpeechModelProfile) -> Bool {
         guard profile.isExperimental else { return true }
         let marker = root.appendingPathComponent("models/\(profile.rawValue)/ready.json")
         guard FileManager.default.isExecutableFile(atPath: python(profile).path),
-              (try? String(contentsOf: root.appendingPathComponent("runtime-v2/runtime-version"), encoding: .utf8)) == "2",
               let data = try? Data(contentsOf: marker),
               let manifest = try? JSONDecoder().decode(LocalModelManifest.self, from: data),
               manifest.version == "1", manifest.key == profile.rawValue,
@@ -315,6 +314,7 @@ final class LocalSpeechWorker: Sendable {
 
     func start() async throws {
         try await Task.detached(priority: .utility) { try LocalSpeechStorage.cleanupAbandonedFiles() }.value
+        _ = try await PackagedSpeechRuntime.ensure(progress: { _ in })
         guard LocalSpeechPaths.isInstalled(profile) else {
             throw localSpeechError("Download this model in Settings before selecting it.")
         }
@@ -353,6 +353,7 @@ final class LocalModelDownloads {
     private(set) var failureCategory: DownloadFailure?
     private(set) var removing = false
     private(set) var isCancelling = false
+    private(set) var preparingRuntimeOnly = false
     private let install: LocalModelInstallation
     private var task: Task<Void, Never>?
     private var process: LocalSpeechProcess?
@@ -378,15 +379,15 @@ final class LocalModelDownloads {
         log("local model download stage: interpreter-prepare")
         DownloadDiagnostics.shared.record(.stage, model: selection, stage: .interpreterPrepare)
         receive(LocalSpeechMessage(phase: "interpreter-prepare"))
-        let python = try await ManagedSpeechRuntime.ensure(progress: receive)
+        let python = try await PackagedSpeechRuntime.ensure(progress: receive)
         try Task.checkCancellation()
         log("local model download stage: installer-launch")
         DownloadDiagnostics.shared.record(.stage, model: selection, stage: .installerLaunch)
         receive(LocalSpeechMessage(phase: "installer-launch"))
-        try await process.launch(python: python, command: "install", profile: selection, onMessage: receive)
+        try await process.launch(python: python, command: "download", profile: selection, onMessage: receive)
     }
 
-    func start(_ selection: SpeechModelProfile) {
+    func start(_ selection: SpeechModelProfile, runtimeOnly: Bool = false) {
         guard task == nil else {
             log("local model download: existing operation shown instead of starting a duplicate")
             DownloadDiagnostics.shared.record(.duplicate, model: selection)
@@ -396,6 +397,7 @@ final class LocalModelDownloads {
         log("local model download starting: \(selection.rawValue)")
         DownloadDiagnostics.shared.record(.start, model: selection)
         profile = selection
+        preparingRuntimeOnly = runtimeOnly
         let operation = UUID()
         operationID = operation
         failure = nil
@@ -441,7 +443,11 @@ final class LocalModelDownloads {
                         self.onChange?()
                     }
                 }
-                try await install(selection, process, receive)
+                if runtimeOnly {
+                    _ = try await PackagedSpeechRuntime.ensure(progress: receive)
+                } else {
+                    try await install(selection, process, receive)
+                }
                 try Task.checkCancellation()
                 message = LocalSpeechMessage(phase: "ready")
                 log("local model download completed: \(selection.rawValue) elapsed=\(elapsedSeconds)s")
@@ -469,6 +475,7 @@ final class LocalModelDownloads {
     func remove(_ selection: SpeechModelProfile, active: SpeechModelProfile) {
         guard task == nil, selection.isExperimental, selection != active else { return }
         profile = selection
+        preparingRuntimeOnly = false
         operationID = UUID()
         failure = nil
         failureCategory = nil

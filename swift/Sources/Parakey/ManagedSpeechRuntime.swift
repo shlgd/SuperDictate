@@ -65,7 +65,7 @@ enum ManagedSpeechRuntime {
     }
 }
 
-private final class RuntimeExtraction: @unchecked Sendable {
+final class RuntimeExtraction: @unchecked Sendable {
     private let lock = NSLock()
     private let process = Process()
     private var cancelled = false
@@ -168,7 +168,7 @@ extension ManagedSpeechRuntime {
 }
 #endif
 
-private final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+final class RuntimeDownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let progress: @Sendable (LocalSpeechMessage) -> Void
     private let destination: URL
     private let lock = NSLock()

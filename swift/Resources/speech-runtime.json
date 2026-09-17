@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "sha256": "8cbd75fe3efa16709b50d837ffd741fd915bcefabb6b478fd21318e24291bf13",
+  "bytes": 279891738,
+  "unpackedBytes": 1102572706,
+  "minimumMacOS": "14.0",
+  "architecture": "arm64",
+  "url": "https://github.com/shlgd/SuperDictate/releases/download/v0.2.48/SuperDictate-SpeechRuntime.tar.gz"
+}

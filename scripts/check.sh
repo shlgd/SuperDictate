@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/package-model.sh scripts/release-signing.sh scripts/package-release.sh scripts/test-release-signing.sh scripts/test-signed-installer.sh
+bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/package-model.sh scripts/release-signing.sh scripts/package-release.sh scripts/test-release-signing.sh scripts/test-signed-installer.sh scripts/prepare-runtime-asset.sh scripts/test-release-upgrade.sh
 plutil -lint swift/Info.plist entitlements.plist
 
 app_version="$(plutil -extract CFBundleShortVersionString raw -o - swift/Info.plist)"
@@ -14,7 +14,7 @@ installer_sha256="$(sed -n 's/^RELEASE_SHA256="\([^"]*\)"$/\1/p' install.sh)"
 installer_model_sha256="$(sed -n 's/^MODEL_RELEASE_SHA256="\([^"]*\)"$/\1/p' install.sh)"
 installer_model_content_sha256="$(sed -n 's/^MODEL_CONTENT_SHA256="\([^"]*\)"$/\1/p' install.sh)"
 manifest_version="$(plutil -extract version raw -o - update.json)"
-manifest_sha256="$(plutil -extract sha256 raw -o - update.json)"
+manifest_sha256="$(plutil -extract installerSha256 raw -o - update.json 2>/dev/null || plutil -extract sha256 raw -o - update.json)"
 [[ -n "$installer_version" && "$app_version" == "$installer_version" ]] || {
     printf 'Version mismatch: Info.plist=%s install.sh=%s\n' "$app_version" "$installer_version" >&2
     exit 1

@@ -17550,6 +17550,16 @@ private enum ParakeySelfTest {
                 try UpdateSigning.validateUpgrade(from: URL(fileURLWithPath: installed),
                                                   to: URL(fileURLWithPath: candidate))
             }
+        case "release-upgrade":
+            return runSuite("release-upgrade") {
+                let environment = ProcessInfo.processInfo.environment
+                guard let installed = environment["SUPERDICTATE_TEST_INSTALLED"],
+                      let candidate = environment["SUPERDICTATE_TEST_CANDIDATE"] else {
+                    throw SelfTestFailure.failed("Release upgrade fixtures are required")
+                }
+                try testDirectUpdateReplacement(releaseFixtures: (
+                    URL(fileURLWithPath: installed), URL(fileURLWithPath: candidate)))
+            }
         case "local-model-protocol":
             return runSuite("local-model-protocol", testLocalModelProtocol)
         case "local-model-ui":
@@ -17606,6 +17616,10 @@ private enum ParakeySelfTest {
                         throw localSpeechError("Bootstrap left staging files")
                     }
                 }
+            }
+        case "packaged-runtime":
+            return runSuite("packaged-runtime") {
+                try asyncLocalModelTest { try await PackagedSpeechRuntime.testArchive() }
             }
         case "local-model-smoke":
             return runSuite("local-model-smoke") {
@@ -21547,7 +21561,7 @@ private enum ParakeySelfTest {
         )
     }
 
-    private static func testDirectUpdateReplacement() throws {
+    private static func testDirectUpdateReplacement(releaseFixtures: (URL, URL)? = nil) throws {
         let fileManager = FileManager.default
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("superdictate-update-replacement-test-\(UUID().uuidString)",
@@ -21563,14 +21577,26 @@ private enum ParakeySelfTest {
         let statePath = root.appendingPathComponent("state.txt")
         let helperPath = root.appendingPathComponent("helper.sh")
         try fileManager.createDirectory(at: applications, withIntermediateDirectories: true)
-        try makeSyntheticSignedUpdateApp(at: currentApp, version: "1.0.0")
-        try makeSyntheticSignedUpdateApp(at: stagedApp, version: "9.8.7")
+        let targetVersion: String
+        if let (installed, candidate) = releaseFixtures {
+            try UpdateSigning.validateUpgrade(from: installed, to: candidate)
+            try SuperDictateUpdateInstaller.validateApp(at: installed, expectedVersion: "0.2.47")
+            targetVersion = "0.2.48"
+            try SuperDictateUpdateInstaller.validateApp(at: candidate, expectedVersion: targetVersion)
+            try fileManager.copyItem(at: installed, to: currentApp)
+            try fileManager.createDirectory(at: stagedApp.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fileManager.copyItem(at: candidate, to: stagedApp)
+        } else {
+            targetVersion = "9.8.7"
+            try makeSyntheticSignedUpdateApp(at: currentApp, version: "1.0.0")
+            try makeSyntheticSignedUpdateApp(at: stagedApp, version: targetVersion)
+        }
         try Data("starting\tStarting update…\n".utf8).write(to: statePath)
         defer { try? fileManager.removeItem(at: root) }
 
         let script = superDictateDirectUpdateHelperScript(
             pid: Int32.max,
-            targetVersion: "9.8.7",
+            targetVersion: targetVersion,
             statePath: statePath.path,
             stagedAppPath: stagedApp.path,
             workDirectory: workDirectory.path,
@@ -21596,7 +21622,7 @@ private enum ParakeySelfTest {
         }
 
         try SuperDictateUpdateInstaller.validateApp(at: currentApp,
-                                                     expectedVersion: "9.8.7")
+                                                     expectedVersion: targetVersion)
         try expect(fileManager.fileExists(atPath: backupApp.path), equals: false,
                    "successful direct update should remove its backup")
         try expect(fileManager.fileExists(atPath: workDirectory.path), equals: false,
@@ -23122,6 +23148,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         showWindow()
         startRefreshTimer()
         checkForUpdates()
+        if (try? PackagedSpeechRuntime.manifest()) != nil, PackagedSpeechRuntime.python() == nil {
+            preparePackagedRuntime()
+        }
         if settings.agentEnabled && !SuperDictateAgentService.isAgentLoadedOrRunning() {
             beginServiceOperation(.starting)
         }
@@ -23234,7 +23263,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             && state?.modelDownloadPhase != nil
         let modelProgressHeight = showsModelProgress ? 26 : 0
         let resetNoticeHeight = missingCount > 0 && CommandLine.arguments.contains("--permissions-reset-result") ? 36 : 0
-        let height = CGFloat(452 + max(0, missingCount - 1) * 28 + modelProgressHeight + resetNoticeHeight)
+        let runtimeHeight = showsPackagedRuntimeProgress ? 140 : 0
+        let height = CGFloat(452 + max(0, missingCount - 1) * 28 + modelProgressHeight + resetNoticeHeight + runtimeHeight)
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
@@ -23337,6 +23367,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(compactServiceCard())
         root.addArrangedSubview(compactPermissionsCard())
         root.addArrangedSubview(compactUpdateCard())
+        if showsPackagedRuntimeProgress { root.addArrangedSubview(packagedRuntimeProgressView()) }
         root.addArrangedSubview(downloadDiagnosticsRow())
         root.addArrangedSubview(compactPrivacyFooter())
 
@@ -23359,6 +23390,47 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                         constant: innerWidthInset).isActive = true
         }
         return background
+    }
+
+    private var showsPackagedRuntimeProgress: Bool {
+        localModelDownloads.preparingRuntimeOnly && localModelDownloads.message?.phase != "ready"
+    }
+
+    private func preparePackagedRuntime() {
+        localModelDownloads.onChange = { [weak self] in self?.updateLocalModelDownloadStatus() }
+        localModelDownloads.start(.whisperTurbo, runtimeOnly: true)
+    }
+
+    @objc private func retryPackagedRuntime(_ sender: NSButton) { preparePackagedRuntime() }
+
+    private func packagedRuntimeProgressView() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        let label = panelLabel(localModelDownloadStatus(), size: 12,
+            color: localModelDownloads.failure == nil ? .secondaryLabelColor : .systemRed)
+        label.maximumNumberOfLines = 4
+        label.lineBreakMode = .byWordWrapping
+        label.preferredMaxLayoutWidth = 480
+        label.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        stack.addArrangedSubview(label)
+        if localModelDownloads.isRunning {
+            let progress = NSProgressIndicator()
+            progress.style = .bar
+            let update = localModelDownloads.message
+            progress.isIndeterminate = (update?.total ?? 0) == 0
+            progress.maxValue = Double(max(1, update?.total ?? 1))
+            progress.doubleValue = Double(update?.downloaded ?? 0)
+            progress.widthAnchor.constraint(equalToConstant: 480).isActive = true
+            if progress.isIndeterminate { progress.startAnimation(nil) }
+            stack.addArrangedSubview(progress)
+            stack.addArrangedSubview(panelButton(t("Отменить", "Cancel"), action: #selector(cancelLocalSpeechDownload(_:)),
+                enabled: !localModelDownloads.isCancelling))
+        } else {
+            stack.addArrangedSubview(panelButton(t("Повторить подготовку", "Retry preparation"), action: #selector(retryPackagedRuntime(_:))))
+        }
+        return stack
     }
 
     private func makeSettingsContentView() -> NSView {
@@ -24696,8 +24768,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 LocalSpeechPaths.isInstalled(profile)
                     ? t("Скачана. Нажмите «Сохранить», чтобы переключиться. Первая загрузка в память может занять время.",
                         "Downloaded. Save to switch. Loading into memory for the first time may take a while.")
-                    : t("Всё необходимое установится автоматически. Общий движок скачивается один раз. Аудио остаётся на Mac.",
-                        "Everything is installed automatically. The shared runtime downloads once. Audio stays on your Mac."),
+                    : t("Готовый движок поставляется с приложением. Скачиваются только файлы модели. Аудио остаётся на Mac.",
+                        "The ready-to-use runtime ships with the app. Only model files need downloading. Audio stays on your Mac."),
                 size: 11.5, color: .secondaryLabelColor)
             hint.maximumNumberOfLines = 3
             hint.lineBreakMode = .byWordWrapping
@@ -25010,8 +25082,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard let profile = settingsDraft?.speechModelProfile, profile != settings.speechModelProfile else { return }
         let alert = NSAlert()
         alert.messageText = t("Удалить \(profile.shortName)?", "Delete \(profile.shortName)?")
-        alert.informativeText = t("Записи и история сохранятся. Модель можно скачать заново. При удалении последней дополнительной модели удаляется и её общий движок.",
-                                 "Recordings and history are kept. You can download the model again. Removing the last additional model also removes its shared runtime.")
+        alert.informativeText = t("Записи и история сохранятся. Модель можно скачать заново. Готовый общий движок останется для других моделей.",
+                                 "Recordings and history are kept. You can download the model again. The ready-to-use shared runtime is kept for other models.")
         alert.addButton(withTitle: t("Удалить", "Delete"))
         alert.addButton(withTitle: t("Отмена", "Cancel"))
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -25024,7 +25096,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             if localModelDownloads.isCancelling { return t("Отменяю…", "Cancelling…") }
             if localModelDownloads.removing { return t("Удаляю…", "Removing…") }
             switch localModelDownloads.message?.phase {
-            case "downloading", "interpreter": return t("Скачиваю…", "Downloading…")
+            case "downloading", "interpreter", "runtime-download": return t("Скачиваю…", "Downloading…")
             case "listing", "verifying", "runtime-imports", "runtime-verifying": return t("Проверяю…", "Checking…")
             default: return t("Подготовка…", "Preparing…")
             }
@@ -25063,9 +25135,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             status = localModelDownloadFailure()
         } else {
             switch update?.phase {
+            case "runtime-download":
+                status = t("Скачиваю готовый движок… ", "Downloading ready-to-use runtime… ")
+                    + String(format: "%.0f / %.0f MB · %.1f MB/s", Double(update?.downloaded ?? 0) / 1_000_000,
+                             Double(update?.total ?? 0) / 1_000_000, (update?.speed ?? 0) / 1_000_000)
+            case "runtime-unpacking": status = t("Распаковываю готовый движок…", "Unpacking ready-to-use runtime…")
+            case "runtime-waiting": status = t("Другая служба подготавливает движок. Ожидаю…", "Another service is preparing the runtime. Waiting…")
             case "storage": status = t("Проверяю папку и очищаю временные файлы…", "Checking storage and cleaning temporary files…")
             case "interpreter-prepare": status = t("Проверяю Python и свободное место…", "Checking Python and available disk space…")
-            case "installer-launch": status = t("Запускаю установщик движка…", "Starting runtime installer…")
+            case "installer-launch": status = t("Запускаю загрузку модели…", "Starting model download…")
             case "interpreter":
                 status = t("Загружаю компоненты… ", "Downloading components… ")
                     + String(format: "%.1f / %.1f MB", Double(update?.downloaded ?? 0) / 1_000_000,
@@ -25082,7 +25160,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             case "removed": status = t("Файлы удалены", "Files removed")
             case "listing": status = t("Проверяю список файлов…", "Checking model files…")
             case "verifying": status = t("Проверяю скачанные файлы…", "Verifying downloaded files…")
-            case "ready": status = t("Готова к выбору", "Ready to select")
+            case "ready": status = localModelDownloads.preparingRuntimeOnly
+                ? t("Движок готов", "Runtime ready") : t("Готова к выбору", "Ready to select")
             default:
                 status = String(format: "%.0f / %.0f MB · %.1f MB/s",
                                 Double(update?.downloaded ?? 0) / 1_000_000,
@@ -25097,10 +25176,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             waiting = t("\nНет нового прогресса \(seconds) с на этом этапе. Это ещё не означает сбой. Можно отменить операцию и повторить попытку.",
                         "\nNo new progress for \(seconds) s at this stage. This does not necessarily mean a failure. You can cancel and retry.")
         } else { waiting = "" }
-        return (localModelDownloads.profile?.shortName ?? "") + ": " + status + elapsed + waiting
+        let name = localModelDownloads.preparingRuntimeOnly ? t("Компоненты распознавания", "Speech components") : (localModelDownloads.profile?.shortName ?? "")
+        return name + ": " + status + elapsed + waiting
     }
 
     private func updateLocalModelDownloadStatus() {
+        if localModelDownloads.preparingRuntimeOnly { refresh(force: true) }
         // Terminal transitions also update model availability and Save validation.
         if !localModelDownloads.isRunning {
             refreshSettingsWindow()

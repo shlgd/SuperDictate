@@ -63,6 +63,15 @@ cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/local-asr.py" "$STAGE_APP/Contents/Resources/"
+cp "$ROOT_DIR/swift/Resources/speech-runtime.json" "$STAGE_APP/Contents/Resources/"
+case "${SUPERDICTATE_RUNTIME_MODE:-embedded}" in
+    embedded)
+        bash "$ROOT_DIR/scripts/prepare-runtime-asset.sh"
+        cp "$ROOT_DIR/dist/speech-runtime/SuperDictate-SpeechRuntime.tar.gz" "$STAGE_APP/Contents/Resources/"
+        ;;
+    download) ;; # Compatibility archive for the <=64 MB updater in v0.2.47.
+    *) fail "Invalid SUPERDICTATE_RUNTIME_MODE" ;;
+esac
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
 chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
 

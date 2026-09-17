@@ -2,7 +2,7 @@
 # Exercise the real installer in an isolated directory, without launching any app.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ARCHIVE="$ROOT/dist/SuperDictate.zip"
+ARCHIVE="${SUPERDICTATE_TEST_ARCHIVE:-$ROOT/dist/SuperDictate.zip}"
 [[ -f "$ARCHIVE" ]] || { printf 'Run scripts/package-release.sh first.\n' >&2; exit 1; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/superdictate-installer-signature-tests.XXXXXX")"
 trap 'rm -r "$WORK"' EXIT
