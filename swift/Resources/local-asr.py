@@ -128,7 +128,10 @@ def bootstrap(root, key):
         emit(phase="runtime-environment")
         checked_run([sys.executable, "-I", "-B", "-m", "venv", str(staging)], phase="runtime-environment", timeout=120)
         python = staging / "bin/python3"
-        checked_run([str(python), "-I", "-B", "-m", "pip", "install", "--index-url", "https://pypi.org/simple", "--disable-pip-version-check", "--no-input", "--timeout", "20", "--retries", "2", "--no-cache-dir", "--no-compile", *packages])
+        # Only these two pure-Python packages are built locally. Native packages
+        # must have wheels: never silently require Xcode, Rust or Homebrew.
+        checked_run([str(python), "-I", "-B", "-m", "pip", "install", "--index-url", "https://pypi.org/simple", "--disable-pip-version-check", "--no-input", "--timeout", "20", "--retries", "2", "--no-cache-dir", "--no-compile",
+                     "--only-binary=:all:", "--no-binary=gigaam,antlr4-python3-runtime", *packages])
         checked_run([str(python), "-I", "-B", "-c", "import mlx.core, mlx_whisper, mlx_audio.stt, gigaam; print('Runtime imports OK')"], phase="runtime-imports", timeout=120)
         (staging / "runtime-version").write_text(ENVIRONMENT_VERSION)
         if environment.exists():
@@ -196,6 +199,27 @@ def fetch(url, path, completed, total, started, expected_size=None, sha=None, tr
             time.sleep(attempt + 1)
 
 
+def model_info(repo, revision):
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import HfHubHTTPError
+    import httpx
+    api = HfApi(endpoint="https://huggingface.co", token=False)
+    for attempt in range(3):
+        try:
+            return api.model_info(repo, revision=revision, files_metadata=True, timeout=30, token=False)
+        except httpx.HTTPError as error:
+            if isinstance(error, httpx.TimeoutException):
+                category, code = "timeout", 1
+            elif isinstance(error, (httpx.HTTPStatusError, HfHubHTTPError)) and error.response is not None:
+                category, code = "http", error.response.status_code
+            else:
+                category, code = "network", 1
+            if attempt == 2 or (category == "http" and code not in (408, 429) and code < 500):
+                raise SetupFailure("Could not get the model file list. Check the network or VPN and retry.", category, code) from error
+            emit(phase="listing", retry=attempt + 1, failure_code=category, code=code)
+            time.sleep(attempt + 1)
+
+
 def download(root, key):
     engine, repo = CATALOG[key]
     destination = root / "models" / key
@@ -213,8 +237,7 @@ def download(root, key):
             files.append((name, size, None, url))
         revision = GIGA_REVISION
     else:
-        from huggingface_hub import HfApi
-        info = HfApi().model_info(repo, revision=REVISIONS[key], files_metadata=True)
+        info = model_info(repo, REVISIONS[key])
         revision = info.sha
         files = []
         for entry in info.siblings:

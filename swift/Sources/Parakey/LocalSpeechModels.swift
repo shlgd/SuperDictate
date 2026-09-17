@@ -414,7 +414,8 @@ final class LocalModelDownloads {
                                 stage: update.phase.flatMap(DownloadStage.init(rawValue:)) ?? .unknown, elapsed: self.elapsedSeconds)
                         }
                         if let retry = update.retry {
-                            DownloadDiagnostics.shared.record(.retry, model: selection, stage: .downloading,
+                            DownloadDiagnostics.shared.record(.retry, model: selection,
+                                stage: update.phase.flatMap(DownloadStage.init(rawValue:)) ?? .unknown,
                                 elapsed: self.elapsedSeconds, failure: update.failure_code.flatMap(DownloadFailure.init(rawValue:)) ?? .unknown,
                                 code: update.code ?? retry)
                         }

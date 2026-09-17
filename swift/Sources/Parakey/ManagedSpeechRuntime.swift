@@ -77,6 +77,7 @@ private final class RuntimeExtraction: @unchecked Sendable {
                     guard !cancelled else { throw CancellationError() }
                     process.executableURL = URL(fileURLWithPath: executable)
                     process.arguments = arguments
+                    process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
                     process.standardOutput = FileHandle.nullDevice
                     process.standardError = FileHandle.nullDevice
                     try process.run()

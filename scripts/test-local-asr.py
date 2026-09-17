@@ -1,5 +1,6 @@
 """No model weights, microphone access or inference. Run with a numpy-enabled Python."""
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import tempfile
 import sys
 import ssl
+import threading
 import urllib.error
 import unittest
 from unittest.mock import patch
@@ -100,6 +102,83 @@ class RuntimeTests(unittest.TestCase):
                     asr.bootstrap(root, "qwen_06")
             self.assertFalse((root / ".runtime-stage").exists())
             self.assertFalse((root / "runtime-v2").exists())
+
+    def test_native_packages_cannot_fall_back_to_compilation(self):
+        calls = []
+        def setup(arguments, **kwargs):
+            calls.append(arguments)
+            if "venv" in arguments:
+                Path(arguments[-1]).mkdir()
+        with tempfile.TemporaryDirectory() as directory, patch.object(asr, "emit"):
+            with patch.object(asr, "checked_run", side_effect=setup):
+                asr.bootstrap(Path(directory), "whisper_turbo")
+        pip = next(command for command in calls if "pip" in command)
+        self.assertIn("--only-binary=:all:", pip)
+        self.assertIn("--no-binary=gigaam,antlr4-python3-runtime", pip)
+
+    def test_manifest_timeout_retries_then_recovers(self):
+        import httpx
+        sentinel = object()
+        with patch("huggingface_hub.HfApi") as api, patch.object(asr, "emit") as progress, patch.object(asr.time, "sleep"):
+            api.return_value.model_info.side_effect = [httpx.ReadTimeout("private details"), sentinel]
+            self.assertIs(asr.model_info("test/model", "revision"), sentinel)
+            api.assert_called_once_with(endpoint="https://huggingface.co", token=False)
+            self.assertEqual(api.return_value.model_info.call_count, 2)
+            self.assertEqual(api.return_value.model_info.call_args.kwargs["timeout"], 30)
+            self.assertFalse(api.return_value.model_info.call_args.kwargs["token"])
+            progress.assert_called_once_with(phase="listing", retry=1, failure_code="timeout", code=1)
+
+    def test_manifest_failure_is_bounded_and_safe(self):
+        import httpx
+        with patch("huggingface_hub.HfApi") as api, patch.object(asr, "emit"), patch.object(asr.time, "sleep"):
+            api.return_value.model_info.side_effect = httpx.ConnectTimeout("SECRET /Users/private")
+            with self.assertRaises(asr.SetupFailure) as result:
+                asr.model_info("test/model", "revision")
+            self.assertEqual(api.return_value.model_info.call_count, 3)
+            self.assertEqual(asr.failure_details(result.exception), ("timeout", 1))
+            self.assertNotIn("SECRET", str(result.exception))
+
+    def test_manifest_auth_error_is_not_retried(self):
+        import httpx
+        response = httpx.Response(403, request=httpx.Request("GET", "https://example.test"))
+        with patch("huggingface_hub.HfApi") as api, patch.object(asr.time, "sleep") as sleep:
+            api.return_value.model_info.side_effect = httpx.HTTPStatusError("forbidden", request=response.request, response=response)
+            with self.assertRaises(asr.SetupFailure) as result:
+                asr.model_info("test/model", "revision")
+            self.assertEqual(asr.failure_details(result.exception), ("http", 403))
+            self.assertEqual(api.return_value.model_info.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_manifest_real_http_failure_then_retry(self):
+        from huggingface_hub import HfApi
+        class Handler(BaseHTTPRequestHandler):
+            calls = 0
+            def do_GET(self):
+                Handler.calls += 1
+                if Handler.calls == 1:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                body = json.dumps(dict(id="test/model", sha="revision", siblings=[])).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            api = HfApi(endpoint=f"http://127.0.0.1:{server.server_port}", token=False)
+            with patch("huggingface_hub.HfApi", return_value=api), patch.object(asr, "emit") as progress, patch.object(asr.time, "sleep"):
+                self.assertEqual(asr.model_info("test/model", "revision").sha, "revision")
+                self.assertEqual(Handler.calls, 2)
+                progress.assert_called_once_with(phase="listing", retry=1, failure_code="http", code=503)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_runtime_is_shared_and_reused(self):
         with tempfile.TemporaryDirectory() as directory:
