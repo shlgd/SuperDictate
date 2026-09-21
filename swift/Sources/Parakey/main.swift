@@ -5104,6 +5104,27 @@ func writeMonoMix(channels: UnsafePointer<UnsafeMutablePointer<Float>>,
 
 final class AudioCapture: @unchecked Sendable {
     private var engine = AVAudioEngine()
+    #if DEBUG
+    private var capturePreparationFailureForTesting: Error?
+
+    static func testFailedCapturePreparation() throws {
+        let capture = AudioCapture()
+        let failure = NSError(domain: "AudioCapture.Test", code: -2)
+        capture.capturePreparationFailureForTesting = failure
+        for _ in 0..<3 {
+            let previous = capture.engine
+            do {
+                try capture.startEngine()
+                throw localSpeechError("Invalid microphone preparation unexpectedly succeeded")
+            } catch {
+                guard (error as NSError).domain == failure.domain else { throw error }
+            }
+            guard capture.engine !== previous, !capture.isEngineStarted, !capture.isRunning else {
+                throw localSpeechError("Failed microphone preparation retained the stale audio engine")
+            }
+        }
+    }
+    #endif
     private var converter: AVAudioConverter?
     private var converterInputFormat: AVAudioFormat?
     private var manuallyMixInputToMono = false
@@ -5144,7 +5165,18 @@ final class AudioCapture: @unchecked Sendable {
         if let selectedDevice {
             waitForSelectedInputDevice(selectedDevice, on: input)
         }
-        _ = try installCaptureTap(on: input)
+        do {
+            #if DEBUG
+            if let failure = capturePreparationFailureForTesting { throw failure }
+            #endif
+            _ = try installCaptureTap(on: input)
+        } catch {
+            // A zero-channel input fails before engine.start(). stopEngine()
+            // cannot reset this instance because engineStarted is still false.
+            clearStoppedCaptureState()
+            resetEngineInstance()
+            throw error
+        }
         lock.lock()
         if recordingImmediately {
             recordingGeneration &+= 1
@@ -20499,6 +20531,7 @@ private enum ParakeySelfTest {
     }
 
     private static func testAudioInputDeviceFiltering() throws {
+        try AudioCapture.testFailedCapturePreparation()
         let pseudo = AudioInputDevice(id: 1,
                                       uid: "CADefaultDeviceAggregate-42159-0",
                                       name: "CADefaultDeviceAggregate-42159-0")
