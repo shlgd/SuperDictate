@@ -3536,6 +3536,21 @@ private enum StartupFailureStage {
     }
 }
 
+private enum AudioInputRecoveryAction: Equatable {
+    case stop, wait, retry
+}
+
+private func audioInputRecoveryAction(hasAudioFailure: Bool, modelReady: Bool,
+                                      terminating: Bool, sleeping: Bool,
+                                      occupied: Bool, permissionsGranted: Bool) -> AudioInputRecoveryAction {
+    guard hasAudioFailure, modelReady, !terminating, !sleeping else { return .stop }
+    return occupied || !permissionsGranted ? .wait : .retry
+}
+
+private func audioInputRecoveryDelay(attempt: Int) -> TimeInterval {
+    [5.0, 15.0, 30.0, 60.0][min(max(attempt, 0), 3)]
+}
+
 private struct StartupFailure {
     let stage: StartupFailureStage
     let detail: String
@@ -10822,6 +10837,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var maxDurationWorkItem: DispatchWorkItem?
     private var audioIdleStopWorkItem: DispatchWorkItem?
     private var isRestartingAudioInput = false
+    private var audioInputRecoveryTimer: Timer?
+    private var audioInputRecoveryAttempt = 0
+    private var systemIsSleeping = false
     private var audioInputPreferenceAtLastEngineStart = ""
     private var audioConfigurationRecoveryWorkItem: DispatchWorkItem?
     private var pendingAudioRouteRefresh = false
@@ -11036,6 +11054,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         isReady = true
+        stopAudioInputRecovery()
         startupStatusTitle = "Ready"
         startupFailure = nil
         clearSpeechModelStartupProgress()
@@ -11138,6 +11157,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         isTerminating = true
+        stopAudioInputRecovery()
         controlPanelProcess = nil
         controlPanelLaunchInProgress = false
         hotkeyRecorder?.cancel()
@@ -11379,6 +11399,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        stopAudioInputRecovery()
         prepareForStartupAttempt()
         let speechModelProfile = settings.speechModelProfile
         if speechModelProfile.isExperimental {
@@ -11638,6 +11659,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let detail = startupFailureDetail(stage: stage, error: error)
         startupFailure = StartupFailure(stage: stage, detail: detail)
         log("startup failed (\(reason), \(stage)): \(startupFailureLogDetail(stage: stage, error: error))")
+        if stage == .audioInput { scheduleAudioInputRecovery() }
         setMenuBarState(.error)
         if !missingPermissions().isEmpty {
             startPermissionReadinessMonitor(reason: reason)
@@ -11652,7 +11674,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         for attempt in 1...totalAttempts {
             try Task.checkCancellation()
-            guard !isTerminating else { throw CancellationError() }
+            guard !isTerminating, !systemIsSleeping else { throw CancellationError() }
 
             startupStatusTitle = attempt == 1
                 ? initialStatusTitle
@@ -11690,8 +11712,82 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - Sleep/wake runtime recovery
 
+    private func stopAudioInputRecovery() {
+        audioInputRecoveryTimer?.invalidate()
+        audioInputRecoveryTimer = nil
+        audioInputRecoveryAttempt = 0
+    }
+
+    #if DEBUG
+    static func testAudioInputRecoveryTimer() throws {
+        let app = ParakeyApp()
+        defer { app.stopAudioInputRecovery() }
+        app.isSpeechModelReady = true
+        app.startupFailure = StartupFailure(stage: .audioInput, detail: "fixture unavailable microphone")
+        app.scheduleAudioInputRecovery()
+        guard let first = app.audioInputRecoveryTimer else { throw localSpeechError("Audio failure did not arm recovery") }
+        app.scheduleAudioInputRecovery()
+        guard app.audioInputRecoveryTimer === first else { throw localSpeechError("Duplicate recovery timer") }
+        app.isBusy = true
+        app.audioInputRecoveryTimerFired(first)
+        guard let deferred = app.audioInputRecoveryTimer, deferred !== first,
+              app.audioInputRecoveryAttempt == 0 else { throw localSpeechError("Busy recovery was not deferred") }
+        app.stopAudioInputRecovery()
+        app.audioInputRecoveryTimerFired(deferred)
+        guard app.audioInputRecoveryTimer == nil else { throw localSpeechError("Cancelled timer resumed recovery") }
+        app.systemIsSleeping = true
+        app.scheduleAudioInputRecovery()
+        guard app.audioInputRecoveryTimer == nil else { throw localSpeechError("Recovery armed during sleep") }
+        app.systemIsSleeping = false
+        app.isBusy = false
+        app.scheduleAudioInputRecovery()
+        guard app.audioInputRecoveryTimer != nil else { throw localSpeechError("Recovery did not resume") }
+        app.stopAudioInputRecovery()
+        app.isTerminating = true
+        app.scheduleAudioInputRecovery()
+        guard app.audioInputRecoveryTimer == nil else { throw localSpeechError("Recovery armed during termination") }
+    }
+    #endif
+
+    private func scheduleAudioInputRecovery() {
+        guard audioInputRecoveryTimer == nil, startupFailure?.stage == .audioInput,
+              isSpeechModelReady, !isTerminating, !systemIsSleeping else { return }
+        let delay = audioInputRecoveryDelay(attempt: audioInputRecoveryAttempt)
+        let timer = Timer(timeInterval: delay, target: self,
+                          selector: #selector(audioInputRecoveryTimerFired(_:)), userInfo: nil, repeats: false)
+        timer.tolerance = min(2, delay / 5)
+        audioInputRecoveryTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        log("audio input recovery scheduled in \(Int(delay))s")
+    }
+
+    @objc private func audioInputRecoveryTimerFired(_ timer: Timer) {
+        guard audioInputRecoveryTimer === timer else { return }
+        timer.invalidate()
+        audioInputRecoveryTimer = nil
+        switch audioInputRecoveryAction(hasAudioFailure: startupFailure?.stage == .audioInput,
+                                       modelReady: isSpeechModelReady,
+                                       terminating: isTerminating, sleeping: systemIsSleeping,
+                                       occupied: isRecording || audio.isRunning || isBusy || startupTask != nil || isRestartingAudioInput,
+                                       permissionsGranted: missingPermissions().isEmpty) {
+        case .stop:
+            stopAudioInputRecovery()
+        case .wait:
+            scheduleAudioInputRecovery()
+        case .retry:
+            audioInputRecoveryAttempt = min(audioInputRecoveryAttempt + 1, 3)
+            startAudioRuntimeAfterWake(reason: "automatic audio input recovery")
+        }
+    }
+
     private func handleSystemWillSleep() {
         guard !isTerminating else { return }
+        systemIsSleeping = true
+        // An unavailable microphone must not erase the intent to resume after sleep.
+        if startupFailure?.stage == .audioInput || isRestartingAudioInput || startupTask != nil {
+            shouldResumeRuntimeAfterWake = true
+        }
+        stopAudioInputRecovery()
 
         if shouldResumeRuntimeAfterSystemSleep(isTerminating: isTerminating,
                                                isCoreRuntimeReady: isCoreRuntimeReady,
@@ -11716,6 +11812,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func handleSystemDidWake() {
         guard !isTerminating else { return }
+        systemIsSleeping = false
         guard shouldResumeRuntimeAfterWake else { return }
         log("system wake detected")
         recoverRuntimeAfterWakeIfNeeded(reason: "system wake")
@@ -11750,9 +11847,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func recoverRuntimeAfterWakeIfNeeded(reason: String) {
+        guard !systemIsSleeping else { return }
         switch wakeRuntimeRecoveryAction(shouldResumeAfterWake: shouldResumeRuntimeAfterWake,
                                          isTerminating: isTerminating,
-                                         hasStartupTask: startupTask != nil,
+                                         hasStartupTask: startupTask != nil || isRestartingAudioInput,
                                          isBusy: isBusy,
                                          isSpeechModelReady: isSpeechModelReady) {
         case .ignore:
@@ -11775,6 +11873,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func startAudioRuntimeAfterWake(reason: String) {
+        guard !systemIsSleeping else { return }
         guard !isRestartingAudioInput else {
             return
         }
@@ -11784,6 +11883,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        audioInputRecoveryTimer?.invalidate()
+        audioInputRecoveryTimer = nil
         isReady = false
         isCoreRuntimeReady = false
         isRecording = false
@@ -11806,16 +11907,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
 
         Task { @MainActor in
-            defer { isRestartingAudioInput = false }
+            defer {
+                isRestartingAudioInput = false
+                recoverRuntimeAfterWakeIfNeeded(reason: "audio recovery finished after wake")
+            }
             do {
                 try await startAudioInputWithRetries(reason: reason,
                                                      initialStatusTitle: "Restarting audio input…")
-                guard !isTerminating else { return }
+                guard !isTerminating, !systemIsSleeping else { return }
                 isCoreRuntimeReady = true
                 startupStatusTitle = "Finishing setup…"
                 completeReadinessIfPossible(reason: reason)
             } catch {
-                guard !isTerminating else { return }
+                guard !isTerminating, !systemIsSleeping else { return }
                 recordStartupFailure(stage: .audioInput, error: error, reason: reason)
             }
         }
@@ -15744,13 +15848,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         stopAudioEngineImmediately()
 
         Task { @MainActor in
-            defer { isRestartingAudioInput = false }
+            defer {
+                isRestartingAudioInput = false
+                recoverRuntimeAfterWakeIfNeeded(reason: "audio route recovery finished after wake")
+            }
             do {
                 try await startAudioInputWithRetries(reason: reason,
                                                      initialStatusTitle: "Restarting audio input…")
+                guard !isTerminating, !systemIsSleeping else { return }
                 isCoreRuntimeReady = true
                 completeReadinessIfPossible(reason: reason)
             } catch {
+                guard !isTerminating, !systemIsSleeping else { return }
                 isCoreRuntimeReady = false
                 isReady = false
                 isRecording = false
@@ -22162,6 +22271,27 @@ private enum ParakeySelfTest {
     }
 
     private static func testPowerStateRecoveryDecision() throws {
+        for attempt in 0..<12 {
+            try expect(audioInputRecoveryDelay(attempt: attempt),
+                       equals: [5.0, 15.0, 30.0, 60.0][min(attempt, 3)],
+                       "audio recovery must back off and cap its delay")
+        }
+        try expect(audioInputRecoveryAction(hasAudioFailure: true, modelReady: true,
+            terminating: false, sleeping: false, occupied: false, permissionsGranted: true),
+            equals: .retry, "failed audio with a loaded model must recover without full startup")
+        try expect(audioInputRecoveryAction(hasAudioFailure: true, modelReady: true,
+            terminating: false, sleeping: false, occupied: true, permissionsGranted: true),
+            equals: .wait, "recording, transcription and another startup must not be interrupted")
+        try expect(audioInputRecoveryAction(hasAudioFailure: true, modelReady: true,
+            terminating: false, sleeping: false, occupied: false, permissionsGranted: false),
+            equals: .wait, "missing permissions must not cause repeated microphone opens")
+        for state in [(false, true, false, false), (true, false, false, false),
+                      (true, true, true, false), (true, true, false, true)] {
+            try expect(audioInputRecoveryAction(hasAudioFailure: state.0, modelReady: state.1,
+                terminating: state.2, sleeping: state.3, occupied: false, permissionsGranted: true),
+                equals: .stop, "recovery must stop when ready, unloaded, terminating or asleep")
+        }
+        try MainActor.assumeIsolated { try ParakeyApp.testAudioInputRecoveryTimer() }
         try expect(
             shouldResumeRuntimeAfterSystemSleep(isTerminating: true,
                                                 isCoreRuntimeReady: true,
