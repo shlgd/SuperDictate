@@ -5111,10 +5111,14 @@ final class AudioCapture: @unchecked Sendable {
         let capture = AudioCapture()
         let failure = NSError(domain: "AudioCapture.Test", code: -2)
         capture.capturePreparationFailureForTesting = failure
-        for _ in 0..<3 {
+        for attempt in 0..<4 {
             let previous = capture.engine
             do {
-                try capture.startEngine()
+                if attempt.isMultiple(of: 2) {
+                    try capture.startEngine()
+                } else {
+                    try capture.startRecording()
+                }
                 throw localSpeechError("Invalid microphone preparation unexpectedly succeeded")
             } catch {
                 guard (error as NSError).domain == failure.domain else { throw error }
@@ -12925,8 +12929,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let initialInsertionContext = insertionTargetQueryContext()
         cancelAudioIdleStop()
         var recoveryJournal: PendingDictationJournal?
+        var isStartingAudio = false
         do {
             recoveryJournal = try PendingDictationRecovery.createJournal()
+            isStartingAudio = true
             didTouchAudioEngine = true
             if !audio.isEngineStarted {
                 suppressAudioConfigurationChangesFromAppEngineUpdate()
@@ -12939,6 +12945,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stopAudioEngineImmediately()
             hotkey.resetToggleState()
             log("recording start failed: \(error.localizedDescription)")
+            // A failed hotkey start needs the same recovery as a failed wake.
+            // Journal I/O failures must not disable a healthy microphone.
+            if isStartingAudio {
+                recordStartupFailure(stage: .audioInput, error: error, reason: "recording start")
+            }
             signalDictationFailure()
             return
         }
