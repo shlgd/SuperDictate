@@ -16,7 +16,9 @@ jobs:
       - name: Validate scripts and plists
         run: ./scripts/check.sh
       - name: Swift self-tests
-        run: swift run -c debug --package-path swift Parakey --self-test all
+        run: |
+          swift run -c debug --package-path swift Parakey --self-test all
+          swift run -c debug --package-path swift Parakey --self-test visual-style
       - name: Build app bundle
         run: ./scripts/build-app.sh "$RUNNER_TEMP/SuperDictate.app"
       - name: Verify app bundle

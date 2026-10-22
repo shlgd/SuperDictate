@@ -8,7 +8,7 @@
 2. Вставьте эту команду и нажмите Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.48/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.49/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 3. В открывшемся SuperDictate нажмите `Разрешить` для **Микрофона**,
@@ -94,8 +94,8 @@ Python, Homebrew, pip и инструменты сборки пользоват�
 от её статуса; при наведении macOS показывает пояснение к каждой кнопке.
 
 Шестерёнка открывает отдельное окно с тремя сочетаниями, поведением завершения,
-выбором микрофона, папкой экспорта аудиофайлов, размером капсулы, цветами и
-фоном индикатора. Переключатель
+выбором микрофона, папкой экспорта аудиофайлов, переключением между волнами
+у чёлки и классической капсулой, размером капсулы, цветами и фоном индикатора. Переключатель
 `RU / EN` мгновенно меняет язык обеих панелей. Изменения сначала остаются
 черновиком; кнопка `Сохранить и перезапустить` применяет их вместе и
 перезапускает только фоновую службу. История и модель при этом не удаляются.
@@ -186,7 +186,7 @@ Xcode и Command Line Tools для обычной установки не нуж
 Эта же команда остаётся запасным способом для любой версии:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.48/install.sh | /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.49/install.sh | /usr/bin/arch -arm64 /bin/bash
 ```
 
 Приложение само не устанавливает обновления в фоне: запуск обновления всегда
@@ -200,7 +200,7 @@ curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.48/install.
 результат в `/Applications`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.48/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /usr/bin/arch -arm64 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/v0.2.49/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /usr/bin/arch -arm64 /bin/bash
 ```
 
 Понадобятся бесплатные Apple Command Line Tools. Если их нет, установщик

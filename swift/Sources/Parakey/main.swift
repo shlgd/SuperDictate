@@ -619,6 +619,20 @@ enum RecordingHUDAccentColor: String, CaseIterable {
     }
 }
 
+enum RecordingHUDVisualStyle: String, CaseIterable {
+    case notch
+    case capsule
+
+    func geometry(for notch: NotchHUDGeometry?) -> NotchHUDGeometry? {
+        self == .notch ? notch : nil
+    }
+}
+
+@MainActor
+private func selectedRecordingHUDNotchGeometry() -> NotchHUDGeometry? {
+    Settings.shared.recordingHUDVisualStyle.geometry(for: NotchHUDGeometry.current)
+}
+
 enum RecordingHUDSize: String, CaseIterable {
     case compact
     case standard
@@ -1921,6 +1935,12 @@ func normalizedAudioLevel(sumSquares: Double, sampleCount: Int) -> Float {
     return Float(max(0, min(1, lifted)))
 }
 
+func normalizedNotchAudioLevel(sumSquares: Double, sampleCount: Int) -> Float {
+    guard sampleCount > 0, sumSquares.isFinite, sumSquares > 0 else { return 0 }
+    let rms = sqrt(sumSquares / Double(sampleCount))
+    return Float(pow(max(0, min(1, (rms - 0.002) * 10)), 0.6))
+}
+
 func visibleRecordingLevel(rawLevel: Float) -> Float {
     guard rawLevel.isFinite else { return 0 }
     return max(0, min(1, rawLevel))
@@ -2695,6 +2715,8 @@ final class Settings: @unchecked Sendable {
     private static let keyRecordingHUDRecordingColor = "recording_hud_recording_color"
     private static let keyRecordingHUDTranscribingColor = "recording_hud_transcribing_color"
     private static let keyRecordingHUDBackgroundStyle = "recording_hud_background_style"
+    private static let keyRecordingHUDVisualStyle = "recording_hud_visual_style"
+    private static let keyNotchGlowPalette = "notch_glow_palette_v1"
     private static let keyRecordingHUDSize = "recording_hud_size"
     private static let legacyKeyShowRecordingIndicator = "show_recording_indicator"
     private static let keyMuteWhileRecording = "mute_while_recording"
@@ -3029,6 +3051,30 @@ final class Settings: @unchecked Sendable {
             return true
         }
         set { defaults.set(newValue, forKey: Self.keyShowRecordingWaveform) }
+    }
+
+    var recordingHUDVisualStyle: RecordingHUDVisualStyle {
+        get {
+            RecordingHUDVisualStyle(rawValue: defaults.string(forKey: Self.keyRecordingHUDVisualStyle) ?? "") ?? .notch
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRecordingHUDVisualStyle) }
+    }
+
+    var notchGlowPalette: NotchGlowPalette {
+        get {
+            guard let data = defaults.data(forKey: Self.keyNotchGlowPalette),
+                  let palette = try? JSONDecoder().decode(NotchGlowPalette.self, from: data),
+                  palette.isValid else { return .standard }
+            return palette
+        }
+        set {
+            if newValue == .standard || !newValue.isValid {
+                defaults.removeObject(forKey: Self.keyNotchGlowPalette)
+            } else if let data = try? JSONEncoder().encode(newValue) {
+                defaults.set(data, forKey: Self.keyNotchGlowPalette)
+            }
+            defaults.synchronize()
+        }
     }
 
     var recordingHUDRecordingColor: RecordingHUDAccentColor {
@@ -4646,7 +4692,7 @@ final class HotkeyListener {
     /// or first press in toggle mode). onRelease fires when it should
     /// stop (release in hold mode, or second press in toggle mode).
     /// onCancel fires for Escape while a recording is active.
-    var onPress: (() -> Void)?
+    var onPress: ((TimeInterval) -> Void)?
     var onRelease: ((TimeInterval) -> Void)?
     var onReleaseAlternate: ((TimeInterval) -> Void)?
     var onCancel: (() -> Void)?
@@ -4795,7 +4841,7 @@ final class HotkeyListener {
     private func performHotkeyActions(_ actions: [HotkeyTransitionAction], detectedAt: TimeInterval) {
         for action in actions {
             switch action {
-            case .press: onPress?()
+            case .press: onPress?(detectedAt)
             case .release: onRelease?(detectedAt)
             case .releaseAlternate: onReleaseAlternate?(detectedAt)
             case .cancel: onCancel?()
@@ -5104,6 +5150,48 @@ func writeMonoMix(channels: UnsafePointer<UnsafeMutablePointer<Float>>,
 
 final class AudioCapture: @unchecked Sendable {
     private var engine = AVAudioEngine()
+    private struct CaptureRoute: Equatable {
+        let preference: String
+        let input: AudioDeviceID?
+        let output: AudioDeviceID?
+
+        init(preference: String) {
+            self.preference = preference
+            input = audioInputDevice(matching: preference)?.id ?? Self.defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+            output = Self.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
+        }
+
+        private static func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioDeviceID? {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                     mElement: kAudioObjectPropertyElementMain)
+            var value = AudioDeviceID(0)
+            var bytes = UInt32(MemoryLayout<AudioDeviceID>.size)
+            guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &bytes, &value) == noErr,
+                  value != 0 else { return nil }
+            return value
+        }
+
+        var supportsVoiceProcessing: Bool {
+            func builtIn(_ device: AudioDeviceID?) -> Bool {
+                guard let device else { return false }
+                var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+                                                         mScope: kAudioObjectPropertyScopeGlobal,
+                                                         mElement: kAudioObjectPropertyElementMain)
+                var value = UInt32(0)
+                var bytes = UInt32(MemoryLayout<UInt32>.size)
+                return AudioObjectGetPropertyData(device, &address, 0, nil, &bytes, &value) == noErr
+                    && value == kAudioDeviceTransportTypeBuiltIn
+            }
+            return input == Self.defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+                && builtIn(input) && builtIn(output)
+        }
+    }
+    private var cachedCaptureRoute: CaptureRoute?
+    private var unavailableVoiceRoute: CaptureRoute?
+    private var realtimeMeterNode: AVAudioSinkNode?
+    private var realtimeMeter: RealtimeAudioMeter?
+    private var cuePlayerNode: AVAudioPlayerNode?
+    private var graphCueID: UUID?
     #if DEBUG
     private var capturePreparationFailureForTesting: Error?
 
@@ -5133,9 +5221,18 @@ final class AudioCapture: @unchecked Sendable {
     private var converterInputFormat: AVAudioFormat?
     private var manuallyMixInputToMono = false
     private let lock = NSLock()
+    private let recordingStartQueue = DispatchQueue(label: "SuperDictate.AudioStart", qos: .userInitiated)
+    private let recordingStartGroup = DispatchGroup()
+    #if DEBUG
+    var recordingEngineStartForTesting: (@Sendable () throws -> Void)?
+    #endif
     private var samples = AudioSampleAccumulator()
     private var _isRunning = false
     private var latestLevel: Float = 0
+    private var latestNotchLevel: Float = 0
+    private var startCueMeterFilter = StartCueMeterFilter(sampleRate: SAMPLE_RATE)
+    private var cueMeterWindow: (id: UUID, start: TimeInterval, fullUntil: TimeInterval, end: TimeInterval)?
+    private var latestMeterDiagnostic = (rawRMS: 0.0, meterRMS: 0.0, cueWeight: 0.0)
     private var latestLevelSequence: UInt64 = 0
     private var recordingGeneration: UInt64 = 0
     private var recoveryJournal: PendingDictationJournal?
@@ -5157,6 +5254,17 @@ final class AudioCapture: @unchecked Sendable {
     fileprivate func startEngine(inputDevicePreference: String = "",
                                  recordingImmediately: Bool = false,
                                  recoveryJournal: PendingDictationJournal? = nil) throws {
+        recordingStartGroup.wait()
+        try recordingStartQueue.sync {
+            try startEngineForRecording(inputDevicePreference: inputDevicePreference,
+                                        recordingImmediately: recordingImmediately,
+                                        recoveryJournal: recoveryJournal)
+        }
+    }
+
+    private func startEngineForRecording(inputDevicePreference: String,
+                                          recordingImmediately: Bool = false,
+                                          recoveryJournal: PendingDictationJournal? = nil) throws {
         if isEngineStarted {
             if recordingImmediately {
                 beginRecording(recoveryJournal: recoveryJournal)
@@ -5164,15 +5272,12 @@ final class AudioCapture: @unchecked Sendable {
             return
         }
 
-        let input = engine.inputNode
-        let selectedDevice = applyInputDevicePreference(inputDevicePreference, to: input)
-        if let selectedDevice {
-            waitForSelectedInputDevice(selectedDevice, on: input)
-        }
+        var input = engine.inputNode
         do {
             #if DEBUG
             if let failure = capturePreparationFailureForTesting { throw failure }
             #endif
+            input = prepareCaptureGraph(inputDevicePreference: inputDevicePreference)
             _ = try installCaptureTap(on: input)
         } catch {
             // A zero-channel input fails before engine.start(). stopEngine()
@@ -5186,15 +5291,32 @@ final class AudioCapture: @unchecked Sendable {
             recordingGeneration &+= 1
             samples.removeAll(keepingCapacity: true)
             latestLevel = 0
+            latestNotchLevel = 0
+            startCueMeterFilter = StartCueMeterFilter(sampleRate: SAMPLE_RATE)
+            cueMeterWindow = nil
             latestLevelSequence &+= 1
             _isRunning = true
+            realtimeMeter?.setActive(true)
             self.recoveryJournal = recoveryJournal
         }
         lock.unlock()
 
         do {
-            engine.prepare()
-            try engine.start()
+            do {
+                engine.prepare()
+                try engine.start()
+            } catch {
+                guard input.isVoiceProcessingEnabled else { throw error }
+                unavailableVoiceRoute = cachedCaptureRoute
+                log("AudioCapture: voice processing unavailable on this route, retrying ordinary capture")
+                input.removeTap(onBus: 0)
+                resetEngineInstance()
+                input = prepareCaptureGraph(inputDevicePreference: inputDevicePreference)
+                _ = try installCaptureTap(on: input)
+                engine.prepare()
+                try engine.start()
+            }
+            if input.isVoiceProcessingEnabled { input.isVoiceProcessingAGCEnabled = false }
         } catch {
             input.removeTap(onBus: 0)
             clearStoppedCaptureState()
@@ -5208,6 +5330,89 @@ final class AudioCapture: @unchecked Sendable {
         log("AudioCapture: engine started")
     }
 
+    private func prepareCaptureGraph(inputDevicePreference: String) -> AVAudioInputNode {
+        let route = CaptureRoute(preference: inputDevicePreference)
+        if let cachedCaptureRoute, cachedCaptureRoute != route { resetEngineInstance() }
+        var input = engine.inputNode
+        guard cachedCaptureRoute == nil else { return input }
+        if let selected = applyInputDevicePreference(inputDevicePreference, to: input) {
+            waitForSelectedInputDevice(selected, on: input)
+        }
+        if route.supportsVoiceProcessing, unavailableVoiceRoute != route {
+            do {
+                try input.setVoiceProcessingEnabled(true)
+                input.isVoiceProcessingAGCEnabled = false
+                input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
+                log("AudioCapture: system echo cancellation enabled, automatic gain disabled")
+            } catch {
+                unavailableVoiceRoute = route
+                resetEngineInstance()
+                input = engine.inputNode
+                if let selected = applyInputDevicePreference(inputDevicePreference, to: input) {
+                    waitForSelectedInputDevice(selected, on: input)
+                }
+                log("AudioCapture: ordinary capture retained after voice processing setup failed")
+            }
+        }
+        if input.isVoiceProcessingEnabled {
+            let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+            let player = AVAudioPlayerNode()
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+            engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
+            cuePlayerNode = player
+        }
+        cachedCaptureRoute = route
+        return input
+    }
+
+    fileprivate func playRecordingCue(_ cue: RecordingCueAudio, id: UUID, recording: UInt64,
+                                        presentedAt: TimeInterval?,
+                                        isCurrent: @escaping @Sendable () -> Bool,
+                                        completion: @escaping @Sendable (RecordingGraphCueResult) -> Void) {
+        recordingStartGroup.enter()
+        recordingStartQueue.async { [self] in
+            defer { recordingStartGroup.leave() }
+            guard isCurrent(), meterRecordingGeneration == recording else {
+                completion(.cancelled)
+                return
+            }
+            guard isEngineStarted, engine.isRunning, engine.inputNode.isVoiceProcessingEnabled,
+                  let player = cuePlayerNode else {
+                completion(.unavailable)
+                return
+            }
+            player.stop()
+            player.volume = 0.55
+            player.scheduleBuffer(cue.buffer)
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            player.play()
+            guard isCurrent(), meterRecordingGeneration == recording else {
+                player.stop()
+                completion(.cancelled)
+                return
+            }
+            graphCueID = id
+            log(String(format: "recording cue: played=true duration=%.1f ms play_call=%.1f ms thread=capture_queue engine=shared",
+                       cue.duration * 1000, (ProcessInfo.processInfo.systemUptime - startedAt) * 1000))
+            if let presentedAt {
+                log(String(format: "recording cue sync: presented_to_play=%.2f ms engine=shared",
+                           (startedAt - presentedAt) * 1000))
+            }
+            completion(.played)
+        }
+    }
+
+    fileprivate func cancelRecordingCue(_ id: UUID) {
+        recordingStartGroup.enter()
+        recordingStartQueue.async { [self] in
+            defer { recordingStartGroup.leave() }
+            guard graphCueID == id else { return }
+            cuePlayerNode?.stop()
+            graphCueID = nil
+        }
+    }
+
     fileprivate func startRecording(inputDevicePreference: String = "",
                                     recoveryJournal: PendingDictationJournal? = nil) throws {
         if isEngineStarted {
@@ -5219,16 +5424,42 @@ final class AudioCapture: @unchecked Sendable {
                         recoveryJournal: recoveryJournal)
     }
 
+    fileprivate func startRecordingAsync(inputDevicePreference: String,
+                                           recoveryJournal: PendingDictationJournal?,
+                                           completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        beginRecording(recoveryJournal: recoveryJournal)
+        recordingStartGroup.enter()
+        recordingStartQueue.async { [self] in
+            let result = Result {
+                #if DEBUG
+                if let recordingEngineStartForTesting {
+                    try recordingEngineStartForTesting()
+                    return
+                }
+                #endif
+                try startEngineForRecording(inputDevicePreference: inputDevicePreference)
+            }
+            recordingStartGroup.leave()
+            completion(result)
+        }
+    }
+
     /// AVAudioEngine stops and uninitializes its I/O unit when a selected
     /// device changes sample rate or channel layout. Rebuild the tap and
     /// converter on the existing engine so its explicitly selected HAL
     /// device remains attached and an active recording can continue.
     fileprivate func recoverAfterConfigurationChange() throws -> Bool {
+        recordingStartGroup.wait()
+        return try recordingStartQueue.sync { try recoverCaptureGraph() }
+    }
+
+    private func recoverCaptureGraph() throws -> Bool {
         guard isEngineStarted else { return false }
 
         let input = engine.inputNode
         input.removeTap(onBus: 0)
         engine.stop()
+        removeRealtimeMeter()
 
         var didInstallTap = false
         do {
@@ -5236,6 +5467,7 @@ final class AudioCapture: @unchecked Sendable {
             didInstallTap = true
             engine.prepare()
             try engine.start()
+            if input.isVoiceProcessingEnabled { input.isVoiceProcessingAGCEnabled = false }
             log("AudioCapture: graph recovered at \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch")
             return true
         } catch {
@@ -5253,22 +5485,38 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     func stopEngine() {
+        recordingStartGroup.wait()
+        recordingStartQueue.sync { stopCaptureGraph() }
+    }
+
+    private func stopCaptureGraph() {
         removeConfigurationObserver()
 
         let wasEngineStarted = isEngineStarted
         clearStoppedCaptureState()
 
         guard wasEngineStarted else { return }
+        cuePlayerNode?.stop()
+        graphCueID = nil
+        engine.stop()
         engine.inputNode.removeTap(onBus: 0)
-        resetEngineInstance()
+        removeRealtimeMeter()
+        if engine.inputNode.isVoiceProcessingEnabled {
+            engine.reset()
+        } else {
+            resetEngineInstance()
+        }
     }
 
     private func clearStoppedCaptureState() {
         lock.lock()
         _isRunning = false
+        realtimeMeter?.setActive(false)
         latestLevel = 0
+        latestNotchLevel = 0
         latestLevelSequence &+= 1
         recordingGeneration &+= 1
+        cueMeterWindow = nil
         samples.removeAll(keepingCapacity: true)
         let recoveryJournal = self.recoveryJournal
         self.recoveryJournal = nil
@@ -5287,8 +5535,12 @@ final class AudioCapture: @unchecked Sendable {
 
     private func resetEngineInstance() {
         engine.stop()
+        removeRealtimeMeter()
+        cuePlayerNode = nil
+        graphCueID = nil
         engine.reset()
         engine = AVAudioEngine()
+        cachedCaptureRoute = nil
     }
 
     fileprivate func beginRecording(recoveryJournal: PendingDictationJournal? = nil) {
@@ -5297,8 +5549,13 @@ final class AudioCapture: @unchecked Sendable {
         recordingGeneration &+= 1
         samples.removeAll(keepingCapacity: true)
         latestLevel = 0
+        latestNotchLevel = 0
         latestLevelSequence &+= 1
+        startCueMeterFilter = StartCueMeterFilter(sampleRate: SAMPLE_RATE)
+        cueMeterWindow = nil
+        latestMeterDiagnostic = (0, 0, 0)
         _isRunning = true
+        realtimeMeter?.setActive(true)
         self.recoveryJournal = recoveryJournal
         lock.unlock()
         previousJournal?.finish()
@@ -5334,9 +5591,12 @@ final class AudioCapture: @unchecked Sendable {
         let startedAt = ProcessInfo.processInfo.systemUptime
         lock.lock()
         _isRunning = false
+        realtimeMeter?.setActive(false)
         latestLevel = 0
+        latestNotchLevel = 0
         latestLevelSequence &+= 1
         recordingGeneration &+= 1
+        cueMeterWindow = nil
         let captured = samples.drain()
         let recoveryJournal = self.recoveryJournal
         self.recoveryJournal = nil
@@ -5355,12 +5615,150 @@ final class AudioCapture: @unchecked Sendable {
         )
     }
 
-    func latestRecordingLevelSnapshot() -> (level: Float, sequence: UInt64) {
+    func latestRecordingLevelSnapshot(forNotch: Bool = false) -> (level: Float, sequence: UInt64) {
         lock.lock(); defer { lock.unlock() }
+        if _isRunning, let realtimeMeter {
+            let value = realtimeMeter.snapshot(forNotch: forNotch)
+            return (value.level, value.sequence)
+        }
         return _isRunning
-            ? (latestLevel, latestLevelSequence)
+            ? (forNotch ? latestNotchLevel : latestLevel, latestLevelSequence)
             : (0, latestLevelSequence)
     }
+
+    fileprivate var meterRecordingGeneration: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isRunning ? recordingGeneration : nil
+    }
+
+    fileprivate func beginStartCueMeterSuppression(duration: TimeInterval, generation: UInt64) -> UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard _isRunning, recordingGeneration == generation,
+              duration.isFinite, duration > 0 else { return nil }
+        let id = UUID()
+        let start = ProcessInfo.processInfo.systemUptime
+        cueMeterWindow = (id, start, start + duration + 0.08, start + duration + 0.16)
+        return id
+    }
+
+    fileprivate func cancelStartCueMeterSuppression(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        if cueMeterWindow?.id == id { cueMeterWindow = nil }
+    }
+
+    fileprivate func recordingMeterDiagnostic() -> (rawRMS: Double, meterRMS: Double, cueWeight: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let realtimeMeter {
+            let value = realtimeMeter.snapshot()
+            let time = ProcessInfo.processInfo.systemUptime
+            let active = cueMeterWindow.map { time >= $0.start && time < $0.end } ?? false
+            return (value.rms, value.rms, active ? 1 : 0)
+        }
+        return latestMeterDiagnostic
+    }
+
+    #if DEBUG
+    static func testStartCueMeter() throws {
+        let direct = AudioCapture()
+        direct.beginRecording()
+        let meter = RealtimeAudioMeter()
+        direct.realtimeMeter = meter
+        meter.setActive(true)
+        let directFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SAMPLE_RATE,
+                                         channels: 1, interleaved: false)!
+        let directBuffer = AVAudioPCMBuffer(pcmFormat: directFormat, frameCapacity: 160)!
+        directBuffer.frameLength = 160
+        var previous: UInt64 = 0
+        for block in 0..<100 {
+            for index in 0..<160 {
+                let t = Double(block * 160 + index) / SAMPLE_RATE
+                directBuffer.floatChannelData![0][index] = Float(0.04 * sin(2 * .pi * 261.626 * t))
+            }
+            meter.consume(frames: 160, buffers: directBuffer.audioBufferList, sampleRate: SAMPLE_RATE)
+            let value = direct.latestRecordingLevelSnapshot(forNotch: true)
+            guard value.sequence > previous, value.level > 0.3 else {
+                throw localSpeechError("Realtime meter delayed or frequency-cut a voiced sound during startup")
+            }
+            previous = value.sequence
+        }
+        _ = direct.endRecording()
+        guard direct.latestRecordingLevelSnapshot(forNotch: true).level == 0 else {
+            throw localSpeechError("Realtime meter continued after recording stopped")
+        }
+        direct.beginRecording()
+        guard direct.latestRecordingLevelSnapshot(forNotch: true).level == 0 else {
+            throw localSpeechError("Realtime meter retained the previous recording's level")
+        }
+        _ = direct.endRecording()
+        print("REALTIME_METER voiced_262Hz=retained first_update=10ms updates_per_second=100 stopped_and_restarted=true")
+        let count = Int(SAMPLE_RATE)
+        let speech = (0..<count).map { index in
+            let t = Double(index) / SAMPLE_RATE
+            return Float(0.012 * (sin(2 * .pi * 137 * t) + 0.5 * sin(2 * .pi * 580 * t)
+                                 + 0.3 * sin(2 * .pi * 1400 * t)))
+        }
+        let cue = (0..<count).map { index in
+            let t = Double(index) / SAMPLE_RATE
+            let envelope = (1 - exp(-t / 0.012)) * exp(-t / 0.2)
+            return Float(0.18 * envelope * sin(2 * .pi * 261.626 * t))
+        }
+        let mixed = zip(speech, cue).map(+)
+        var cueFilter = StartCueMeterFilter(sampleRate: SAMPLE_RATE)
+        let cueEnergy = cueFilter.measure(cue)
+        guard cueEnergy.filtered < cueEnergy.raw * 0.005 else {
+            throw localSpeechError("Start cue still dominates the visual meter")
+        }
+        var voiceFilter = StartCueMeterFilter(sampleRate: SAMPLE_RATE)
+        let voiceEnergy = voiceFilter.measure(speech)
+        guard voiceEnergy.filtered > voiceEnergy.raw * 0.85,
+              voiceEnergy.mixed(weight: 0) == voiceEnergy.raw else {
+            throw localSpeechError("Start cue meter removed the simultaneous voice or changed ordinary metering")
+        }
+        var mixedFilter = StartCueMeterFilter(sampleRate: SAMPLE_RATE)
+        let mixedEnergy = mixedFilter.measure(mixed)
+        guard mixedEnergy.filtered > voiceEnergy.filtered * 0.9,
+              mixedEnergy.filtered < voiceEnergy.filtered * 1.3 else {
+            throw localSpeechError("Start cue meter did not preserve overlapping voice")
+        }
+        let capture = AudioCapture()
+        capture.beginRecording()
+        let generation = capture.meterRecordingGeneration!
+        let stale = capture.beginStartCueMeterSuppression(duration: 1, generation: generation)!
+        capture.beginRecording()
+        guard capture.cueMeterWindow == nil,
+              capture.beginStartCueMeterSuppression(duration: 1, generation: generation) == nil else {
+            throw localSpeechError("A stale cue leaked into the next recording")
+        }
+        let currentGeneration = capture.meterRecordingGeneration!
+        let current = capture.beginStartCueMeterSuppression(duration: 1, generation: currentGeneration)!
+        capture.cancelStartCueMeterSuppression(stale)
+        guard capture.cueMeterWindow?.id == current else {
+            throw localSpeechError("A stale cue cancellation removed the current recording's filter")
+        }
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SAMPLE_RATE,
+                                   channels: 1, interleaved: false)!
+        capture.converter = AVAudioConverter(from: format, to: format)
+        capture.converterInputFormat = format
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count))!
+        buffer.frameLength = AVAudioFrameCount(count)
+        mixed.withUnsafeBufferPointer { source in
+            buffer.floatChannelData![0].update(from: source.baseAddress!, count: count)
+        }
+        capture.handleTap(buffer: buffer, target: format, time: AVAudioTime(hostTime: mach_absolute_time()))
+        let diagnostic = capture.recordingMeterDiagnostic()
+        guard diagnostic.cueWeight == 1, diagnostic.meterRMS > 0,
+              capture.endRecording().samples == mixed, capture.cueMeterWindow == nil,
+              capture.beginStartCueMeterSuppression(duration: 1, generation: currentGeneration) == nil else {
+            throw localSpeechError("Visual cue filtering modified the recording or survived its end")
+        }
+        print(String(format: "START_CUE_METER cue=%.1fdB voice_retained=%.1f%% overlap=true samples_unchanged=true stale_cues_ignored=true",
+                     10 * log10(cueEnergy.filtered / cueEnergy.raw), voiceEnergy.filtered / voiceEnergy.raw * 100))
+    }
+    #endif
 
     private func installCaptureTap(on input: AVAudioInputNode) throws -> AVAudioFormat {
         // On macOS, changing kAudioOutputUnitProperty_CurrentDevice updates
@@ -5369,7 +5767,9 @@ final class AudioCapture: @unchecked Sendable {
         // that stale output format to installTap raises an Objective-C
         // exception instead of returning an error. The input-scope format is
         // the actual hardware stream delivered by the selected device.
-        let inputFormat = input.inputFormat(forBus: 0)
+        let inputFormat = input.isVoiceProcessingEnabled
+            ? AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+            : input.inputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw NSError(
                 domain: "SuperDictate.AudioCapture",
@@ -5409,10 +5809,30 @@ final class AudioCapture: @unchecked Sendable {
         converter = newConverter
         lock.unlock()
 
+        let outputFormat = input.outputFormat(forBus: 0)
+        let canMeterDirectly = input.isVoiceProcessingEnabled
+            || (outputFormat.sampleRate == inputFormat.sampleRate && outputFormat.channelCount == inputFormat.channelCount)
+        if inputFormat.commonFormat == .pcmFormatFloat32, canMeterDirectly {
+            let meter = RealtimeAudioMeter()
+            meter.setActive(isRunning)
+            let sampleRate = inputFormat.sampleRate
+            let node = AVAudioSinkNode { _, frames, buffers in
+                meter.consume(frames: frames, buffers: buffers, sampleRate: sampleRate)
+                return noErr
+            }
+            engine.attach(node)
+            engine.connect(input, to: node, format: inputFormat)
+            realtimeMeterNode = node
+            lock.lock()
+            realtimeMeter = meter
+            lock.unlock()
+            log("AudioCapture: realtime meter enabled at \(sampleRate) Hz, no startup tone frequency cut")
+        }
+
         // Capture targetFormat by value into the closure. self is weak so
         // the engine does not keep AudioCapture alive past its owner.
-        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { [weak self] buffer, _ in
-            self?.handleTap(buffer: buffer, target: targetFormat)
+        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { [weak self] buffer, time in
+            self?.handleTap(buffer: buffer, target: targetFormat, time: time)
         }
 
         let mixLabel = mixToMono ? " via manual mono mix" : ""
@@ -5420,7 +5840,16 @@ final class AudioCapture: @unchecked Sendable {
         return inputFormat
     }
 
-    private func handleTap(buffer: AVAudioPCMBuffer, target: AVAudioFormat) {
+    private func removeRealtimeMeter() {
+        lock.lock()
+        realtimeMeter?.setActive(false)
+        realtimeMeter = nil
+        lock.unlock()
+        if let realtimeMeterNode { engine.detach(realtimeMeterNode) }
+        realtimeMeterNode = nil
+    }
+
+    private func handleTap(buffer: AVAudioPCMBuffer, target: AVAudioFormat, time: AVAudioTime) {
         // Snapshot the running flag AND the converter trio in one
         // lock acquisition; bail fast if we're not recording so we
         // don't pay conversion cost for nothing. Working off the
@@ -5434,6 +5863,8 @@ final class AudioCapture: @unchecked Sendable {
         let converter = self.converter
         let monoMixFormat = converterInputFormat
         let mixToMono = manuallyMixInputToMono
+        var meterFilter = startCueMeterFilter
+        let cueWindow = cueMeterWindow
         lock.unlock()
         guard running, let converter else { return }
 
@@ -5465,17 +5896,23 @@ final class AudioCapture: @unchecked Sendable {
         let frameCount = Int(out.frameLength)
         var arr: [Float] = []
         arr.reserveCapacity(frameCount)
-        var sumSquares: Double = 0
-        var finiteSampleCount = 0
         for sample in UnsafeBufferPointer(start: ch, count: frameCount) {
             arr.append(sample)
-            guard sample.isFinite else { continue }
-            let clamped = max(-1, min(1, sample))
-            sumSquares += Double(clamped * clamped)
-            finiteSampleCount += 1
         }
-        let level = normalizedAudioLevel(sumSquares: sumSquares,
-                                         sampleCount: finiteSampleCount)
+        let energy = meterFilter.measure(arr)
+        let bufferDuration = Double(buffer.frameLength) / buffer.format.sampleRate
+        let bufferStart = time.isHostTimeValid
+            ? AVAudioTime.seconds(forHostTime: time.hostTime)
+            : ProcessInfo.processInfo.systemUptime - bufferDuration
+        let bufferEnd = bufferStart + bufferDuration
+        var cueWeight = 0.0
+        if let cueWindow, bufferEnd >= cueWindow.start, bufferStart < cueWindow.end {
+            let remaining = max(0, min(1, (cueWindow.end - bufferStart) / (cueWindow.end - cueWindow.fullUntil)))
+            cueWeight = remaining * remaining * (3 - 2 * remaining)
+        }
+        let sumSquares = energy.mixed(weight: cueWeight)
+        let finiteSampleCount = energy.sampleCount
+        let level = normalizedAudioLevel(sumSquares: sumSquares, sampleCount: finiteSampleCount)
         // Re-check running under lock — endRecording() might have
         // fired during conversion, then a rapid next recording may
         // already have started. The generation token keeps straggler
@@ -5485,6 +5922,10 @@ final class AudioCapture: @unchecked Sendable {
             samples.append(arr)
             recoveryJournal?.append(arr)
             latestLevel = level
+            latestNotchLevel = normalizedNotchAudioLevel(sumSquares: sumSquares, sampleCount: finiteSampleCount)
+            startCueMeterFilter = meterFilter
+            let divisor = Double(max(1, finiteSampleCount))
+            latestMeterDiagnostic = (sqrt(energy.raw / divisor), sqrt(max(0, sumSquares) / divisor), cueWeight)
             latestLevelSequence &+= 1
         }
         lock.unlock()
@@ -8219,10 +8660,215 @@ private func systemAudioMuteWatchdogScript() -> String {
 // successful paste, Basso when a dictation is dropped. Loaded from
 // /System/Library/Sounds so we don't have to bundle audio resources.
 
+fileprivate enum RecordingGraphCueResult: Sendable {
+    case played
+    case unavailable
+    case cancelled
+}
+
+fileprivate final class RecordingCueAudio: @unchecked Sendable {
+    let buffer: AVAudioPCMBuffer
+    var duration: TimeInterval { Double(buffer.frameLength) / buffer.format.sampleRate }
+
+    init?(url: URL) {
+        guard let file = try? AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false),
+              file.processingFormat.sampleRate == 48000, file.processingFormat.channelCount == 2,
+              file.length > 0, file.length <= Int64(UInt32.max),
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+            return nil
+        }
+        do { try file.read(into: buffer) } catch { return nil }
+        self.buffer = buffer
+    }
+}
+
+private final class RecordingStartCueRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
+private final class RecordingStartCuePlayer: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "SuperDictate.StartCue", qos: .userInitiated)
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+    private var player: AVAudioPlayer?
+    private var cueAudio: RecordingCueAudio?
+    private weak var graphCapture: AudioCapture?
+    private var graphCueID: UUID?
+    private var isTonalSiriCue = false
+    private weak var meteredCapture: AudioCapture?
+    private var meterSuppressionID: UUID?
+
+    func prepare() {
+        queue.async { [self] in prepareOnQueue() }
+    }
+
+    private func prepareOnQueue() {
+        guard player == nil else { return }
+        for path in [
+            "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_begin_short.caf",
+            "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_begin.caf",
+            "/System/Library/Sounds/Tink.aiff"
+        ] {
+            if let sound = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: path)) {
+                sound.volume = 0.55
+                if sound.prepareToPlay() {
+                    player = sound
+                    cueAudio = RecordingCueAudio(url: URL(fileURLWithPath: path))
+                    isTonalSiriCue = path.hasSuffix("/jbl_begin_short.caf")
+                    return
+                }
+            }
+        }
+    }
+
+    func play(metering capture: AudioCapture? = nil,
+              completion: @escaping @MainActor @Sendable (TimeInterval) -> Void) {
+        makePlayback(metering: capture, completion: completion)(nil)
+    }
+
+    func makePlayback(metering capture: AudioCapture? = nil,
+                      completion: @escaping @MainActor @Sendable (TimeInterval) -> Void) -> @Sendable (TimeInterval?) -> Void {
+        let captureGeneration = capture?.meterRecordingGeneration
+        lock.lock()
+        generation &+= 1
+        let token = generation
+        lock.unlock()
+        let request = RecordingStartCueRequest()
+        return { [self] presentedAt in
+            guard request.claim(), isCurrent(token) else { return }
+            queue.async { [self] in
+                guard isCurrent(token) else { return }
+                clearMeterSuppression()
+                prepareOnQueue()
+                guard let player else {
+                    deliver(0, token: token, completion: completion)
+                    return
+                }
+                guard isCurrent(token) else { return }
+                if let cueAudio, let capture, let captureGeneration {
+                    let id = UUID()
+                    graphCapture = capture
+                    graphCueID = id
+                    capture.playRecordingCue(cueAudio, id: id, recording: captureGeneration,
+                                              presentedAt: presentedAt, isCurrent: { [self] in isCurrent(token) }) { [self] result in
+                        queue.async { [self] in
+                            guard isCurrent(token) else {
+                                capture.cancelRecordingCue(id)
+                                return
+                            }
+                            switch result {
+                            case .played:
+                                if isTonalSiriCue {
+                                    meterSuppressionID = capture.beginStartCueMeterSuppression(duration: cueAudio.duration,
+                                                                                               generation: captureGeneration)
+                                    meteredCapture = capture
+                                }
+                                deliver(cueAudio.duration, token: token, completion: completion)
+                            case .unavailable:
+                                graphCapture = nil
+                                graphCueID = nil
+                                if let player = self.player {
+                                    playFallbackOnQueue(player, capture: capture, captureGeneration: captureGeneration,
+                                                        presentedAt: presentedAt, token: token, completion: completion)
+                                } else {
+                                    deliver(0, token: token, completion: completion)
+                                }
+                            case .cancelled:
+                                break
+                            }
+                        }
+                    }
+                    return
+                }
+                playFallbackOnQueue(player, capture: capture, captureGeneration: captureGeneration,
+                                    presentedAt: presentedAt, token: token, completion: completion)
+            }
+        }
+    }
+
+    private func playFallbackOnQueue(_ player: AVAudioPlayer, capture: AudioCapture?, captureGeneration: UInt64?,
+                                      presentedAt: TimeInterval?, token: UInt64,
+                                      completion: @escaping @MainActor @Sendable (TimeInterval) -> Void) {
+        guard isCurrent(token) else { return }
+        player.pause()
+        player.currentTime = 0
+        if isTonalSiriCue, let capture, let captureGeneration {
+            meterSuppressionID = capture.beginStartCueMeterSuppression(duration: player.duration,
+                                                                       generation: captureGeneration)
+            meteredCapture = capture
+        }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let played = player.play()
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        if !played { clearMeterSuppression() }
+        guard isCurrent(token) else {
+            player.pause()
+            clearMeterSuppression()
+            return
+        }
+        log(String(format: "recording cue: played=%@ duration=%.1f ms play_call=%.1f ms thread=cue_queue",
+                   played ? "true" : "false", player.duration * 1000, elapsed * 1000))
+        if let presentedAt {
+            log(String(format: "recording cue sync: presented_to_play=%.2f ms",
+                       (startedAt - presentedAt) * 1000))
+        }
+        deliver(played ? player.duration : 0, token: token, completion: completion)
+    }
+
+    private func deliver(_ duration: TimeInterval, token: UInt64,
+                         completion: @escaping @MainActor @Sendable (TimeInterval) -> Void) {
+        DispatchQueue.main.async { [self] in
+            guard isCurrent(token) else { return }
+            completion(duration)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+        queue.async { [self] in
+            player?.pause()
+            clearMeterSuppression()
+        }
+    }
+
+    private func clearMeterSuppression() {
+        if let graphCueID { graphCapture?.cancelRecordingCue(graphCueID) }
+        graphCapture = nil
+        graphCueID = nil
+        if let meterSuppressionID { meteredCapture?.cancelStartCueMeterSuppression(meterSuppressionID) }
+        meterSuppressionID = nil
+        meteredCapture = nil
+    }
+
+    private func isCurrent(_ token: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation == token
+    }
+}
+
 @MainActor
 enum Sounds {
-    private static let start = systemSound("Tink", volume: 0.55)
-    private static let done = systemSound("Pop", volume: 0.45)
+    private static let start = RecordingStartCuePlayer()
+    private static let done: AVAudioPlayer? = {
+        let resource = Bundle.main.url(forResource: "recording-done", withExtension: "wav")
+        let url = resource ?? URL(fileURLWithPath: "/System/Library/Sounds/Pop.aiff")
+        guard let sound = try? AVAudioPlayer(contentsOf: url) else { return nil }
+        sound.volume = resource == nil ? 0.45 : 1
+        guard sound.prepareToPlay() else { return nil }
+        return sound
+    }()
     private static let error = systemSound("Basso", volume: 0.30)
 
     private static func systemSound(_ name: String, volume: Float) -> NSSound? {
@@ -8232,9 +8878,71 @@ enum Sounds {
         return sound
     }
 
-    static func playStart() { start?.stop(); start?.play() }
-    static func playDone()  { done?.stop();  done?.play() }
+    static func prepareStart() { start.prepare(); _ = done }
+    static func cancelStart() { start.cancel() }
+    static func playStart(metering capture: AudioCapture? = nil,
+                          completion: @escaping @MainActor @Sendable (TimeInterval) -> Void) {
+        start.play(metering: capture, completion: completion)
+    }
+    static func makeStartPlayback(metering capture: AudioCapture? = nil,
+                                  completion: @escaping @MainActor @Sendable (TimeInterval) -> Void) -> @Sendable (TimeInterval?) -> Void {
+        start.makePlayback(metering: capture, completion: completion)
+    }
+    static func cancelDone() { done?.pause() }
+    static func playDone() { done?.pause(); done?.currentTime = 0; done?.play() }
+    @MainActor
+    static func playDone(alongside animation: @escaping @MainActor @Sendable () -> Void) {
+        guard let done else { animation(); return }
+        done.pause()
+        done.currentTime = 0
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        let lead: TimeInterval = 0.12
+        let scheduledAt = requestedAt + lead
+        guard done.play(atTime: done.deviceCurrentTime + lead) else { animation(); return }
+        let remaining = max(0, scheduledAt - ProcessInfo.processInfo.systemUptime)
+        DispatchQueue.main.asyncAfter(deadline: .now() + remaining, execute: animation)
+    }
     static func playError() { error?.stop(); error?.play() }
+
+    @MainActor
+    static func diagnoseCompletionSound() throws {
+        guard let url = Bundle.main.url(forResource: "recording-done", withExtension: "wav"),
+              let done else {
+            throw localSpeechError("Bundled completion cue is missing")
+        }
+        let duration = done.duration
+        guard duration > 0.57, duration < 0.59 else {
+            throw localSpeechError("Unexpected completion cue duration: \(duration)")
+        }
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        var animationStartedAt: TimeInterval?
+        var audioPositionAtAnimation: TimeInterval?
+        playDone(alongside: {
+            animationStartedAt = ProcessInfo.processInfo.systemUptime
+            audioPositionAtAnimation = done.currentTime
+        })
+        let returnedAt = ProcessInfo.processInfo.systemUptime
+        guard done.isPlaying else { throw localSpeechError("Completion cue never entered playback") }
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while done.isPlaying, Date() < deadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        guard !done.isPlaying else {
+            done.stop()
+            throw localSpeechError("Completion cue did not finish")
+        }
+        guard let animationStartedAt, let audioPositionAtAnimation,
+              animationStartedAt >= requestedAt + 0.10,
+              abs(audioPositionAtAnimation) < 0.08 else {
+            throw localSpeechError("Completion animation missed the scheduled audio onset")
+        }
+        print(String(format: "COMPLETION_SYNC animation_start=%.1fms audio_position=%.1fms",
+                     (animationStartedAt-requestedAt)*1000, audioPositionAtAnimation*1000))
+        let digest = SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
+        print(String(format: "COMPLETION_CUE variant=1 duration=%.3fms play_call=%.1fms playback=%.1fms volume=%.2f sha256=%@",
+                     duration * 1000, (returnedAt-requestedAt) * 1000, (ProcessInfo.processInfo.systemUptime-requestedAt) * 1000,
+                     done.volume, digest))
+    }
 }
 
 // MARK: - Bundle version helpers
@@ -9372,6 +10080,74 @@ final class CorrectionShareCleanupDelegate: NSObject, @preconcurrency NSSharingS
 }
 
 private final class RecordingHUDView: NSView {
+    var notchGeometry: NotchHUDGeometry? {
+        didSet {
+            guard oldValue != notchGeometry else { return }
+            if notchGeometry != nil, notchGlowView == nil {
+                let view = NotchGlowHostView()
+                view.frame = bounds
+                view.autoresizingMask = [.width, .height]
+                addSubview(view)
+                notchGlowView = view
+                view.palette = notchPalette
+            } else if notchGeometry == nil {
+                notchGlowView?.removeFromSuperview()
+                notchGlowView = nil
+            }
+            updateNotchGlow()
+            needsDisplay = true
+        }
+    }
+    private var notchGlowView: NotchGlowHostView?
+    var notchPalette: NotchGlowPalette = .standard {
+        didSet { notchGlowView?.palette = notchPalette }
+    }
+
+    var notchGlowIsActive: Bool { notchGlowView?.isActive == true }
+
+    var notchRenderedFrames: Int { notchGlowView?.renderedFrames ?? 0 }
+
+    var notchEntrancePresented: (first: TimeInterval?, complete: TimeInterval?, firstAge: TimeInterval?, opened: TimeInterval?, origin: TimeInterval?) {
+        (notchGlowView?.entranceFirstPresented, notchGlowView?.entranceCompletePresented,
+         notchGlowView?.entranceFirstFrameAge, notchGlowView?.entranceOpenedPresented,
+         notchGlowView?.entranceStartedAt)
+    }
+
+    var notchBackdropUpdates: Int { notchGlowView?.backdropUpdates ?? 0 }
+
+    var notchBackdropGeometry: String { notchGlowView?.backdropGeometryDescription ?? "missing" }
+
+    var notchBackdropIsAligned: Bool { notchGlowView?.backdropIsAligned == true }
+
+    var notchBackdropFramesSynchronized: Bool { notchGlowView?.backdropFramesSynchronized == true }
+
+    func whenNotchStartFrameIsPresented(_ callback: @escaping () -> Void) -> Bool {
+        guard let notchGlowView else { return false }
+        notchGlowView.whenStartFrameIsPresented(callback)
+        return true
+    }
+
+    func whenNotchStartFrameIsPresented(immediate: @escaping @Sendable (TimeInterval) -> Void,
+                                       _ callback: @escaping () -> Void) -> Bool {
+        guard let notchGlowView else { return false }
+        notchGlowView.whenStartFrameIsPresented(immediate: immediate, callback)
+        return true
+    }
+
+    func cancelNotchStartFeedback() {
+        notchGlowView?.cancelStartFrameCallback()
+    }
+
+    func advanceNotchGlow(deltaTime: TimeInterval) {
+        notchGlowView?.advance(deltaTime: deltaTime)
+    }
+
+    private func updateNotchGlow() {
+        guard let notchGeometry else { return }
+        notchGlowView?.update(geometry: notchGeometry, mode: mode,
+                              level: level, reveal: revealProgress)
+    }
+
     var visualScale: CGFloat = RecordingHUDSize.standard.visualScale {
         didSet {
             if oldValue != visualScale { needsDisplay = true }
@@ -9408,7 +10184,10 @@ private final class RecordingHUDView: NSView {
 
     var revealProgress: CGFloat = 1 {
         didSet {
-            if oldValue != revealProgress { needsDisplay = true }
+            if oldValue != revealProgress {
+                updateNotchGlow()
+                needsDisplay = true
+            }
         }
     }
 
@@ -9416,6 +10195,7 @@ private final class RecordingHUDView: NSView {
         didSet {
             if oldValue != mode {
                 modeChangedAt = ProcessInfo.processInfo.systemUptime
+                updateNotchGlow()
                 needsDisplay = true
             }
         }
@@ -9424,7 +10204,10 @@ private final class RecordingHUDView: NSView {
 
     var level: Float = 0 {
         didSet {
-            if oldValue != level { needsDisplay = true }
+            if oldValue != level {
+                updateNotchGlow()
+                needsDisplay = true
+            }
         }
     }
 
@@ -9438,6 +10221,7 @@ private final class RecordingHUDView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        guard notchGeometry == nil else { return }
         drawFloatingWaveformOnly()
     }
 
@@ -10839,6 +11623,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let settings = Settings.shared
 
     private var isRecording = false
+    private var recordingAudioStartupID: UUID?
     private var isBusy = false
     private var isReady = false
     private var isCoreRuntimeReady = false
@@ -10899,8 +11684,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDView: RecordingHUDView?
     private var recordingHUDTranscribingStartedAt: TimeInterval?
     private var recordingHUDAnimationToken = 0
+    private var recordingStartSoundWorkItem: DispatchWorkItem?
+    private var recordingSoundMuteWorkItem: DispatchWorkItem?
     private var recordingHUDDisplayLink: CADisplayLink?
     private var lastRecordingHUDMotionAt: TimeInterval?
+    private var lastNotchAudioAt: TimeInterval?
+    #if DEBUG
+    private var notchFrameIntervals: [TimeInterval] = []
+    #endif
     private var lastRecordingHUDTargetRefreshAt: TimeInterval?
     private var recordingHUDRevealStartedAt: TimeInterval?
     private var recordingHUDRevealFrom: CGFloat = 0
@@ -11036,7 +11827,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             break
         }
 
-        hotkey.onPress = { [weak self] in self?.handlePress() }
+        Sounds.prepareStart()
+        hotkey.onPress = { [weak self] detectedAt in self?.handlePress(hotkeyDetectedAt: detectedAt) }
         hotkey.onRelease = { [weak self] detectedAt in
             self?.handleRelease(shortcut: .standard, hotkeyDetectedAt: detectedAt)
         }
@@ -11057,7 +11849,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // (enterPermissionBlockedState), which also resets the toggle.
         hotkey.canStartRecording = { [weak self] in
             guard let self else { return false }
-            return self.isReady && !self.isRecording && !self.isBusy && !self.isTerminating
+            return self.isReady && !self.isRecording && self.recordingAudioStartupID == nil && !self.isBusy && !self.isTerminating
         }
         let hotkeyReady = hotkeyPausedForExternalCapture || hotkey.start()
         if hotkeyPausedForExternalCapture {
@@ -11089,6 +11881,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        if recordingHUDPanel == nil, settings.showRecordingWaveform,
+           selectedRecordingHUDNotchGeometry() != nil {
+            recordingHUDPanel = makeRecordingHUDPanel()
+        }
         isReady = true
         stopAudioInputRecovery()
         startupStatusTitle = "Ready"
@@ -12187,7 +12983,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingHUDRetargetWorkItem = nil
         recordingHUDTargetSessionToken &+= 1
         recordingHUDTargetQueryInFlight = false
-        recordingHUDWaitingForInitialTarget = settings.showRecordingWaveform
+        recordingHUDWaitingForInitialTarget = settings.showRecordingWaveform && selectedRecordingHUDNotchGeometry() == nil
+        if settings.showRecordingWaveform, selectedRecordingHUDNotchGeometry() != nil {
+            showRecordingHUD(mode: .recording, level: 0)
+        }
         recordingHUDTargetStabilizer.reset(initialApplicationPID: initialContext?.applicationPID)
         setMenuBarState(.recording)
         let timer = Timer(timeInterval: 1.0 / 24.0,
@@ -12211,6 +13010,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func stopRecordingLevelMeter(resetImage: Bool = true, hideHUD: Bool = true) {
+        Sounds.cancelStart()
+        recordingSoundMuteWorkItem?.cancel()
+        recordingSoundMuteWorkItem = nil
+        recordingStartSoundWorkItem?.cancel()
+        recordingStartSoundWorkItem = nil
+        recordingHUDView?.cancelNotchStartFeedback()
         recordingLevelTimer?.invalidate()
         recordingLevelTimer = nil
         recordingVisualLevel = 0
@@ -12233,6 +13038,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func recordingLevelTimerFired(_ timer: Timer) {
         guard isRecording else {
             stopRecordingLevelMeter()
+            return
+        }
+        if selectedRecordingHUDNotchGeometry() != nil {
+            refreshRecordingHUDInsertionTargetIfNeeded(at: ProcessInfo.processInfo.systemUptime)
+            if settings.showRecordingWaveform {
+                if recordingHUDPanel?.isVisible != true {
+                    showRecordingHUD(mode: .recording, level: 0)
+                }
+            } else {
+                hideRecordingHUD()
+            }
             return
         }
         let snapshot = audio.latestRecordingLevelSnapshot()
@@ -12261,11 +13077,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private var recordingHUDExpandedSize: NSSize {
-        settings.recordingHUDSize.expandedSize
+        selectedRecordingHUDNotchGeometry()?.frame.size ?? settings.recordingHUDSize.expandedSize
     }
 
     private func showRecordingHUD(mode: RecordingHUDMode,
                                   level: Float) {
+        Sounds.cancelDone()
         guard settings.showRecordingWaveform else { return }
         let panel = recordingHUDPanel ?? makeRecordingHUDPanel()
         recordingHUDPanel = panel
@@ -12280,7 +13097,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             animateRecordingHUDIn(panel)
         } else {
             recordingHUDAnimationToken += 1
-            stopRecordingHUDRevealAnimation(finish: true)
+            stopRecordingHUDRevealAnimation(finish: selectedRecordingHUDNotchGeometry() == nil)
             panel.alphaValue = 1
             recordingHUDView?.revealProgress = 1
             panel.setFrame(recordingHUDFrame(size: recordingHUDExpandedSize), display: true)
@@ -12310,7 +13127,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startRecordingHUDMotion()
     }
 
-    private func hideRecordingHUD() {
+    private func hideRecordingHUD(playCompletionSound: Bool = false) {
+        if playCompletionSound {
+            let token = recordingHUDAnimationToken
+            Sounds.playDone { [weak self] in
+                guard let self, self.recordingHUDAnimationToken == token,
+                      !self.isRecording, !self.isBusy else { return }
+                self.hideRecordingHUD()
+            }
+            return
+        }
         recordingHUDRetargetWorkItem?.cancel()
         recordingHUDRetargetWorkItem = nil
         guard let panel = recordingHUDPanel else {
@@ -12346,7 +13172,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                        display: false)
         startRecordingHUDRevealAnimation(from: recordingHUDView?.revealProgress ?? 1,
                                          to: 0,
-                                         duration: RECORDING_HUD_ANIMATE_OUT_SECONDS) { [weak panel, weak self] in
+                                         duration: selectedRecordingHUDNotchGeometry() == nil ? RECORDING_HUD_ANIMATE_OUT_SECONDS : NotchGlowHostView.departureDuration) { [weak panel, weak self] in
             guard let self, let panel else { return }
             guard self.recordingHUDAnimationToken == token else { return }
             panel.orderOut(nil)
@@ -12374,10 +13200,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastRecordingHUDMotionAt = ProcessInfo.processInfo.systemUptime
         let displayLink = view.displayLink(target: self,
                                            selector: #selector(recordingHUDDisplayLinkFired(_:)))
+        let maxFPS = min(RECORDING_HUD_DISPLAY_LINK_MAX_FPS,
+                         Float(view.window?.screen?.maximumFramesPerSecond ?? 120))
         displayLink.preferredFrameRateRange = CAFrameRateRange(
-            minimum: RECORDING_HUD_DISPLAY_LINK_MIN_FPS,
-            maximum: RECORDING_HUD_DISPLAY_LINK_MAX_FPS,
-            preferred: RECORDING_HUD_DISPLAY_LINK_MAX_FPS
+            minimum: maxFPS,
+            maximum: maxFPS,
+            preferred: maxFPS
         )
         displayLink.add(to: .main, forMode: .common)
         recordingHUDDisplayLink = displayLink
@@ -12401,6 +13229,33 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastRecordingHUDMotionAt = now
 
         advanceRecordingHUDRevealAnimation(at: now)
+        if let geometry = selectedRecordingHUDNotchGeometry() {
+            if recordingHUDView?.notchGeometry != geometry {
+                recordingHUDView?.notchGeometry = geometry
+                recordingHUDPanel?.level = .statusBar
+                recordingHUDPanel?.setFrame(geometry.frame, display: true)
+            }
+            if isRecording {
+                let snapshot = audio.latestRecordingLevelSnapshot(forNotch: true)
+                if snapshot.sequence != lastRecordingLevelSequence {
+                    lastRecordingLevelSequence = snapshot.sequence
+                    lastNotchAudioAt = now
+                }
+                let level = now - (lastNotchAudioAt ?? now) > 0.18 ? 0 : snapshot.level
+                recordingVisualLevel = visibleRecordingLevel(rawLevel: level)
+                recordingHUDView?.level = recordingVisualLevel
+            }
+            recordingHUDView?.advanceNotchGlow(deltaTime: dt)
+            #if DEBUG
+            if notchFrameIntervals.count < 1500 { notchFrameIntervals.append(now - previous) }
+            #endif
+            return
+        }
+        if recordingHUDView?.notchGeometry != nil {
+            recordingHUDView?.notchGeometry = nil
+            recordingHUDPanel?.level = .floating
+            recordingHUDPanel?.setFrame(recordingHUDFrame(size: recordingHUDExpandedSize), display: true)
+        }
         let mode = recordingHUDView?.mode
             ?? ((isBusy && !isRecording) ? .transcribing : .recording)
         let speed = recordingHUDPhaseSpeed(mode: mode, level: recordingVisualLevel)
@@ -12423,20 +13278,414 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
+        if selectedRecordingHUDNotchGeometry() != nil { panel.animationBehavior = .none }
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
-        panel.level = .floating
+        panel.level = selectedRecordingHUDNotchGeometry() == nil ? .floating : .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         recordingHUDView = view
         return panel
     }
 
     private func configureRecordingHUDView(_ view: RecordingHUDView) {
+        view.notchPalette = settings.notchGlowPalette
+        view.notchGeometry = selectedRecordingHUDNotchGeometry()
+        recordingHUDPanel?.level = view.notchGeometry == nil ? .floating : .statusBar
         view.visualScale = settings.recordingHUDSize.visualScale
         view.recordingColor = settings.recordingHUDRecordingColor.nsColor
         view.transcribingColor = settings.recordingHUDTranscribingColor.nsColor
         view.backgroundStyle = settings.recordingHUDBackgroundStyle
     }
+
+    static func diagnoseNotchAudio(withCue: Bool = false, warmCapture: Bool = false) throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        guard selectedRecordingHUDNotchGeometry() != nil else {
+            throw NSError(domain: "SuperDictate.NotchAudio", code: 1)
+        }
+        let owner = ParakeyApp()
+        owner.recordingHUDPanel = owner.makeRecordingHUDPanel()
+        if withCue { Sounds.prepareStart() }
+        if warmCapture {
+            let preparingAt = ProcessInfo.processInfo.systemUptime
+            try owner.audio.startEngine(inputDevicePreference: owner.settings.inputDevice)
+            owner.audio.stopEngine()
+            guard !owner.audio.isEngineStarted, !owner.audio.isRunning else {
+                throw localSpeechError("Microphone remained active after startup preparation")
+            }
+            print(String(format: "NOTCH_PREFLIGHT duration=%.1fms microphone_stopped=true",
+                         (ProcessInfo.processInfo.systemUptime - preparingAt) * 1000))
+        }
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        owner.audio.startRecordingAsync(inputDevicePreference: owner.settings.inputDevice,
+                                        recoveryJournal: nil) { result in
+            let completedAt = ProcessInfo.processInfo.systemUptime
+            print(String(format: "NOTCH_STARTUP audio=%.1fms result=%@",
+                         (completedAt - requestedAt) * 1000, String(describing: result)))
+        }
+        owner.isRecording = true
+        owner.showRecordingHUD(mode: .recording, level: 0)
+        if withCue {
+            let playback = Sounds.makeStartPlayback(metering: owner.audio) { duration in
+                print("NOTCH_STARTUP cue_duration=\(duration)s")
+            }
+            _ = owner.recordingHUDView?.whenNotchStartFrameIsPresented(immediate: { playback($0) }) {
+                playback(nil)
+            }
+        }
+        let hudRequestedAt = ProcessInfo.processInfo.systemUptime
+        print(String(format: "NOTCH_STARTUP before_frames=%.1fms audio=parallel",
+                     (hudRequestedAt - requestedAt) * 1000))
+        defer {
+            Sounds.cancelStart()
+            owner.isRecording = false
+            _ = owner.audio.endRecording()
+            owner.audio.stopEngine()
+            owner.recordingHUDPanel?.orderOut(nil)
+            owner.recordingHUDView?.revealProgress = 0
+            owner.stopRecordingHUDMotion()
+        }
+        let deadline = Date(timeIntervalSinceNow: 8)
+        var previous: UInt64 = 0
+        var levels: [Float] = []
+        var meterTimes: [TimeInterval] = []
+        var lastPump = ProcessInfo.processInfo.systemUptime
+        var maxPumpGap: TimeInterval = 0
+        while Date() < deadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            let pumpedAt = ProcessInfo.processInfo.systemUptime
+            maxPumpGap = max(maxPumpGap, pumpedAt-lastPump)
+            lastPump = pumpedAt
+            let snapshot = owner.audio.latestRecordingLevelSnapshot(forNotch: true)
+            if snapshot.sequence != previous {
+                levels.append(snapshot.level)
+                meterTimes.append(pumpedAt)
+                previous = snapshot.sequence
+            }
+        }
+        let frames = owner.recordingHUDView?.notchRenderedFrames ?? 0
+        print("NOTCH_MIC buffers=\(levels.count) min=\(levels.min() ?? 0) max=\(levels.max() ?? 0) frames=\(frames)")
+        let meterIntervals = zip(meterTimes, meterTimes.dropFirst()).map { $1 - $0 }.sorted()
+        if !meterIntervals.isEmpty {
+            print(String(format: "NOTCH_MIC_CADENCE median=%.2fms p95=%.2fms",
+                         meterIntervals[meterIntervals.count / 2] * 1000,
+                         meterIntervals[Int(Double(meterIntervals.count - 1) * 0.95)] * 1000))
+        }
+        print(String(format: "NOTCH_MAIN_LOOP max_pump_gap=%.1fms cue=%@", maxPumpGap * 1000, withCue ? "on" : "off"))
+        if let timing = owner.recordingHUDView?.notchEntrancePresented,
+           let origin = timing.origin, let first = timing.first,
+           let opened = timing.opened, let settled = timing.complete {
+            print(String(format: "NOTCH_REQUEST_TO_PRESENT first=%.1fms opened=%.1fms settled=%.1fms",
+                         (origin+first-requestedAt)*1000, (origin+opened-requestedAt)*1000,
+                         (origin+settled-requestedAt)*1000))
+        }
+        let captured = owner.audio.endRecording()
+        print("NOTCH_CAPTURE samples=\(captured.samples.count) sample_rate=\(SAMPLE_RATE) finite=\(captured.samples.allSatisfy(\.isFinite))")
+        guard levels.count >= 40, frames > 400 else {
+            throw NSError(domain: "SuperDictate.NotchAudio", code: 2)
+        }
+    }
+
+    static func diagnoseStartCueMeter() throws {
+        let capture = AudioCapture()
+        let settings = Settings()
+        Sounds.prepareStart()
+        try capture.startRecording(inputDevicePreference: settings.inputDevice)
+        defer {
+            Sounds.cancelStart()
+            _ = capture.endRecording()
+            capture.stopEngine()
+        }
+        let origin = ProcessInfo.processInfo.systemUptime
+        var previous: UInt64 = 0
+        var nextCue = 1.0
+        var cueCount = 0
+        var maxRaw = 0.0
+        var maxMeter = 0.0
+        var cueFrames = 0
+        while ProcessInfo.processInfo.systemUptime - origin < 8 {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            let elapsed = ProcessInfo.processInfo.systemUptime - origin
+            if elapsed >= nextCue, cueCount < 3 {
+                Sounds.playStart(metering: capture) { duration in print("CUE_METER cue_duration=\(duration)") }
+                cueCount += 1
+                nextCue += 2.5
+            }
+            let snapshot = capture.latestRecordingLevelSnapshot(forNotch: true)
+            guard snapshot.sequence != previous else { continue }
+            previous = snapshot.sequence
+            let energy = capture.recordingMeterDiagnostic()
+            if energy.cueWeight >= 0.99 {
+                maxRaw = max(maxRaw, energy.rawRMS)
+                maxMeter = max(maxMeter, energy.meterRMS)
+                cueFrames += 1
+            }
+            print(String(format: "CUE_METER t=%.3f raw_rms=%.6f meter_rms=%.6f notch=%.4f weight=%.3f",
+                         elapsed, energy.rawRMS, energy.meterRMS, snapshot.level, energy.cueWeight))
+        }
+        guard cueFrames >= 15, maxRaw > 0.000001 else {
+            throw localSpeechError("Start cue meter diagnostic did not receive a measurable live microphone signal")
+        }
+        print(String(format: "CUE_METER_RESULT cues=%d frames=%d max_raw_rms=%.6f max_meter_rms=%.6f",
+                     cueCount, cueFrames, maxRaw, maxMeter))
+    }
+
+    #if DEBUG
+    static func testNotchHUDLifecycle() async throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        guard let geometry = selectedRecordingHUDNotchGeometry() else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "A screen with a camera cutout is required"])
+        }
+        try NotchGlowHostView.testStartupVoice(geometry: geometry)
+        let owner = ParakeyApp()
+        owner.muteAfterRecordingStartSound(duration: 1.22)
+        guard let delayedMute = owner.recordingSoundMuteWorkItem,
+              owner.systemAudioMutePhase == .idle else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 15)
+        }
+        owner.stopRecordingLevelMeter()
+        guard delayedMute.isCancelled, owner.recordingSoundMuteWorkItem == nil,
+              owner.systemAudioMutePhase == .idle else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 16)
+        }
+        print("NOTCH_SOUND_MUTE delayedUntilCueEnds=true cancelledOnStop=true")
+        let backdropTestWindow = makeNotchBackdropTestWindow()
+        defer { backdropTestWindow?.close() }
+        let keyWindow = NSApp.keyWindow
+        func advance(_ seconds: TimeInterval) async throws {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        }
+        owner.showRecordingHUD(mode: .recording, level: 0)
+        var presentedStartCallbacks = 0
+        let armed = owner.recordingHUDView?.whenNotchStartFrameIsPresented {
+            presentedStartCallbacks += 1
+        } ?? false
+        guard armed else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 12)
+        }
+        defer {
+            owner.recordingHUDPanel?.orderOut(nil)
+            owner.recordingHUDView?.revealProgress = 0
+            owner.stopRecordingHUDMotion()
+        }
+        try await advance(1)
+        guard presentedStartCallbacks == 1 else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 13,
+                          userInfo: [NSLocalizedDescriptionKey: "Expected one presented start frame, got \(presentedStartCallbacks)"])
+        }
+        var cancelledStartCallbacks = 0
+        _ = owner.recordingHUDView?.whenNotchStartFrameIsPresented { cancelledStartCallbacks += 1 }
+        owner.recordingHUDView?.cancelNotchStartFeedback()
+        try await advance(0.05)
+        guard cancelledStartCallbacks == 0, presentedStartCallbacks == 1 else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 14)
+        }
+        print("NOTCH_START presentedCallbacks=1 cancelledCallbacks=0")
+        guard let firstPresented = owner.recordingHUDView?.notchEntrancePresented.first,
+              let completePresented = owner.recordingHUDView?.notchEntrancePresented.complete,
+              firstPresented >= 0, firstPresented < 0.2,
+              completePresented >= NotchGlowHostView.arrivalDuration,
+              completePresented < NotchGlowHostView.arrivalDuration + 0.2 else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 17,
+                          userInfo: [NSLocalizedDescriptionKey: "Entrance presentation missed its timing budget"])
+        }
+        guard let firstAge = owner.recordingHUDView?.notchEntrancePresented.firstAge,
+              firstAge >= 0, firstAge <= firstPresented,
+              firstPresented-firstAge < 0.15,
+              completePresented > firstPresented,
+              completePresented - firstPresented < NotchGlowHostView.arrivalDuration + 0.1 else {
+            throw localSpeechError("Notch entrance did not follow its request-based timeline")
+        }
+        guard let openedPresented = owner.recordingHUDView?.notchEntrancePresented.opened,
+              openedPresented > firstPresented,
+              openedPresented - firstPresented < NotchGlowHostView.arrivalRevealDuration + 0.1 else {
+            throw localSpeechError("Notch primary reveal missed its timing budget")
+        }
+        print(String(format: "NOTCH_ENTRANCE first=%.1fms opened=%.1fms complete=%.1fms",
+                     firstPresented * 1000, openedPresented * 1000, completePresented * 1000))
+        guard let panel = owner.recordingHUDPanel,
+              panel.frame == geometry.frame,
+              panel.ignoresMouseEvents,
+              NSApp.keyWindow === keyWindow,
+              owner.recordingHUDView?.notchGlowIsActive == true else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 2)
+        }
+        guard (owner.recordingHUDView?.notchBackdropUpdates ?? 0) > 10 else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 9,
+                          userInfo: [NSLocalizedDescriptionKey: "Native backdrop mask is not updating"])
+        }
+        print("NOTCH_BACKDROP maskUpdates=\(owner.recordingHUDView?.notchBackdropUpdates ?? 0) \(owner.recordingHUDView?.notchBackdropGeometry ?? "missing")")
+        guard owner.recordingHUDView?.notchBackdropIsAligned == true else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 10,
+                          userInfo: [NSLocalizedDescriptionKey: owner.recordingHUDView?.notchBackdropGeometry ?? "missing"])
+        }
+        guard owner.recordingHUDView?.notchBackdropFramesSynchronized == true else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 11,
+                          userInfo: [NSLocalizedDescriptionKey: "Color and backdrop frame counts differ"])
+        }
+        print("NOTCH_PRESENT synchronizedFrames=\(owner.recordingHUDView?.notchRenderedFrames ?? 0)")
+        if ProcessInfo.processInfo.environment["SUPERDICTATE_GLASS_LAYOUT_ONLY"] == "1" { return }
+        for level in [Float(0.15), 0.9, 0.35, 0.8] {
+            owner.updateRecordingHUD(mode: .recording, level: level)
+            try await advance(0.7)
+        }
+        owner.showTranscribingHUD()
+        try await advance(2)
+        owner.showRecordingHUD(mode: .error, level: 0)
+        try await advance(1)
+        owner.hideRecordingHUD()
+        try await advance(0.75)
+        guard !panel.isVisible, owner.recordingHUDDisplayLink == nil,
+              owner.recordingHUDView?.notchGlowIsActive == false else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 3)
+        }
+        owner.showRecordingHUD(mode: .recording, level: 0.5)
+        try await advance(0.5)
+        guard panel.isVisible, owner.recordingHUDView?.notchGlowIsActive == true else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 4)
+        }
+        owner.hideRecordingHUD()
+        try await advance(0.75)
+        guard !panel.isVisible, owner.recordingHUDView?.notchGlowIsActive == false else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 5)
+        }
+        for duration in [0.05, 0.2, 5.0] {
+            owner.showRecordingHUD(mode: .recording, level: 0.8)
+            try await advance(0.6)
+            owner.showTranscribingHUD()
+            let initialFrames = owner.recordingHUDView?.notchRenderedFrames ?? 0
+            let processingSampleStarted = ProcessInfo.processInfo.systemUptime
+            try await advance(duration)
+            let processingFrames = (owner.recordingHUDView?.notchRenderedFrames ?? 0) - initialFrames
+            let processingElapsed = ProcessInfo.processInfo.systemUptime - processingSampleStarted
+            guard panel.isVisible, processingFrames > Int(duration * 50) else {
+                throw NSError(domain: "SuperDictate.NotchTest", code: 7,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "duration=\(duration) elapsed=\(processingElapsed) frames=\(processingFrames) visible=\(panel.isVisible) active=\(owner.recordingHUDView?.notchGlowIsActive == true) displayLink=\(owner.recordingHUDDisplayLink != nil)"])
+            }
+            owner.finishBusyHUD(playCompletionSound: duration == 0.2)
+            try await advance(0.75)
+            guard !panel.isVisible, owner.recordingHUDDisplayLink == nil,
+                  owner.recordingHUDView?.notchGlowIsActive == false else {
+                throw NSError(domain: "SuperDictate.NotchTest", code: 8,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "duration=\(duration) visible=\(panel.isVisible) displayLink=\(owner.recordingHUDDisplayLink != nil) active=\(owner.recordingHUDView?.notchGlowIsActive == true) reveal=\(owner.recordingHUDView?.revealProgress ?? -1) exitAge=\(owner.recordingHUDRevealStartedAt.map { ProcessInfo.processInfo.systemUptime-$0 } ?? -1) processingAge=\(owner.recordingHUDTranscribingStartedAt.map { ProcessInfo.processInfo.systemUptime-$0 } ?? -1) busy=\(owner.isBusy) recording=\(owner.isRecording)"])
+            }
+            print("NOTCH_PROCESSING duration=\(duration)s visible, animated and finished")
+        }
+        guard owner.recordingHUDView?.notchRenderedFrames ?? 0 > 600 else {
+            throw NSError(domain: "SuperDictate.NotchTest", code: 6)
+        }
+        let intervals = owner.notchFrameIntervals.filter { $0 > 0.001 && $0 < 0.1 }.sorted()
+        if !intervals.isEmpty {
+            let median = intervals[intervals.count / 2]
+            let p95 = intervals[Int(Double(intervals.count - 1) * 0.95)]
+            print(String(format: "NOTCH_TIMING frames=%d median=%.2fms p95=%.2fms cadence=%.1fHz",
+                         intervals.count, median * 1000, p95 * 1000, 1 / median))
+        }
+    }
+    static func testNotchSoundStartup() async throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        guard selectedRecordingHUDNotchGeometry() != nil else { throw localSpeechError("Notch screen required") }
+        let owner = ParakeyApp()
+        defer {
+            Sounds.cancelStart()
+            owner.recordingHUDPanel?.orderOut(nil)
+            owner.recordingHUDView?.revealProgress = 0
+            owner.stopRecordingHUDMotion()
+        }
+        Sounds.prepareStart()
+        owner.showRecordingHUD(mode: .recording, level: 0)
+        var cueDuration: TimeInterval?
+        var playbackCallbacks = 0
+        let playback = Sounds.makeStartPlayback {
+            cueDuration = $0
+            playbackCallbacks += 1
+        }
+        _ = owner.recordingHUDView?.whenNotchStartFrameIsPresented(immediate: { playback($0) }) {
+            playback(nil)
+        }
+        try await Task.sleep(nanoseconds: 900_000_000)
+        guard playbackCallbacks == 1, let cueDuration, cueDuration > 0.8, cueDuration < 1,
+              let first = owner.recordingHUDView?.notchEntrancePresented.first,
+              let complete = owner.recordingHUDView?.notchEntrancePresented.complete,
+              complete > first, complete - first < NotchGlowHostView.arrivalDuration + 0.1 else {
+            throw localSpeechError("Real start cue or immediate first frame failed")
+        }
+        let maxGap = owner.notchFrameIntervals.max() ?? 1
+        guard maxGap < 0.12 else { throw localSpeechError("Start cue stalled the HUD: \(maxGap)s") }
+        print(String(format: "NOTCH_SOUND_LIVE first_frame=%.1fms full_frame=%.1fms max_main_frame_gap=%.1fms cue=%.1fms",
+                     first * 1000, complete * 1000, maxGap * 1000, cueDuration * 1000))
+        var cancelledCallbacks = 0
+        Sounds.playStart { _ in cancelledCallbacks += 1 }
+        Sounds.cancelStart()
+        try await Task.sleep(nanoseconds: 400_000_000)
+        guard cancelledCallbacks == 0 else { throw localSpeechError("Cancelled start cue completed") }
+        print("NOTCH_SOUND_LIVE cancelled_pending_cue=true")
+    }
+
+    static func testParallelNotchStartup() async throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        guard selectedRecordingHUDNotchGeometry() != nil else { throw localSpeechError("Notch screen required") }
+        let owner = ParakeyApp()
+        owner.recordingHUDPanel = owner.makeRecordingHUDPanel()
+        defer {
+            _ = owner.audio.endRecording()
+            owner.audio.stopEngine()
+            owner.recordingHUDPanel?.orderOut(nil)
+            owner.recordingHUDView?.revealProgress = 0
+            owner.stopRecordingHUDMotion()
+        }
+        let pendingAudioDeadline = NotchGlowHostView.arrivalDuration + 0.2
+        for cancelAfter in [pendingAudioDeadline, 0.025] {
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            owner.audio.recordingEngineStartForTesting = {
+                guard gate.wait(timeout: .now() + 3) == .success else {
+                    throw localSpeechError("Audio startup fixture timed out")
+                }
+            }
+            let completion = AsyncStream<Result<Void, Error>>.makeStream()
+            let requestedAt = ProcessInfo.processInfo.systemUptime
+            owner.audio.startRecordingAsync(inputDevicePreference: "", recoveryJournal: nil) {
+                completion.continuation.yield($0)
+                completion.continuation.finish()
+            }
+            owner.showRecordingHUD(mode: .recording, level: 0)
+            try await Task.sleep(nanoseconds: UInt64(cancelAfter * 1_000_000_000))
+            if cancelAfter > NotchGlowHostView.arrivalDuration {
+                guard let complete = owner.recordingHUDView?.notchEntrancePresented.complete,
+                      complete < pendingAudioDeadline, owner.audio.isRunning else {
+                    throw localSpeechError("HUD waited for the blocked microphone startup")
+                }
+                print(String(format: "NOTCH_PARALLEL entrance=%.1fms audio=still_pending elapsed=%.1fms",
+                             complete * 1000, (ProcessInfo.processInfo.systemUptime - requestedAt) * 1000))
+            }
+            _ = owner.audio.endRecording()
+            owner.hideRecordingHUD()
+            gate.signal()
+            for await result in completion.stream { try result.get() }
+            try await Task.sleep(nanoseconds: 700_000_000)
+            guard !owner.audio.isRunning, owner.recordingHUDPanel?.isVisible == false,
+                  owner.recordingHUDView?.notchGlowIsActive == false else {
+                throw localSpeechError("Completed audio startup revived a cancelled recording")
+            }
+            print("NOTCH_PARALLEL cancelled_at=\(cancelAfter)s recording_and_hud_remain_stopped=true")
+        }
+        let failed = AsyncStream<Result<Void, Error>>.makeStream()
+        owner.audio.recordingEngineStartForTesting = { throw localSpeechError("Fixture audio startup failure") }
+        owner.audio.startRecordingAsync(inputDevicePreference: "", recoveryJournal: nil) {
+            failed.continuation.yield($0)
+            failed.continuation.finish()
+        }
+        for await result in failed.stream {
+            guard case .failure = result else { throw localSpeechError("Audio startup failure was lost") }
+        }
+        _ = owner.audio.endRecording()
+        guard !owner.audio.isRunning else { throw localSpeechError("Failed startup retained an active recording") }
+        print("NOTCH_PARALLEL startup_failure_delivered=true")
+    }
+    #endif
 
     private func animateRecordingHUDIn(_ panel: NSPanel) {
         recordingHUDAnimationToken += 1
@@ -12448,12 +13697,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.contentView?.displayIfNeeded()
         panel.displayIfNeeded()
         panel.orderFrontRegardless()
+        if selectedRecordingHUDNotchGeometry() != nil {
+            recordingHUDView?.revealProgress = 1
+            recordingHUDView?.advanceNotchGlow(deltaTime: 1.0 / 120)
+            startRecordingHUDMotion()
+            return
+        }
         startRecordingHUDRevealAnimation(from: 0,
                                          to: 1,
                                          duration: RECORDING_HUD_ANIMATE_IN_SECONDS)
     }
 
     private func recordingHUDFrame(size: NSSize) -> NSRect {
+        if let geometry = selectedRecordingHUDNotchGeometry() { return geometry.frame }
         if let targetFrame = recordingHUDInsertionTargetVisualFrame ?? recordingHUDInsertionTargetFrame {
             return recordingHUDFrameAboveTarget(targetFrame, size: size)
         }
@@ -12628,7 +13884,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 log("text insertion target unavailable at recording start, frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
             }
             if settings.showRecordingWaveform {
-                showRecordingHUD(mode: .recording, level: recordingVisualLevel)
+                if selectedRecordingHUDNotchGeometry() != nil, recordingHUDPanel?.isVisible == true {
+                    updateRecordingHUD(mode: .recording, level: recordingVisualLevel)
+                } else {
+                    showRecordingHUD(mode: .recording, level: recordingVisualLevel)
+                }
             }
         } else if liveTarget != nil,
                   case .switchTarget(let target) = decision {
@@ -12768,6 +14028,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func animateRecordingHUDRetargetIfNeeded(from previousTargetFrame: NSRect?,
                                                      to newTargetFrame: NSRect) {
+        guard selectedRecordingHUDNotchGeometry() == nil else { return }
         guard isRecording else { return }
         guard let panel = recordingHUDPanel,
               panel.isVisible,
@@ -12843,7 +14104,96 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return NSRect(x: x, y: y, width: frame.width, height: frame.height)
     }
 
-    private func finishBusyHUD() {
+    private func insertDictationAtCompletion(_ text: String) async -> (inserted: Bool, startedAt: TimeInterval, completedAt: TimeInterval) {
+        let token = recordingHUDTargetSessionToken
+        let destinationPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if let startedAt = recordingHUDTranscribingStartedAt {
+            let remaining = RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS - (ProcessInfo.processInfo.systemUptime-startedAt)
+            if remaining > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(remaining*1_000_000_000))
+            }
+        }
+        return await withCheckedContinuation { continuation in
+            let complete: @MainActor @Sendable () -> Void = { [weak self] in
+                let startedAt = ProcessInfo.processInfo.systemUptime
+                guard let self, !self.isTerminating, !self.isRecording,
+                      self.recordingHUDTargetSessionToken == token,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == destinationPID else {
+                    Sounds.cancelDone()
+                    continuation.resume(returning: (false, startedAt, startedAt))
+                    return
+                }
+                let inserted = TextInserter.insert(text)
+                let completedAt = ProcessInfo.processInfo.systemUptime
+                if inserted {
+                    self.recordingHUDTranscribingStartedAt = nil
+                    self.hideRecordingHUD()
+                } else {
+                    Sounds.cancelDone()
+                }
+                log(String(format: "dictation completion: insert_dispatch=%.1f ms sound=%@ closing=%@",
+                           (completedAt-startedAt)*1000, self.settings.playFeedbackSounds ? "scheduled" : "off",
+                           inserted ? "started" : "failed"))
+                continuation.resume(returning: (inserted, startedAt, completedAt))
+            }
+            if settings.playFeedbackSounds {
+                Sounds.playDone(alongside: complete)
+            } else {
+                complete()
+            }
+        }
+    }
+
+    static func diagnoseUnifiedCompletion() async throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let previousApplication = NSWorkspace.shared.frontmostApplication
+        let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 400, height: 160),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.title = "SuperDictate completion diagnostic"
+        let field = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 160))
+        window.contentView = field
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeFirstResponder(field)
+        let owner = ParakeyApp()
+        owner.isBusy = true
+        defer {
+            owner.recordingHUDPanel?.orderOut(nil)
+            owner.stopRecordingHUDMotion()
+            window.close()
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() {
+                previousApplication?.activate(options: [.activateAllWindows])
+            }
+        }
+        try await Task.sleep(nanoseconds: 250_000_000)
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid(),
+              window.firstResponder === field else {
+            throw localSpeechError("Diagnostic text field did not receive focus")
+        }
+        owner.showTranscribingHUD()
+        let result = await owner.insertDictationAtCompletion("SuperDictate sync check")
+        guard result.inserted else { throw localSpeechError("Diagnostic insertion was rejected") }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.4
+        while field.string != "SuperDictate sync check", ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        guard field.string == "SuperDictate sync check" else {
+            throw localSpeechError("Posted text did not reach the native text field")
+        }
+        let textObservedAt = ProcessInfo.processInfo.systemUptime
+        guard owner.recordingHUDRevealStartedAt != nil || !owner.settings.showRecordingWaveform else {
+            throw localSpeechError("Text was inserted without starting the HUD closure")
+        }
+        print(String(format: "UNIFIED_COMPLETION text_observed_after_dispatch=%.1fms dispatch=%.1fms closure_started=true",
+                     (textObservedAt-result.completedAt)*1000, (result.completedAt-result.startedAt)*1000))
+        try await Task.sleep(nanoseconds: 500_000_000)
+        guard owner.recordingHUDPanel?.isVisible != true else {
+            throw localSpeechError("Unified completion did not finish closing")
+        }
+    }
+
+    private func finishBusyHUD(playCompletionSound: Bool = false) {
         if let startedAt = recordingHUDTranscribingStartedAt {
             let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
             let remaining = RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS - elapsed
@@ -12854,13 +14204,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                           !self.isBusy,
                           self.recordingHUDTranscribingStartedAt == startedAt else { return }
                     self.recordingHUDTranscribingStartedAt = nil
-                    self.hideRecordingHUD()
+                    self.hideRecordingHUD(playCompletionSound: playCompletionSound)
                 }
                 return
             }
         }
         recordingHUDTranscribingStartedAt = nil
-        hideRecordingHUD()
+        hideRecordingHUD(playCompletionSound: playCompletionSound)
     }
 
     // Visible + audible cue that a press produced no pasted text — the
@@ -12910,8 +14260,85 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - Recording loop
 
-    private func handlePress() {
-        guard isReady, !isRecording, !isBusy, !isTerminating else {
+    private func muteAfterRecordingStartSound(duration: TimeInterval) {
+        recordingSoundMuteWorkItem?.cancel()
+        recordingSoundMuteWorkItem = nil
+        guard duration.isFinite, duration > 0 else {
+            muteIfNeededForRecording()
+            return
+        }
+        let token = recordingHUDTargetSessionToken
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.recordingHUDTargetSessionToken == token else { return }
+            self.recordingSoundMuteWorkItem = nil
+            guard self.isRecording, !self.isTerminating else { return }
+            self.muteIfNeededForRecording()
+        }
+        recordingSoundMuteWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.06, execute: work)
+    }
+
+    private func playRecordingStartSound() {
+        recordingSoundMuteWorkItem?.cancel()
+        recordingSoundMuteWorkItem = nil
+        guard settings.playFeedbackSounds else {
+            muteIfNeededForRecording()
+            return
+        }
+        Sounds.prepareStart()
+        recordingStartSoundWorkItem?.cancel()
+        recordingStartSoundWorkItem = nil
+        guard settings.showRecordingWaveform,
+              recordingHUDPanel?.isVisible == true,
+              recordingHUDView?.notchGeometry != nil else {
+            playStartCueForRecording()
+            return
+        }
+        let token = recordingHUDTargetSessionToken
+        let playback = Sounds.makeStartPlayback(metering: audio) { [weak self] duration in
+            guard let self, self.recordingHUDTargetSessionToken == token,
+                  self.isRecording, !self.isTerminating else { return }
+            self.muteAfterRecordingStartSound(duration: duration)
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.finishRecordingStartSound(token: token, playback: playback)
+        }
+        recordingStartSoundWorkItem = work
+        let armed = recordingHUDView?.whenNotchStartFrameIsPresented(immediate: { playback($0) }) { [weak self] in
+            self?.finishRecordingStartSound(token: token, playback: playback)
+        } ?? false
+        if armed {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20, execute: work)
+        } else {
+            finishRecordingStartSound(token: token, playback: playback)
+        }
+    }
+
+    private func finishRecordingStartSound(token: Int, playback: @Sendable (TimeInterval?) -> Void) {
+        guard token == recordingHUDTargetSessionToken,
+              recordingStartSoundWorkItem != nil else { return }
+        recordingStartSoundWorkItem?.cancel()
+        recordingStartSoundWorkItem = nil
+        recordingHUDView?.cancelNotchStartFeedback()
+        guard isRecording, !isTerminating else { return }
+        playback(nil)
+    }
+
+    private func playStartCueForRecording() {
+        guard settings.playFeedbackSounds else {
+            muteAfterRecordingStartSound(duration: 0)
+            return
+        }
+        let token = recordingHUDTargetSessionToken
+        Sounds.playStart(metering: audio) { [weak self] duration in
+            guard let self, self.recordingHUDTargetSessionToken == token,
+                  self.isRecording, !self.isTerminating else { return }
+            self.muteAfterRecordingStartSound(duration: duration)
+        }
+    }
+
+    private func handlePress(hotkeyDetectedAt: TimeInterval? = nil) {
+        guard isReady, !isRecording, recordingAudioStartupID == nil, !isBusy, !isTerminating else {
             // Audible cue when the previous transcription is still in
             // flight — without it the press vanishes silently and the
             // user thinks the hotkey broke. Only fires for the busy
@@ -12926,47 +14353,97 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             enterPermissionBlockedState(missing: missing, reason: "hotkey press")
             return
         }
+        let pressReceivedAt = ProcessInfo.processInfo.systemUptime
         let initialInsertionContext = insertionTargetQueryContext()
         cancelAudioIdleStop()
-        var recoveryJournal: PendingDictationJournal?
-        var isStartingAudio = false
+        let recoveryJournal: PendingDictationJournal
         do {
             recoveryJournal = try PendingDictationRecovery.createJournal()
-            isStartingAudio = true
-            didTouchAudioEngine = true
-            if !audio.isEngineStarted {
-                suppressAudioConfigurationChangesFromAppEngineUpdate()
-            }
-            try audio.startRecording(inputDevicePreference: settings.inputDevice,
-                                     recoveryJournal: recoveryJournal)
         } catch {
-            recoveryJournal?.finish()
-            PendingDictationRecovery.remove(recoveryJournal?.url)
-            stopAudioEngineImmediately()
             hotkey.resetToggleState()
-            log("recording start failed: \(error.localizedDescription)")
-            // A failed hotkey start needs the same recovery as a failed wake.
-            // Journal I/O failures must not disable a healthy microphone.
-            if isStartingAudio {
-                recordStartupFailure(stage: .audioInput, error: error, reason: "recording start")
-            }
+            log("recording journal preparation failed: \(error.localizedDescription)")
             signalDictationFailure()
             return
         }
+        beginRecordingWithParallelFeedback(initialContext: initialInsertionContext,
+                                           recoveryJournal: recoveryJournal,
+                                           requestedAt: pressReceivedAt,
+                                           hotkeyDetectedAt: hotkeyDetectedAt)
+    }
+
+    private func beginRecordingWithParallelFeedback(initialContext: InsertionTargetQueryContext?,
+                                                     recoveryJournal: PendingDictationJournal?,
+                                                     requestedAt: TimeInterval,
+                                                     hotkeyDetectedAt: TimeInterval? = nil) {
+        let startupID = UUID()
+        recordingAudioStartupID = startupID
+        didTouchAudioEngine = true
+        if !audio.isEngineStarted {
+            suppressAudioConfigurationChangesFromAppEngineUpdate()
+        }
         isRecording = true
+        let audioRequestedAt = ProcessInfo.processInfo.systemUptime
+        audio.startRecordingAsync(inputDevicePreference: settings.inputDevice,
+                                  recoveryJournal: recoveryJournal) { [weak self] result in
+            let audioCompletedAt = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.async {
+                self?.recordingAudioStartupCompleted(result, startupID: startupID,
+                                                      recoveryJournal: recoveryJournal,
+                                                      audioRequestedAt: audioRequestedAt,
+                                                      audioCompletedAt: audioCompletedAt)
+            }
+        }
         if setupChecklistWindow?.isVisible == true {
             hotkeyTestSucceeded = true
             updateSetupChecklist()
         }
-        startRecordingLevelMeter(initialContext: initialInsertionContext)
-        if settings.playFeedbackSounds {
-            Sounds.playStart()
-        }
-        muteIfNeededForRecording()
+        startRecordingLevelMeter(initialContext: initialContext)
+        playRecordingStartSound()
+        let hudRequestedAt = ProcessInfo.processInfo.systemUptime
+        log(String(format: "recording startup: dispatch=%.1f ms prep=%.1f ms hud=%.1f ms total_before_frames=%.1f ms audio=parallel",
+                   (requestedAt - (hotkeyDetectedAt ?? requestedAt)) * 1000,
+                   (audioRequestedAt - requestedAt) * 1000,
+                   (hudRequestedAt - audioRequestedAt) * 1000,
+                   (hudRequestedAt - requestedAt) * 1000))
         log("press: recording")
-
         scheduleMaxDurationAutoRelease()
         rebuildMenu()
+    }
+
+    private func recordingAudioStartupCompleted(_ result: Result<Void, Error>, startupID: UUID,
+                                                 recoveryJournal: PendingDictationJournal?,
+                                                 audioRequestedAt: TimeInterval,
+                                                 audioCompletedAt: TimeInterval) {
+        guard recordingAudioStartupID == startupID else { return }
+        recordingAudioStartupID = nil
+        log(String(format: "recording startup: audio_completed=%.1f ms active=%@",
+                   (audioCompletedAt - audioRequestedAt) * 1000, isRecording ? "true" : "false"))
+        guard !isTerminating else { return }
+        guard isRecording else {
+            if !runDeferredAudioRouteRefreshIfNeeded() {
+                scheduleAudioIdleStop(reason: "recording stopped during audio startup")
+            }
+            return
+        }
+        switch result {
+        case .success:
+            break
+        case .failure(let error):
+            isRecording = false
+            cancelMaxDurationAutoRelease()
+            stopRecordingLevelMeter()
+            let captured = audio.endRecording()
+            recoveryJournal?.finish()
+            PendingDictationRecovery.remove(captured.recoveryURL ?? recoveryJournal?.url)
+            stopAudioEngineImmediately()
+            unmuteIfWeMuted()
+            hotkey.resetToggleState()
+            log("recording start failed: \(error.localizedDescription)")
+            // A failed hotkey start needs the same recovery as a failed wake.
+            // Journal I/O failures must not disable a healthy microphone.
+            recordStartupFailure(stage: .audioInput, error: error, reason: "recording start")
+            signalDictationFailure()
+        }
     }
 
     private func handleRelease(shortcut: DictationReleaseShortcut = .standard,
@@ -13046,6 +14523,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { @MainActor in
             let taskStartedAt = ProcessInfo.processInfo.systemUptime
             var dictationFailed = false
+            var completionHUDStarted = false
             do {
                 let completed = try await transcriptionTask.value
                 let transcription = completed.transcription
@@ -13122,11 +14600,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let insertionObserver = shouldPressEnterAfterInsertion
                             ? FocusedTextChangeObserver.capture()
                             : nil
-                        let insertionStartedAt = ProcessInfo.processInfo.systemUptime
-                        let inserted = TextInserter.insert(
+                        let insertion = await insertDictationAtCompletion(
                             pastedText(from: finalText, suffix: settings.pasteSuffix)
                         )
-                        let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
+                        let inserted = insertion.inserted
+                        completionHUDStarted = inserted
+                        let insertionStartedAt = insertion.startedAt
+                        let insertionCompletedAt = insertion.completedAt
                         var enterDelaySeconds: Double?
                         if inserted {
                             if shouldPressEnterAfterInsertion {
@@ -13150,9 +14630,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                     }
                                 }
                                 enterDelaySeconds = ProcessInfo.processInfo.systemUptime - enterDelayStartedAt
-                            }
-                            if settings.playFeedbackSounds {
-                                Sounds.playDone()
                             }
                         } else {
                             log("text insertion failed")
@@ -13192,7 +14669,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 dictationFailed = true
             }
             isBusy = false
-            finishBusyHUD()
+            if !completionHUDStarted { finishBusyHUD() }
             if dictationFailed && !isTerminating {
                 signalDictationFailure()
             } else {
@@ -14079,7 +15556,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if settings.playFeedbackSounds { Sounds.playError() }
             return
         }
-        guard isReady, !isRecording, !isBusy, !isTerminating else {
+        guard isReady, !isRecording, recordingAudioStartupID == nil, !isBusy, !isTerminating else {
             flashErrorFeedback()
             return
         }
@@ -15810,6 +17287,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func handleAudioConfigurationChange() {
+        guard recordingAudioStartupID == nil else {
+            pendingAudioRouteRefresh = true
+            return
+        }
         if shouldIgnoreAppOwnedAudioConfigurationChange() {
             scheduleAppOwnedAudioConfigurationRecovery()
             return
@@ -15843,6 +17324,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.isTerminating else { return }
             self.audioConfigurationRecoveryWorkItem = nil
+            guard self.recordingAudioStartupID == nil else {
+                self.pendingAudioRouteRefresh = true
+                return
+            }
             do {
                 if try self.audio.recoverAfterConfigurationChange() {
                     log("AudioCapture: app-owned audio configuration change recovered")
@@ -15866,7 +17351,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @discardableResult
     private func runDeferredAudioRouteRefreshIfNeeded() -> Bool {
-        guard pendingAudioRouteRefresh,
+        guard pendingAudioRouteRefresh, recordingAudioStartupID == nil,
               !isRecording, !isBusy, startupTask == nil, isCoreRuntimeReady, !isTerminating else { return false }
         pendingAudioRouteRefresh = false
         restartAudioInput(reason: "deferred audio configuration change")
@@ -15874,6 +17359,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func restartAudioInput(reason: String) {
+        guard recordingAudioStartupID == nil else {
+            pendingAudioRouteRefresh = true
+            return
+        }
         guard !isRestartingAudioInput else { return }
         guard isCoreRuntimeReady else {
             rebuildMenu()
@@ -17681,6 +19170,63 @@ private enum ParakeySelfTest {
             return runSuite("ai-cleanup", testAICleanup)
         case "audio-level":
             return runSuite("audio-level", testAudioLevelMetering)
+        case "start-cue-meter":
+            return runSuite("start-cue-meter", AudioCapture.testStartCueMeter)
+        case "notch-hud":
+            return runSuite("notch-hud", testNotchHUDGeometry)
+        case "visual-style":
+            return runSuite("visual-style") {
+                try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testRecordingVisualStyle() }
+            }
+        case "notch-palette":
+            return runSuite("notch-palette") {
+                try MainActor.assumeIsolated { try SuperDictateControlPanelApp.testNotchPalette() }
+            }
+        case "notch-sound-live":
+            return MainActor.assumeIsolated {
+                Task { @MainActor in
+                    do {
+                        try await ParakeyApp.testNotchSoundStartup()
+                        print("PASS notch-sound-live")
+                        exit(EXIT_SUCCESS)
+                    } catch {
+                        print("FAIL notch-sound-live: \(error)")
+                        exit(EXIT_FAILURE)
+                    }
+                }
+                NSApplication.shared.run()
+                return EXIT_FAILURE
+            }
+        case "notch-startup-live":
+            return MainActor.assumeIsolated {
+                Task { @MainActor in
+                    do {
+                        try await ParakeyApp.testParallelNotchStartup()
+                        print("PASS notch-startup-live")
+                        exit(EXIT_SUCCESS)
+                    } catch {
+                        print("FAIL notch-startup-live: \(error)")
+                        exit(EXIT_FAILURE)
+                    }
+                }
+                NSApplication.shared.run()
+                return EXIT_FAILURE
+            }
+        case "notch-hud-live":
+            return MainActor.assumeIsolated {
+                Task { @MainActor in
+                    do {
+                        try await ParakeyApp.testNotchHUDLifecycle()
+                        print("PASS notch-hud-live")
+                        exit(EXIT_SUCCESS)
+                    } catch {
+                        print("FAIL notch-hud-live: \(error)")
+                        exit(EXIT_FAILURE)
+                    }
+                }
+                NSApplication.shared.run()
+                return EXIT_FAILURE
+            }
         case "audio-conversion":
             return runSuite("audio-conversion", testAudioConversion)
         case "audio-input":
@@ -18022,6 +19568,7 @@ private enum ParakeySelfTest {
         try testFillerWordRemoval()
         try testAICleanup()
         try testAudioLevelMetering()
+        try AudioCapture.testStartCueMeter()
         try testAudioConversion()
         try testAudioInputDeviceFiltering()
         try testAudioFileTranscriptionOutput()
@@ -19710,6 +21257,17 @@ private enum ParakeySelfTest {
             "silence should map to zero recording level"
         )
 
+        let speechRMS: [Double] = [0.004, 0.01, 0.02, 0.04, 0.08]
+        let notchLevels = speechRMS.map {
+            normalizedNotchAudioLevel(sumSquares: $0 * $0 * 128, sampleCount: 128)
+        }
+        guard notchLevels.first! > 0, notchLevels.last! < 1,
+              zip(notchLevels, notchLevels.dropFirst()).allSatisfy({ $1 - $0 > 0.08 }),
+              normalizedNotchAudioLevel(sumSquares: 0, sampleCount: 128) == 0,
+              normalizedNotchAudioLevel(sumSquares: .nan, sampleCount: 128) == 0 else {
+            throw SelfTestFailure.failed("notch voice levels must retain speech dynamics without early saturation")
+        }
+
         let lowVoice = normalizedAudioLevel(from: Array(repeating: 0.004, count: 128))
         let quiet = normalizedAudioLevel(from: Array(repeating: 0.01, count: 128))
         let normal = normalizedAudioLevel(from: Array(repeating: 0.12, count: 128))
@@ -19766,6 +21324,34 @@ private enum ParakeySelfTest {
             equals: 0,
             "error HUD should be static (zero phase speed)"
         )
+    }
+
+    private static func testNotchHUDGeometry() throws {
+        let screens: [(NSRect, CGFloat, CGFloat)] = [
+            (NSRect(x: 0, y: 0, width: 1352, height: 878), 166, 29),
+            (NSRect(x: 0, y: 0, width: 1512, height: 982), 184, 32),
+            (NSRect(x: -1728, y: 240, width: 1728, height: 1117), 185, 32)
+        ]
+        for (screen, width, height) in screens {
+            let leftEdge = screen.midX - width / 2
+            let rightEdge = screen.midX + width / 2
+            let left = NSRect(x: screen.minX, y: screen.maxY - height,
+                              width: leftEdge - screen.minX, height: height)
+            let right = NSRect(x: rightEdge, y: screen.maxY - height,
+                               width: screen.maxX - rightEdge, height: height)
+            guard let geometry = NotchHUDGeometry.make(screenFrame: screen, topInset: height,
+                                                       leftArea: left, rightArea: right),
+                  geometry.cameraSize == NSSize(width: width, height: height),
+                  geometry.frame.midX == screen.midX,
+                  geometry.frame.maxY == screen.maxY else {
+                throw SelfTestFailure.failed("Notch must follow the camera bounds in global screen coordinates")
+            }
+        }
+        let screen = NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        guard NotchHUDGeometry.make(screenFrame: screen, topInset: 0,
+                                     leftArea: nil, rightArea: nil) == nil else {
+            throw SelfTestFailure.failed("A display without a camera cutout must use the capsule")
+        }
     }
 
     private static func testAudioConversion() throws {
@@ -21733,8 +23319,8 @@ private enum ParakeySelfTest {
         let targetVersion: String
         if let (installed, candidate) = releaseFixtures {
             try UpdateSigning.validateUpgrade(from: installed, to: candidate)
-            try SuperDictateUpdateInstaller.validateApp(at: installed, expectedVersion: "0.2.47")
-            targetVersion = "0.2.48"
+            try SuperDictateUpdateInstaller.validateApp(at: installed, expectedVersion: "0.2.48")
+            targetVersion = "0.2.49"
             try SuperDictateUpdateInstaller.validateApp(at: candidate, expectedVersion: targetVersion)
             try fileManager.copyItem(at: installed, to: currentApp)
             try fileManager.createDirectory(at: stagedApp.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -23215,6 +24801,8 @@ private struct ControlPanelSettingsDraft: Equatable {
     var inputDevicePreference: String
     var audioFileTranscriptionOutputDirectory: String
     var removeFinalPeriod: Bool
+    var visualStyle: RecordingHUDVisualStyle
+    var notchPalette: NotchGlowPalette
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -23237,6 +24825,8 @@ private struct ControlPanelSettingsDraft: Equatable {
         inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
         audioFileTranscriptionOutputDirectory = settings.audioFileTranscriptionOutputDirectory
         removeFinalPeriod = settings.removeFinalPeriod
+        visualStyle = settings.recordingHUDVisualStyle
+        notchPalette = settings.notchGlowPalette
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -23287,7 +24877,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var updateTask: Task<Void, Never>?
     private var updateState: ControlPanelUpdateState = .checking
     private var lastRenderFingerprint = ""
-    private let settings = Settings.shared
+    private let settings: Settings
+    private weak var paletteActionsContainer: NSStackView?
     private var permissionClickCount: [Permission: Int] = [:]
     private var resettingPermissions = false
     private var settingsDraft: ControlPanelSettingsDraft?
@@ -23307,7 +24898,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
-    init(downloads: LocalModelDownloads = LocalModelDownloads()) {
+    init(downloads: LocalModelDownloads = LocalModelDownloads(), settings: Settings = .shared) {
+        self.settings = settings
         localModelDownloads = downloads
         super.init()
     }
@@ -23513,6 +25105,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.recordingHUDTranscribingColor.rawValue,
                 settings.recordingHUDBackgroundStyle.rawValue,
                 settings.recordingHUDSize.rawValue,
+                settings.recordingHUDVisualStyle.rawValue,
                 permissionClickCount.description].joined(separator: "::")
     }
 
@@ -23660,44 +25253,61 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(removeFinalPeriodRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
-            title: t("Размер капсулы", "Capsule size"),
-            detail: t("Размер плавающего индикатора записи.",
-                      "Size of the floating recording indicator."),
-            selectedValue: draft.hudSize.rawValue,
-            options: RecordingHUDSize.allCases.map { (localizedHUDSizeName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDSize(_:)),
-            toolTip: t("Выбрать компактную, обычную или крупную капсулу.",
-                       "Choose a compact, standard, or large capsule.")
+            title: t("Визуал записи", "Recording appearance"),
+            detail: t("Волны вокруг чёлки или классическая капсула рядом с полем ввода.",
+                      "Waves around the notch or the classic capsule near the text field."),
+            selectedValue: draft.visualStyle.rawValue,
+            options: [(t("Волны у чёлки", "Notch waves"), RecordingHUDVisualStyle.notch.rawValue),
+                      (t("Капсула", "Capsule"), RecordingHUDVisualStyle.capsule.rawValue)],
+            action: #selector(selectRecordingHUDVisualStyle(_:)),
+            toolTip: t("На экране без чёлки используется капсула.",
+                       "Displays without a notch use the capsule.")
         ))
-        root.addArrangedSubview(popupRow(
-            title: t("Цвет записи", "Recording color"),
-            detail: t("Цвет аудиоволн, пока микрофон слушает.",
-                      "Color used while the microphone is listening."),
-            selectedValue: draft.recordingColor.rawValue,
-            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDRecordingColor(_:)),
-            toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
-        ))
-        root.addArrangedSubview(popupRow(
-            title: t("Цвет транскрибации", "Transcribing color"),
-            detail: t("Цвет анимации во время распознавания речи.",
-                      "Color used while speech is being converted to text."),
-            selectedValue: draft.transcribingColor.rawValue,
-            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDTranscribingColor(_:)),
-            toolTip: t("Цвет индикатора во время распознавания речи.",
-                       "Indicator color while speech is being transcribed.")
-        ))
-        root.addArrangedSubview(popupRow(
-            title: t("Фон капсулы", "HUD background"),
-            detail: t("Системная тема или постоянный светлый/тёмный фон.",
-                      "Follow the system appearance or use a fixed background."),
-            selectedValue: draft.backgroundStyle.rawValue,
-            options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDBackgroundStyle(_:)),
-            toolTip: t("Выбрать фон плавающего индикатора диктовки.",
-                       "Choose the floating dictation indicator background.")
-        ))
+        root.addArrangedSubview(separator())
+        if draft.visualStyle == .notch {
+            root.addArrangedSubview(notchPaletteSection(draft))
+        } else {
+            root.addArrangedSubview(separator())
+            root.addArrangedSubview(popupRow(
+                title: t("Размер капсулы", "Capsule size"),
+                detail: t("Размер плавающего индикатора записи.",
+                          "Size of the floating recording indicator."),
+                selectedValue: draft.hudSize.rawValue,
+                options: RecordingHUDSize.allCases.map { (localizedHUDSizeName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDSize(_:)),
+                toolTip: t("Выбрать компактную, обычную или крупную капсулу.",
+                           "Choose a compact, standard, or large capsule.")
+            ))
+            root.addArrangedSubview(popupRow(
+                title: t("Цвет записи", "Recording color"),
+                detail: t("Цвет аудиоволн, пока микрофон слушает.",
+                          "Color used while the microphone is listening."),
+                selectedValue: draft.recordingColor.rawValue,
+                options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDRecordingColor(_:)),
+                toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
+            ))
+            root.addArrangedSubview(popupRow(
+                title: t("Цвет транскрибации", "Transcribing color"),
+                detail: t("Цвет анимации во время распознавания речи.",
+                          "Color used while speech is being converted to text."),
+                selectedValue: draft.transcribingColor.rawValue,
+                options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDTranscribingColor(_:)),
+                toolTip: t("Цвет индикатора во время распознавания речи.",
+                           "Indicator color while speech is being transcribed.")
+            ))
+            root.addArrangedSubview(popupRow(
+                title: t("Фон капсулы", "HUD background"),
+                detail: t("Системная тема или постоянный светлый/тёмный фон.",
+                          "Follow the system appearance or use a fixed background."),
+                selectedValue: draft.backgroundStyle.rawValue,
+                options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDBackgroundStyle(_:)),
+                toolTip: t("Выбрать фон плавающего индикатора диктовки.",
+                           "Choose the floating dictation indicator background.")
+            ))
+        }
         root.addArrangedSubview(separator())
         root.addArrangedSubview(privacyInfoView())
 
@@ -23726,7 +25336,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         footer.translatesAutoresizingMaskIntoConstraints = false
         let divider = separator()
         divider.translatesAutoresizingMaskIntoConstraints = false
-        let actions = settingsActionsRow(draft: draft)
+        let actions = NSStackView()
+        actions.orientation = .vertical
+        actions.alignment = .leading
+        let actionRow = settingsActionsRow(draft: draft)
+        actions.addArrangedSubview(actionRow)
+        actionRow.widthAnchor.constraint(equalTo: actions.widthAnchor).isActive = true
+        paletteActionsContainer = actions
         actions.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(divider)
         footer.addSubview(actions)
@@ -25465,6 +27081,191 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    static func testRecordingVisualStyle() throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let suite = "com.local.superdictate.visual-test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = Settings(defaults: defaults)
+        guard settings.recordingHUDVisualStyle == .notch else { throw localSpeechError("Default appearance changed") }
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        let controller = SuperDictateControlPanelApp(settings: settings)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 700),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        controller.settingsWindow = window
+        let geometry = NotchHUDGeometry.current ?? NotchHUDGeometry(
+            frame: NSRect(x: 0, y: 0, width: 734, height: 113), cameraSize: NSSize(width: 166, height: 29))
+        for style in [RecordingHUDVisualStyle.capsule, .notch] {
+            controller.settingsDraft = ControlPanelSettingsDraft(settings: settings)
+            window.contentView = controller.makeSettingsContentView()
+            window.contentView?.layoutSubtreeIfNeeded()
+            guard let popup = descendants(window.contentView!).compactMap({ $0 as? NSPopUpButton }).first(where: {
+                $0.action == #selector(selectRecordingHUDVisualStyle(_:))
+            }), let item = popup.itemArray.first(where: { $0.representedObject as? String == style.rawValue }) else {
+                throw localSpeechError("Appearance selector is unreachable")
+            }
+            popup.select(item)
+            guard NSApp.sendAction(popup.action!, to: popup.target, from: popup),
+                  controller.settingsDraft?.visualStyle == style,
+                  settings.recordingHUDVisualStyle != style else { throw localSpeechError("Appearance draft applied too early") }
+            guard let save = descendants(window.contentView!).compactMap({ $0 as? NSButton }).first(where: {
+                $0.action == #selector(saveSettingsClicked(_:))
+            }), save.isEnabled else { throw localSpeechError("Appearance change must enable Save") }
+            save.performClick(nil)
+            let reopened = Settings(defaults: UserDefaults(suiteName: suite)!)
+            guard reopened.recordingHUDVisualStyle == style else { throw localSpeechError("Appearance did not survive reopening") }
+            let view = RecordingHUDView(frame: NSRect(x: 0, y: 0, width: 734, height: 113))
+            view.notchGeometry = reopened.recordingHUDVisualStyle.geometry(for: geometry)
+            view.mode = .recording
+            view.level = 0.5
+            guard (view.notchGeometry != nil) == (style == .notch),
+                  style.geometry(for: nil) == nil else { throw localSpeechError("Wrong renderer selected") }
+            view.displayIfNeeded()
+        }
+        defaults.set("unknown", forKey: "recording_hud_visual_style")
+        guard settings.recordingHUDVisualStyle == .notch else { throw localSpeechError("Invalid style has no fallback") }
+        window.orderOut(nil)
+        print("VISUAL_STYLE native selector, draft, Save, reopen, capsule/notch renderer and no-notch fallback passed")
+    }
+
+    static func testNotchPalette() throws {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let suite = "com.local.superdictate.palette-test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = Settings(defaults: defaults)
+        guard settings.notchGlowPalette == .standard else { throw localSpeechError("Default palette changed") }
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        let controller = SuperDictateControlPanelApp(settings: settings)
+        controller.settingsDraft = ControlPanelSettingsDraft(settings: settings)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 700),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        controller.settingsWindow = window
+        window.contentView = controller.makeSettingsContentView()
+        window.contentView?.layoutSubtreeIfNeeded()
+        guard let content = window.contentView,
+              let well = descendants(content).compactMap({ $0 as? NSColorWell }).first,
+              descendants(content).compactMap({ $0 as? NSColorWell }).count == 4 else {
+            throw localSpeechError("Four palette controls must be reachable in settings")
+        }
+        well.color = NSColor(srgbRed: 0.1, green: 0.9, blue: 0.2, alpha: 1)
+        guard NSApp.sendAction(well.action!, to: well.target, from: well),
+              let selected = controller.settingsDraft?.notchPalette,
+              selected != .standard, settings.notchGlowPalette == .standard,
+              let save = descendants(content).compactMap({ $0 as? NSButton }).first(where: {
+                  $0.action == #selector(saveSettingsClicked(_:))
+              }), save.isEnabled else { throw localSpeechError("Color editing must enable Save without persisting the draft") }
+        save.performClick(nil)
+        let reopened = Settings(defaults: UserDefaults(suiteName: suite)!)
+        guard reopened.notchGlowPalette == selected else { throw localSpeechError("Saved palette did not survive reopening") }
+        let host = NotchGlowHostView()
+        let geometry = NotchHUDGeometry.current ?? NotchHUDGeometry(
+            frame: NSRect(x: 0, y: 0, width: 734, height: 113), cameraSize: NSSize(width: 166, height: 29))
+        host.frame = NSRect(origin: .zero, size: geometry.frame.size)
+        host.preview(geometry: geometry, mode: .recording, level: 0.6)
+        guard let standard = host.snapshot()?.representation(using: .png, properties: [:]) else {
+            throw localSpeechError("Default palette did not render")
+        }
+        host.palette = reopened.notchGlowPalette
+        guard let custom = host.snapshot()?.representation(using: .png, properties: [:]),
+              custom != standard else { throw localSpeechError("Saved colors did not reach Metal") }
+        for index in selected.colors.indices {
+            var changed = selected
+            changed.colors[index] = NotchGlowColor(red: 0.07 + Double(index) * 0.12, green: 0.85, blue: 0.13)
+            host.palette = changed
+            guard let rendered = host.snapshot()?.representation(using: .png, properties: [:]),
+                  rendered != custom else {
+                throw localSpeechError("Palette color \(index + 1) did not reach Metal")
+            }
+        }
+        controller.settingsDraft = ControlPanelSettingsDraft(settings: reopened)
+        controller.settingsWindow = window
+        window.contentView = controller.makeSettingsContentView()
+        guard let reset = descendants(window.contentView!).compactMap({ $0 as? NSButton }).first(where: {
+            $0.action == #selector(resetNotchPalette(_:))
+        }), reset.isEnabled else { throw localSpeechError("Palette reset is missing") }
+        reset.performClick(nil)
+        guard controller.settingsDraft?.notchPalette == .standard,
+              reopened.notchGlowPalette == selected else { throw localSpeechError("Reset must remain a draft until saved") }
+        guard let resetSave = descendants(window.contentView!).compactMap({ $0 as? NSButton }).first(where: {
+            $0.action == #selector(saveSettingsClicked(_:))
+        }), resetSave.isEnabled else { throw localSpeechError("Reset must enable Save") }
+        resetSave.performClick(nil)
+        guard Settings(defaults: UserDefaults(suiteName: suite)!).notchGlowPalette == .standard else {
+            throw localSpeechError("Reset did not persist")
+        }
+        defaults.set(Data("{\"colors\":[]}".utf8), forKey: "notch_glow_palette_v1")
+        guard settings.notchGlowPalette == .standard else { throw localSpeechError("Malformed palette must use defaults") }
+        window.orderOut(nil)
+        print("PALETTE default, color action, Save, reopen, all four Metal colors, reset and invalid data passed")
+    }
+
+    private func notchPaletteSection(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.addArrangedSubview(panelLabel(t("Палитра свечения", "Glow palette"), size: 13, weight: .semibold))
+        stack.addArrangedSubview(panelLabel(
+            t("Четыре цвета плавно смешиваются вокруг чёлки.",
+              "Four colors blend smoothly around the camera cutout."),
+            size: 12, color: .secondaryLabelColor))
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 10
+        row.alignment = .centerY
+        for (index, color) in draft.notchPalette.colors.enumerated() {
+            let well = NSColorWell()
+            well.colorWellStyle = .minimal
+            well.color = color.nsColor
+            well.tag = index
+            well.target = self
+            well.action = #selector(changeNotchPaletteColor(_:))
+            well.setAccessibilityLabel(t("Цвет \(index + 1) свечения", "Glow color \(index + 1)"))
+            well.toolTip = t("Выбрать цвет \(index + 1)", "Choose color \(index + 1)")
+            well.widthAnchor.constraint(equalToConstant: 44).isActive = true
+            well.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            row.addArrangedSubview(well)
+        }
+        row.addArrangedSubview(panelButton(t("Вернуть исходные", "Restore defaults"),
+            action: #selector(resetNotchPalette(_:)), enabled: draft.notchPalette != .standard))
+        stack.addArrangedSubview(row)
+        return stack
+    }
+
+    @objc private func changeNotchPaletteColor(_ sender: NSColorWell) {
+        captureAISettingsFields()
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        guard draft.notchPalette.colors.indices.contains(sender.tag) else { return }
+        draft.notchPalette.colors[sender.tag] = NotchGlowColor(color: sender.color)
+        settingsDraft = draft
+        if let row = sender.superview as? NSStackView,
+           let reset = row.arrangedSubviews.last as? NSButton {
+            reset.isEnabled = draft.notchPalette != .standard
+        }
+        guard let container = paletteActionsContainer else { return }
+        for view in container.arrangedSubviews {
+            container.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let row = settingsActionsRow(draft: draft)
+        container.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+    }
+
+    @objc private func resetNotchPalette(_ sender: NSButton) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.notchPalette = .standard
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -26277,6 +28078,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    @objc private func selectRecordingHUDVisualStyle(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let style = RecordingHUDVisualStyle(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.visualStyle = style
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDSize(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let size = RecordingHUDSize(rawValue: raw) else { return }
@@ -26462,6 +28272,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.inputDevice = draft.inputDevicePreference
         settings.audioFileTranscriptionOutputDirectory = draft.audioFileTranscriptionOutputDirectory
         settings.removeFinalPeriod = draft.removeFinalPeriod
+        settings.recordingHUDVisualStyle = draft.visualStyle
+        settings.notchGlowPalette = draft.notchPalette
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
@@ -26659,6 +28471,51 @@ let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
 if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
     exit(diagnosticResult)
+} else if launchArguments.first == "--diagnose-notch-audio" {
+    do {
+        try ParakeyApp.diagnoseNotchAudio(withCue: launchArguments.contains("--cue"),
+                                         warmCapture: launchArguments.contains("--warm"))
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Notch microphone diagnostic failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+} else if launchArguments.first == "--diagnose-start-cue-meter" {
+    do {
+        try ParakeyApp.diagnoseStartCueMeter()
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Start cue meter diagnostic failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+ } else if launchArguments.first == "--diagnose-unified-completion" {
+    Task { @MainActor in
+        do {
+            try await ParakeyApp.diagnoseUnifiedCompletion()
+            exit(EXIT_SUCCESS)
+        } catch {
+            fputs("Unified completion diagnostic failed: \(error.localizedDescription)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+    NSApplication.shared.run()
+} else if launchArguments.first == "--diagnose-completion-sound" {
+    do {
+        try Sounds.diagnoseCompletionSound()
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Completion cue diagnostic failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+} else if launchArguments.first == "--export-notch-preview" {
+    guard launchArguments.count == 2 else { exit(EXIT_FAILURE) }
+    do {
+        try exportNotchGlowPreview(to: URL(fileURLWithPath: launchArguments[1], isDirectory: true))
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Notch preview failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
 } else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     guard launchArguments.count == 2 else {
         fputs("usage: SuperDictate --export-hud-animation <frames-directory>\n", stderr)

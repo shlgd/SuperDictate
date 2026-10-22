@@ -64,6 +64,11 @@ cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resource
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/local-asr.py" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/speech-runtime.json" "$STAGE_APP/Contents/Resources/"
+cp "$ROOT_DIR/swift/Resources/recording-done.wav" "$STAGE_APP/Contents/Resources/"
+cp "$ROOT_DIR/third-party/Aurora/LICENSE" "$STAGE_APP/Contents/Resources/Aurora-LICENSE"
+cp "$ROOT_DIR/third-party/Aurora/README.md" "$STAGE_APP/Contents/Resources/Aurora-NOTICE.md"
+cp "$ROOT_DIR/third-party/AppleIntelligenceGlowEffect/LICENSE" "$STAGE_APP/Contents/Resources/AppleIntelligenceGlowEffect-LICENSE"
+cp "$ROOT_DIR/third-party/AppleIntelligenceGlowEffect/README.md" "$STAGE_APP/Contents/Resources/AppleIntelligenceGlowEffect-NOTICE.md"
 case "${SUPERDICTATE_RUNTIME_MODE:-embedded}" in
     embedded)
         bash "$ROOT_DIR/scripts/prepare-runtime-asset.sh"

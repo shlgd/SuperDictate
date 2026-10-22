@@ -1,0 +1,17 @@
+{
+  "id": "siri-confirm",
+  "number": 1,
+  "title": "Siri · подтверждение",
+  "description": "Короткий сигнал из той же библиотеки, что наше начало.",
+  "url": "audio/siri-confirm.wav",
+  "duration": 0.5817708333333333,
+  "gain": 0.45,
+  "original": "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_confirm.caf",
+  "sha256": "f75af3c7eab6938f2f9cf18793349c4b84146373420c68e2bc7bdd5a8f12f215",
+  "round": 1,
+  "installed": true,
+  "asset": "recording-done.wav",
+  "asset_sha256": "52e1831a205f4938ef49b8077a29080d98deb5cc6516e9aeaf2d4a988223084e",
+  "volume": 1.0,
+  "gain_baked_into_asset": true
+}
