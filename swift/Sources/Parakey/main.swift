@@ -5696,10 +5696,12 @@ final class AudioCapture: @unchecked Sendable {
         _ = direct.endRecording()
         print("REALTIME_METER voiced_262Hz=retained first_update=10ms updates_per_second=100 stopped_and_restarted=true")
         let count = Int(SAMPLE_RATE)
-        let speech = (0..<count).map { index in
-            let t = Double(index) / SAMPLE_RATE
-            return Float(0.012 * (sin(2 * .pi * 137 * t) + 0.5 * sin(2 * .pi * 580 * t)
-                                 + 0.3 * sin(2 * .pi * 1400 * t)))
+        let speech: [Float] = (0..<count).map { index -> Float in
+            let phase = 2.0 * Double.pi * Double(index) / SAMPLE_RATE
+            let fundamental = sin(137.0 * phase)
+            let middle = 0.5 * sin(580.0 * phase)
+            let upper = 0.3 * sin(1400.0 * phase)
+            return Float(0.012 * (fundamental + middle + upper))
         }
         let cue = (0..<count).map { index in
             let t = Double(index) / SAMPLE_RATE
