@@ -23,14 +23,18 @@ CATALOG = {
     "whisper_turbo": ("whisper", "mlx-community/whisper-large-v3-turbo"),
     "qwen_06": ("qwen", "mlx-community/Qwen3-ASR-0.6B-8bit"),
     "qwen_17": ("qwen", "mlx-community/Qwen3-ASR-1.7B-8bit"),
-    "gigaam_v3": ("gigaam", "v3_e2e_rnnt"),
+    "gigaam_v3": ("gigaam", "ai-sage/GigaAM-v3"),
 }
 REVISIONS = {
     "whisper_large_v3": "49e6aa286ad60c14352c404340ded53710378a11",
     "whisper_turbo": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
     "qwen_06": "89e96d92ba34aca20b3e29fb10cc284097d1219f",
     "qwen_17": "a8379a2e2f9e313c9292cdf1af4055ab56d50d55",
+    # Branch e2e_rnnt of ai-sage/GigaAM-v3 (the Sber CDN used before is not required any more).
+    "gigaam_v3": "7655ad717f8122257385bb4b2f373db3697e8680",
 }
+GIGA_FILES = ("config.json", "pytorch_model.bin", "tokenizer.model")
+GIGA_TOKENIZER_MD5 = "3b3bf8370e882885d79731592fc99f98"
 GIGA_REVISION = "7447938d791c4f3e643386ee22c33777004293a5"
 RUNTIME_VERSION = "1"
 ENVIRONMENT_VERSION = "2"
@@ -227,28 +231,23 @@ def download(root, key):
     destination.mkdir(parents=True, exist_ok=True)
     ready = destination / "ready.json"
     emit(phase="listing")
-    if engine == "gigaam":
-        base = "https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM"
-        names = [repo + ".ckpt", repo + "_tokenizer.model"]
-        files = []
-        for name in names:
-            url = f"{base}/{name}"
-            with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30) as response:
-                size = int(response.headers["Content-Length"])
-            files.append((name, size, None, url))
-        revision = GIGA_REVISION
-    else:
-        info = model_info(repo, REVISIONS[key])
-        revision = info.sha
-        files = []
-        for entry in info.siblings:
-            if not entry.rfilename.endswith((".json", ".safetensors", ".npz", ".model", ".txt", ".tiktoken")):
+    info = model_info(repo, REVISIONS[key])
+    revision = info.sha
+    files = []
+    for entry in info.siblings:
+        if engine == "gigaam":
+            # Only data files: modeling_gigaam.py is never downloaded or executed.
+            if entry.rfilename not in GIGA_FILES:
                 continue
-            if "/" in entry.rfilename:
-                continue
-            sha = entry.lfs.sha256 if entry.lfs else None
-            files.append((entry.rfilename, entry.size, sha,
-                          f"https://huggingface.co/{repo}/resolve/{revision}/{entry.rfilename}"))
+        elif not entry.rfilename.endswith((".json", ".safetensors", ".npz", ".model", ".txt", ".tiktoken")):
+            continue
+        if "/" in entry.rfilename:
+            continue
+        sha = entry.lfs.sha256 if entry.lfs else None
+        files.append((entry.rfilename, entry.size, sha,
+                      f"https://huggingface.co/{repo}/resolve/{revision}/{entry.rfilename}"))
+    if engine == "gigaam" and {f[0] for f in files} != set(GIGA_FILES):
+        raise RuntimeError("GigaAM model manifest is incomplete")
     if not files:
         raise RuntimeError("Model manifest is empty")
     total = sum(entry[1] for entry in files)
@@ -264,8 +263,8 @@ def download(root, key):
     emit(phase="verifying")
     if engine == "gigaam":
         import gigaam
-        if file_digest(destination / (repo + ".ckpt"), "md5") != gigaam._MODEL_HASHES[repo]:
-            raise RuntimeError("GigaAM checksum mismatch")
+        if file_digest(destination / "tokenizer.model", "md5") != GIGA_TOKENIZER_MD5:
+            raise RuntimeError("GigaAM tokenizer checksum mismatch")
     # Import validation is deliberately not inference or a model warm-up.
     if engine == "whisper":
         import mlx_whisper
@@ -288,6 +287,37 @@ def validate_install(root, key):
         if (destination / entry["name"]).stat().st_size != entry["size"]:
             raise RuntimeError("Incomplete local model. Download it again in Settings.")
     return destination
+
+
+def load_gigaam(directory):
+    """Build GigaAM v3 E2E RNNT from the official Hugging Face checkpoint.
+
+    The HF repository ships the same weights as the original .ckpt, but in a transformers-style
+    layout: weights under a "model." prefix and cfg targets in modeling_gigaam. Remap both and
+    load them strictly into the gigaam package; no remote code is executed.
+    """
+    import torch
+    from omegaconf import OmegaConf
+    from gigaam import _finalize_model
+    from gigaam.model import GigaAMASR
+    directory = Path(directory)
+    if not (directory / "config.json").exists():
+        raise RuntimeError("Model needs to be downloaded again")
+    targets = {"modeling_gigaam.FeatureExtractor": "gigaam.preprocess.FeatureExtractor",
+               "modeling_gigaam.ConformerEncoder": "gigaam.encoder.ConformerEncoder",
+               "modeling_gigaam.RNNTHead": "gigaam.decoder.RNNTHead",
+               "modeling_gigaam.RNNTGreedyDecoding": "gigaam.decoding.RNNTGreedyDecoding"}
+    def remap(node):
+        if isinstance(node, dict):
+            return {k: targets[v] if k == "_target_" else remap(v) for k, v in node.items()}
+        return node
+    cfg = remap(json.loads((directory / "config.json").read_text())["cfg"]["model"]["cfg"])
+    cfg["decoding"]["model_path"] = str(directory / "tokenizer.model")
+    state = torch.load(directory / "pytorch_model.bin", map_location="cpu", weights_only=True)
+    state = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
+    model = GigaAMASR(OmegaConf.create(cfg))
+    model.load_state_dict(state, strict=True)
+    return _finalize_model(model, True, torch.device("cpu"))
 
 
 def chunks(audio, sample_rate=16000):
@@ -334,7 +364,7 @@ def serve(root, key):
         import gigaam
         import torch
         torch.set_num_threads(4)
-        model = gigaam.load_model(name, device="cpu", download_root=str(directory))
+        model = load_gigaam(directory)
         def transcribe(audio, language):
             if language not in (None, "ru"):
                 raise RuntimeError("GigaAM v3 supports Russian; choose Auto or Russian.")

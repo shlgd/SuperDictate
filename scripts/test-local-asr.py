@@ -41,7 +41,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_catalog_is_bounded_and_pinned(self):
         self.assertEqual(len(asr.CATALOG), 5)
-        self.assertEqual(set(asr.REVISIONS), set(asr.CATALOG) - {"gigaam_v3"})
+        self.assertEqual(set(asr.REVISIONS), set(asr.CATALOG))
         self.assertTrue(all(len(value) == 40 for value in asr.REVISIONS.values()))
 
     def test_atomic_manifest_and_missing_file(self):
